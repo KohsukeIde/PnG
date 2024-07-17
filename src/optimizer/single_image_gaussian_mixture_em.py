@@ -1,14 +1,12 @@
 import numpy as np
 from PIL import Image
 
+
 class SingleImageGaussianMixtureEM:
-    """
-    conduct Gaussian Mixture Model optimization on a single image using the EM algorithm.
-    """
+    """conduct Gaussian Mixture Model optimization on a single image using the EM algorithm."""
 
     def __init__(self, image_path: str) -> None:
-        """
-        Initialize the SingleImageGaussianMixtureEM with an image file.
+        """Initialize the SingleImageGaussianMixtureEM with an image file.
 
         Args:
             image_path (str): Path to the input image file.
@@ -19,12 +17,11 @@ class SingleImageGaussianMixtureEM:
         """
         try:
             with Image.open(image_path) as img:
-                self.image = np.array(img).astype(float) / 255.0  
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Image file not found: {image_path}")
+                self.image = np.array(img).astype(float) / 255.0
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Image file not found: {image_path}") from e
         except Exception as e:
-            raise ValueError(f"Error processing image: {str(e)}")
-
+            raise ValueError(f"Error processing image: {str(e)}") from e
 
         # if self.image.ndim != 3 or self.image.shape[2] != 3:
         #     raise ValueError("Input image must be a 3-channel color image")
