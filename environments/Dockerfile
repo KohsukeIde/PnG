@@ -21,7 +21,8 @@ RUN add-apt-repository ppa:deadsnakes/ppa
 
 RUN apt update && apt install --no-install-recommends -y \
     git curl make ssh openssh-client \
-    python${PYTHON_VERSION} python3-pip python-is-python3
+    python${PYTHON_VERSION} python3-pip python-is-python3 \ 
+    libgl1-mesa-dev
 
 # Following is needed to swtich default python3 version
 # For detail, please check following link https://unix.stackexchange.com/questions/410579/change-the-python3-default-version-in-ubuntu
