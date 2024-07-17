@@ -19,11 +19,12 @@ class SingleImageGaussianMixtureEM:
         """
         try:
             with Image.open(image_path) as img:
-                self.image = np.array(img).astype(float) / 255.0
+                self.image = np.array(img).astype(float) / 255.0  
         except FileNotFoundError:
             raise FileNotFoundError(f"Image file not found: {image_path}")
         except Exception as e:
             raise ValueError(f"Error processing image: {str(e)}")
 
-        if self.image.ndim != 3 or self.image.shape[2] != 3:
-            raise ValueError("Input image must be a 3-channel color image")
+
+        # if self.image.ndim != 3 or self.image.shape[2] != 3:
+        #     raise ValueError("Input image must be a 3-channel color image")
