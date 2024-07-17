@@ -3,6 +3,7 @@ import os
 import numpy as np
 
 from src.optimizer.single_image_gaussian_mixture_em import SingleImageGaussianMixtureEM
+from src.primitive.twod_gaussians import TwoDGaussians
 
 
 def test_single_image_gaussian_mixture_em_initialization():
@@ -30,6 +31,40 @@ def test_single_image_gaussian_mixture_em_invalid_file():
         pass
 
 
+def test_initialize_gaussians():
+    """Test the initialization of Gaussians."""
+    image_path = os.path.join("data", "tsukuba", "scene1.row3.col1.ppm")
+    assert os.path.exists(image_path), f"Test image not found: {image_path}"
+
+    gmm = SingleImageGaussianMixtureEM(image_path)
+
+    n_gauss = 16
+    gaussians = gmm.initialize_gaussians(n_gauss)
+
+    # Check if the method returns a TwoDGaussians object
+    assert isinstance(gaussians, TwoDGaussians), "Should return a TwoDGaussians object"
+
+    # Check if the number of Gaussians is correct
+    assert (
+        gaussians.k == n_gauss
+    ), f"Expected {n_gauss} Gaussians, but got {gaussians.k}"
+
+    # Check the shapes of the Gaussian parameters
+    assert gaussians.means.shape == (n_gauss, 2), "Incorrect shape for means"
+    assert gaussians.covs.shape == (n_gauss, 2, 2), "Incorrect shape for covariances"
+    assert gaussians.rgb.shape == (n_gauss, 3), "Incorrect shape for RGB values"
+    assert gaussians.alpha.shape == (n_gauss,), "Incorrect shape for alpha values"
+
+    # Check if the RGB values are within the correct range
+    assert np.all(
+        (gaussians.rgb >= 0) & (gaussians.rgb <= 1)
+    ), "RGB values should be between 0 and 1"
+
+    # Check if the alpha values are correctly set
+    assert np.all(gaussians.alpha == 0.4), "Alpha values should be 0.4"
+
+
+# TODO: not sure if this test is necessary -> グレイスケールとかでもできるべき？
 # def test_single_image_gaussian_mixture_em_invalid_image():
 #     """Test the initialization with an invalid image format (e.g., non-RGB image)."""
 #     image_path = os.path.join('data', 'tsukuba', 'grayscale_image.png')

@@ -56,7 +56,7 @@ def test_twod_gaussians_k_property():
         assert obj.k == k
 
 
-## followings is used to achieve 100% coverage
+## followings was used to achieve 100% coverage
 # def test_twod_gaussians_invalid_means():
 #     """Test that creating TwoDGaussians with invalid means raises ValueError."""
 #     try:
