@@ -26,7 +26,7 @@ classifiers = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.8"
 ruff = "^0.4.1"
 mdformat-gfm = "^0.3.6"
 mdformat-frontmatter = "^2.0.8"
