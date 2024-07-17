@@ -1,4 +1,4 @@
-data/*
+# data/*
 models/*
 outputs/*
 __pycache__
@@ -13,3 +13,4 @@ __pycache__
 !environments/ci/.env
 !environments/cpu/.env
 !environments/gpu/.env
+!data/tsukuba/*
