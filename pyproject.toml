@@ -26,18 +26,18 @@ classifiers = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = "^3.9"
 ruff = "^0.4.1"
 mdformat-gfm = "^0.3.6"
 mdformat-frontmatter = "^2.0.8"
 mdformat_footnote = "^0.1.1"
 mypy = "^1.10.0"
 pytest-cov = "^5.0.0"
-numpy = "^2.0.0"
 opencv-python = "^4.10.0"
+numpy = "^2.0.0"
 
 [tool.mypy]
-python_version = 3.8
+python_version = 3.9
 # following setting is same as pysen
 # https://github.com/pfnet/pysen/blob/main/setup.cfg#L12
 check_untyped_defs = true
@@ -63,7 +63,7 @@ warn_unused_ignores = true
 
 [tool.ruff]
 line-length = 88
-target-version = "py38"
+target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "I", "N", "D", "PT"]
