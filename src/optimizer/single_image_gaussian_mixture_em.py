@@ -43,7 +43,7 @@ class SingleImageGaussianMixtureEM:
         # Initialize positions randomly
         means = np.random.rand(n_gauss, 2) * [height, width]
 
-        # Initialize covariances with const
+        # Initialize covariances with constant for now
         cov_const = min(height, width) / 10  # You can adjust this constant
         covs = np.array([np.eye(2) * cov_const for _ in range(n_gauss)])
 
@@ -54,3 +54,61 @@ class SingleImageGaussianMixtureEM:
         alpha = np.full(n_gauss, alpha_0)
 
         return TwoDGaussians(means, covs, rgb, alpha)
+
+
+    def gaussian_pdf(self, mean, cov, height, width) -> np.ndarray:
+        """
+        Compute the Gaussian PDF for multiple points and multiple Gaussians.
+
+        Args:
+            mean (np.ndarray): Means of Gaussians, shape (K, 2)
+            cov (np.ndarray): Covariance matrices, shape (K, 2, 2)
+            height (int): Height of the image
+            width (int): Width of the image
+
+        Returns:
+            np.ndarray: Gaussian PDF values, shape (height, width, K)
+        """
+        K = mean.shape[0]
+        cov_inv = np.linalg.inv(cov)  # (K, 2, 2)
+        cov_det = np.linalg.det(cov)  # (K,)
+
+        y, x = np.mgrid[0:height, 0:width]
+        xy = np.stack([x, y], axis=-1)  # (height, width, 2)
+
+        N = np.zeros((height, width, K))
+
+        for i in range(height):
+            for j in range(width):
+                xy_m = xy[i, j] - mean  # (K, 2)
+                N[i, j, :] = 1.0 / np.sqrt(2 * np.pi * cov_det) * np.exp(
+                    np.matmul(np.matmul(xy_m[:, None, :], cov_inv), xy_m[:, :, None])[:, 0, 0]
+                )
+
+        return N
+    
+    def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
+        """
+        Compute the responsibilities (gamma) for each pixel and each Gaussian.
+
+        Args:
+            gaussians (TwoDGaussians): The current Gaussian mixture model.
+
+        Returns:
+            np.ndarray: Responsibilities with shape (height, width, k).
+        """
+        height, width = self.image.shape[:2]
+
+        # Compute spatial probabilities: N(x,y|μ_k,Σ_k)
+        spatial_probs = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
+
+        # Compute color probabilities: ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
+        color_probs = np.prod(gaussians.rgb[:, np.newaxis, np.newaxis, :] ** self.image, axis=-1)
+
+        # Compute joint probabilities: α_k N(x,y|μ_k,Σ_k) ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
+        responsibilities = gaussians.alpha[:, np.newaxis, np.newaxis] * spatial_probs * color_probs
+
+        # Normalize: γ_{x,y,k} = (joint probability) / (sum of joint probabilities over all k)
+        responsibilities /= np.sum(responsibilities, axis=-1, keepdims=True)
+
+        return responsibilities
