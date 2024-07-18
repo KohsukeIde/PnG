@@ -74,16 +74,27 @@ class SingleImageGaussianMixtureEM:
         cov_det = np.linalg.det(cov)  # (K,)
 
         y, x = np.mgrid[0:height, 0:width]
-        xy = np.stack([x, y], axis=-1)  # (height, width, 2)
-
         N = np.zeros((height, width, K))
 
         for i in range(height):
             for j in range(width):
-                xy_m = xy[i, j] - mean  # (K, 2)
-                N[i, j, :] = 1.0 / np.sqrt(2 * np.pi * cov_det) * np.exp(
-                    np.matmul(np.matmul(xy_m[:, None, :], cov_inv), xy_m[:, :, None])[:, 0, 0]
-                )
+                xy = np.array([[j, i]])  # Note: x corresponds to j, y to i
+                xy_m = xy - mean[:, None, :]  # (K, 1, 2)
+                
+                print(f"xy shape: {xy.shape}")
+                print(f"xy_m shape: {xy_m.shape}")
+                print(f"cov_inv shape: {cov_inv.shape}")
+                
+                temp1 = np.matmul(xy_m, cov_inv)  # (K, 1, 2)
+                print(f"temp1 shape: {temp1.shape}")
+                
+                temp2 = np.array([[[j], [i]]]) - mean[:, :, None]  # (K, 2, 1)
+                print(f"temp2 shape: {temp2.shape}")
+                
+                maha = np.matmul(temp1, temp2)[:, 0, 0]  # (K,)
+                print(f"maha shape: {maha.shape}")
+                
+                N[i, j, :] = 1.0 / np.sqrt(2 * np.pi * cov_det) * np.exp(-0.5 * maha)
 
         return N
     
@@ -95,18 +106,18 @@ class SingleImageGaussianMixtureEM:
             gaussians (TwoDGaussians): The current Gaussian mixture model.
 
         Returns:
-            np.ndarray: Responsibilities with shape (height, width, k).
+            np.ndarray: Responsibilities with shape (height, width, K).
         """
         height, width = self.image.shape[:2]
 
         # Compute spatial probabilities: N(x,y|μ_k,Σ_k)
-        spatial_probs = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
+        N = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
 
         # Compute color probabilities: ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
-        color_probs = np.prod(gaussians.rgb[:, np.newaxis, np.newaxis, :] ** self.image, axis=-1)
+        c_sum = np.sum(gaussians.rgb ** self.image[:, :, np.newaxis, :], axis=-1)
 
         # Compute joint probabilities: α_k N(x,y|μ_k,Σ_k) ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
-        responsibilities = gaussians.alpha[:, np.newaxis, np.newaxis] * spatial_probs * color_probs
+        responsibilities = gaussians.alpha[np.newaxis, np.newaxis, :] * N * c_sum
 
         # Normalize: γ_{x,y,k} = (joint probability) / (sum of joint probabilities over all k)
         responsibilities /= np.sum(responsibilities, axis=-1, keepdims=True)
