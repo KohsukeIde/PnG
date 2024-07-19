@@ -13,36 +13,16 @@ def test_vanilla_2d_rasterizer_creatioin():
     assert rasterizer.width == 128
 
 
-def test_vanilla_2d_rasterizer_rasterize():
+def test_vanilla_2d_rasterizer_rasterize(twod_gaussians: TwoDGaussians):
     """Test rasterize method return image."""
     rasterizer = Vanilla2DRasterizer(64, 128)
-    k = 512
-    obj = TwoDGaussians(
-        np.random.rand(k, 2) * 100,
-        np.random.rand(k, 2, 2) * 4,
-        np.random.rand(k, 3) * 255,
-        np.random.rand(k) * 10,
-    )
-    obj.covs[:, 0, 0] = np.abs(obj.covs[:, 0, 0])
-    obj.covs[:, 1, 1] = np.abs(obj.covs[:, 1, 1])
-    obj.covs[:, 0, 1] = -obj.covs[:, 1, 0]
-    image = rasterizer.rasterize(obj)
+    image = rasterizer.rasterize(twod_gaussians)
     assert image.shape == (64, 128, 3)
     assert image.dtype == np.uint8
 
 
-def test_vanilla_2d_rasterizer_rasterize_save_image():
+def test_vanilla_2d_rasterizer_rasterize_save_image(twod_gaussians: TwoDGaussians):
     """Test rasterize method save image."""
     rasterizer = Vanilla2DRasterizer(64, 128)
-    k = 512
-    obj = TwoDGaussians(
-        np.random.rand(k, 2) * 100,
-        np.random.rand(k, 2, 2) * 4,
-        np.random.rand(k, 3) * 255,
-        np.random.rand(k) * 10,
-    )
-    obj.covs[:, 0, 0] = np.abs(obj.covs[:, 0, 0])
-    obj.covs[:, 1, 1] = np.abs(obj.covs[:, 1, 1])
-    obj.covs[:, 0, 1] = -obj.covs[:, 1, 0]
-    rasterizer.rasterize(obj, True)
+    rasterizer.rasterize(twod_gaussians, True)
     assert os.path.isfile("outputs/tmp.png")
