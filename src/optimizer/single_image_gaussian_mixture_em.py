@@ -1,5 +1,4 @@
 import numpy as np
-from numpy.typing import NDArray
 from PIL import Image
 
 from src.primitive.twod_gaussians import TwoDGaussians
@@ -109,14 +108,14 @@ class SingleImageGaussianMixtureEM:
 
         return n
 
-    def e_step(self, gaussians: TwoDGaussians) -> NDArray[np.float64]:
+    def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
         """Compute the responsibilities (gamma) for each pixel and each Gaussian.
 
         Args:
             gaussians (TwoDGaussians): The current Gaussian mixture model.
 
         Returns:
-            NDArray[np.float64]: Responsibilities, shape (height, width, K).
+            ndarray: Responsibilities, shape (height, width, K).
         """
         height, width = self.image.shape[:2]
 
@@ -130,8 +129,9 @@ class SingleImageGaussianMixtureEM:
         responsibilities = gaussians.alpha[None, None, :] * n * c_sum
 
         # Normalize: γ_{x,y,k} = (joint probability) / (sum of concatenated probabilities over all k)
-        responsibilities /= np.sum(responsibilities, axis=-1, keepdims=True)
+        sum_reciprocal = np.reciprocal(np.sum(responsibilities, axis=-1, keepdims=True))
+        responsibilities = responsibilities * sum_reciprocal
 
         # responsibilities = responsibilities.astype(np.float64)
-
+        assert isinstance(responsibilities, np.ndarray)
         return responsibilities
