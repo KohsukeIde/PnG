@@ -43,7 +43,7 @@ class SingleImageGaussianMixtureEM:
         # Initialize positions randomly
         means = np.random.rand(n_gauss, 2) * [height, width]
 
-        # Initialize covariances with const
+        # Initialize covariances with constant for now
         cov_const = min(height, width) / 10  # You can adjust this constant
         covs = np.array([np.eye(2) * cov_const for _ in range(n_gauss)])
 
@@ -54,3 +54,84 @@ class SingleImageGaussianMixtureEM:
         alpha = np.full(n_gauss, alpha_0)
 
         return TwoDGaussians(means, covs, rgb, alpha)
+
+    def gaussian_pdf(
+        self, mean: np.ndarray, cov: np.ndarray, height: int, width: int
+    ) -> np.ndarray:
+        """Compute the Gaussian PDF for multiple points and multiple Gaussians.
+
+        Args:
+            mean (np.ndarray): Means of Gaussians, shape (K, 2)
+            cov (np.ndarray): Covariance matrices, shape (K, 2, 2)
+            height (int): Height of the image
+            width (int): Width of the image
+
+        Returns:
+            np.ndarray: Gaussian PDF values, shape (height, width, K)
+        """
+        k = mean.shape[0]
+        cov_inv = np.linalg.inv(cov)  # (K, 2, 2)
+        cov_det = np.linalg.det(cov)  # (K,)
+
+        # y, x = np.mgrid[0:height, 0:width]
+        n = np.zeros((height, width, k))
+
+        for i in range(height):
+            for j in range(width):
+                # xy = np.array([[j, i]])  # Note: x corresponds to j, y to i
+                # xy_m = xy - mean[:, None, :]  # (K, 1, 2)
+
+                # print(f"xy shape: {xy.shape}")
+                # print(f"xy_m shape: {xy_m.shape}")
+                # print(f"cov_inv shape: {cov_inv.shape}")
+
+                # temp1 = np.matmul(xy_m, cov_inv)  # (K, 1, 2)
+                # print(f"temp1 shape: {temp1.shape}")
+
+                # temp2 = np.array([[[j], [i]]]) - mean[:, :, None]  # (K, 2, 1)
+                # print(f"temp2 shape: {temp2.shape}")
+
+                # maha = np.matmul(temp1, temp2)[:, 0, 0]  # (K,)
+                # print(f"maha shape: {maha.shape}")
+
+                n[i, j, :] = (
+                    1.0
+                    / np.sqrt(2 * np.pi * cov_det)
+                    * np.exp(
+                        -0.5
+                        * np.matmul(
+                            np.matmul(np.array([[j, i]]) - mean[:, None, :], cov_inv),
+                            np.array([[[j], [i]]]) - mean[:, :, None],
+                        )[:, 0, 0]
+                    )
+                )
+
+        return n
+
+    def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
+        """Compute the responsibilities (gamma) for each pixel and each Gaussian.
+
+        Args:
+            gaussians (TwoDGaussians): The current Gaussian mixture model.
+
+        Returns:
+            ndarray: Responsibilities, shape (height, width, K).
+        """
+        height, width = self.image.shape[:2]
+
+        # spatial probabilities: N(x,y|μ_k,Σ_k)
+        n = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
+
+        # color probabilities: ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
+        c_sum = np.sum(gaussians.rgb ** self.image[:, :, None, :], axis=-1)
+
+        # concatenated probabilities: α_k N(x,y|μ_k,Σ_k) ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
+        responsibilities = gaussians.alpha[None, None, :] * n * c_sum
+
+        # Normalize: γ_{x,y,k} = (joint probability) / (sum of concatenated probabilities over all k)
+        sum_reciprocal = np.reciprocal(np.sum(responsibilities, axis=-1, keepdims=True))
+        responsibilities = responsibilities * sum_reciprocal
+
+        # responsibilities = responsibilities.astype(np.float64)
+        assert isinstance(responsibilities, np.ndarray)
+        return responsibilities

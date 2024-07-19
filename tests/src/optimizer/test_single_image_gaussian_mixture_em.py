@@ -64,6 +64,52 @@ def test_initialize_gaussians():
     assert np.all(gaussians.alpha == 0.4), "Alpha values should be 0.4"
 
 
+def test_e_step():
+    """Test the E-step (responsibility calculation) of the EM algorithm."""
+    # Create a dummy image and initialize SingleImageGaussianMixtureEM
+    dummy_image = np.random.rand(100, 100, 3)
+    gmm = SingleImageGaussianMixtureEM.__new__(SingleImageGaussianMixtureEM)
+    gmm.image = dummy_image
+
+    # Create dummy Gaussians
+    n_gauss = 5
+    means = np.random.rand(n_gauss, 2) * [100, 100]
+    covs = np.array([np.eye(2) * 10 for _ in range(n_gauss)])
+    rgb = np.random.rand(n_gauss, 3)
+    alpha = np.random.rand(n_gauss)
+    alpha /= np.sum(alpha)  # Normalize alpha
+    gaussians = TwoDGaussians(means, covs, rgb, alpha)
+
+    # Run E-step
+    responsibilities = gmm.e_step(gaussians)
+    # check responsibility dtype -> fails on "make lint"
+    assert isinstance(
+        responsibilities, np.ndarray
+    ), "responsibilities should be a numpy array"
+    assert (
+        responsibilities.dtype == np.float64
+    ), f"Expected dtype float64, but got {responsibilities.dtype}"
+    # Check shape
+    assert responsibilities.shape == (
+        100,
+        100,
+        n_gauss,
+    ), "Incorrect shape of responsibilities"
+
+    # Check if responsibilities sum to 1 for each pixel
+    np.testing.assert_allclose(
+        np.sum(responsibilities, axis=2),
+        1,
+        atol=1e-5,
+        err_msg="Responsibilities don't sum to 1",
+    )
+
+    # Check that all values are between 0 and 1
+    assert np.all(
+        (responsibilities >= 0) & (responsibilities <= 1)
+    ), "Responsibilities should be between 0 and 1"
+
+
 # TODO: not sure if this test is necessary -> グレイスケールとかでもできるべき？
 # def test_single_image_gaussian_mixture_em_invalid_image():
 #     """Test the initialization with an invalid image format (e.g., non-RGB image)."""
