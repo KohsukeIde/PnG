@@ -1,6 +1,7 @@
 [tool.poetry]
 name = "perspectice-n-gaussian"
 version = "0.1.3"
+packages = [{include = "src", from = "."}]
 description = "Project template for XCCV group of cvpaper.challenge."
 license = "MIT"
 authors = ["cvpaper.challenge XCCV group"]
