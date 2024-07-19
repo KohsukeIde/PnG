@@ -6,7 +6,7 @@ from src.primitive.twod_gaussians import TwoDGaussians
 from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
 
 
-def test_vanilla_2d_rasterizer_creatioin():
+def test_vanilla_2d_rasterizer_creation():
     """Test the creation of Vanilla2DRasterizer."""
     rasterizer = Vanilla2DRasterizer(64, 128)
     assert rasterizer.height == 64

@@ -14,7 +14,7 @@ class Vanilla2DRasterizer:
     """
 
     def __init__(self, height: int, width: int) -> None:
-        """Initialize the Vanilla2DRasterizerwith rasterize target image size.
+        """Initialize the Vanilla2DRasterizer with rasterize target image size.
 
         Args:
             height (int): rasterize target image height
@@ -50,9 +50,9 @@ class Vanilla2DRasterizer:
         img = np.zeros((self.height * self.width, 3), np.float64)
         for k in range(gaussians.k):
             cov_det = np.linalg.det(gaussians.covs[k, :, :])
-            cov_inv = np.linalg.pinv(gaussians.covs[k, :, :])
             if cov_det < 0:
                 raise ValueError("Covariance determinant should positive.")
+            cov_inv = np.linalg.inv(gaussians.covs[k, :, :])
             # Scaled Color (ndarray[1, 3])
             scaled_color = (
                 0.5
