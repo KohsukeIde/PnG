@@ -67,7 +67,8 @@ def test_initialize_gaussians():
 def test_e_step():
     """Test the E-step (responsibility calculation) of the EM algorithm."""
     # Create a dummy image and initialize SingleImageGaussianMixtureEM
-    dummy_image = np.random.rand(100, 100, 3)
+    height, width = 100, 100
+    dummy_image = np.random.rand(height, width, 3)
     gmm = SingleImageGaussianMixtureEM.__new__(SingleImageGaussianMixtureEM)
     gmm.image = dummy_image
 
@@ -108,6 +109,33 @@ def test_e_step():
     assert np.all(
         (responsibilities >= 0) & (responsibilities <= 1)
     ), "Responsibilities should be between 0 and 1"
+    
+def test_m_step():
+    # Create a dummy image and initialize SingleImageGaussianMixtureEM
+    height, width = 100, 100
+    k = 5
+    
+    dummy_image = np.random.rand(height, width, 3)
+    gamma = np.random.rand(height, width, k)
+    gamma /= np.sum(gamma, axis=2, keepdims=True)  # Normalize
+    
+    gaussians = TwoDGaussians(
+        means=np.random.rand(k, 2),
+        covs=np.array([np.eye(2) for _ in range(k)]),
+        rgb=np.random.rand(k, 3),
+        alpha=np.ones(k) / k
+    )
+    
+    # Create a partial SingleImageGaussianMixtureEM object
+    em = SingleImageGaussianMixtureEM.__new__(SingleImageGaussianMixtureEM)
+    em.image = dummy_image  # Directly set the image attribute
+    
+    # Run m_step
+    new_gaussians = em.m_step(gamma, gaussians)
+    
+    # Check that m_step completes without error and returns a TwoDGaussians object
+    assert isinstance(new_gaussians, TwoDGaussians)
+    assert new_gaussians.k == k
 
 
 # TODO: not sure if this test is necessary -> グレイスケールとかでもできるべき？
