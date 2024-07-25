@@ -38,6 +38,9 @@ opencv-python = "^4.10.0"
 numpy = "^2.0.0"
 pillow = "^10.4.0"
 
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+
 [tool.mypy]
 python_version = 3.9
 # following setting is same as pysen

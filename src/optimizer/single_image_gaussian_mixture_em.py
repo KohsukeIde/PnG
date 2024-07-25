@@ -136,72 +136,91 @@ class SingleImageGaussianMixtureEM:
         assert isinstance(responsibilities, np.ndarray)
         return responsibilities
 
-    def m_step(
-        self, responsibilities: np.ndarray, gaussians: TwoDGaussians
-    ) -> TwoDGaussians:
-        """
-        Update the parameters of the Gaussian mixture model.
+    def m_step(self, gamma: np.ndarray, gaussians: TwoDGaussians) -> TwoDGaussians:
+        """Update the parameters of the Gaussian mixture model.
 
         Args:
-            responsibilities (ndarray): Responsibilities, shape (height, width, K).
+            gamma (ndarray): Responsibilities, shape (height, width, K).
             gaussians (TwoDGaussians): Current Gaussian mixture model.
 
         Returns:
             TwoDGaussians: Updated Gaussian mixture model.
         """
         height, width = self.image.shape[:2]
-        k = gaussians.k
+        # k = gaussians.k
 
         # Compute sum of responsibilities for each Gaussian
-        n_k = np.sum(responsibilities, axis=(0, 1))  # shape: (k,)
+        n_k = np.sum(gamma, axis=(0, 1))  # shape: (k,)
         n_k_reciprocal = np.reciprocal(n_k)
+
+        # Create meshgrid for x and y coordinates
+        y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+        xy = np.stack([x, y], axis=-1)  # shape: (height, width, 2)
 
         # Update means
         # μ_k' = Σ_{x,y} γ_{x,y,k} * (x,y) / Σ_{x,y} γ_{x,y,k}
-        new_means = np.zeros((k, 2))
-        for i in range(k):
-            for y in range(height):
-                for x in range(width):
-                    new_means[i] = new_means[i] + responsibilities[y, x, i] * np.array(
-                        [x, y]
-                    )
+
+        new_means = np.sum(gamma[:, :, :, None] * xy[:, :, None, :], axis=(0, 1))
         new_means = new_means * n_k_reciprocal[:, None]
+
+        # new_means = np.zeros((k, 2))
+        # for i in range(k):
+        #     for y in range(height):
+        #         for x in range(width):
+        #             new_means[i] = new_means[i] +gamma[y, x, i] * np.array(
+        #                 [x, y]
+        #             )
+        # new_means = new_means * n_k_reciprocal[:, None]
 
         # Update covariances
         # Σ_k' = Σ_{x,y} γ_{x,y,k} * ((x,y) - μ_k')((x,y) - μ_k')^T / Σ_{x,y} γ_{x,y,k}
-        new_covs = np.zeros((k, 2, 2))
-        for i in range(k):
-            for y in range(height):
-                for x in range(width):
-                    diff = np.array([x, y]) - new_means[i]
-                    new_covs[i] = new_covs[i] + responsibilities[y, x, i] * np.outer(
-                        diff, diff
-                    )
+        diff = xy[:, :, None, :] - new_means[None, None, :, :]
+        new_covs = np.einsum("ijkl,ijkm,ijk->klm", diff, diff, gamma)
         new_covs = new_covs * n_k_reciprocal[:, None, None]
+
+        # new_covs = np.zeros((k, 2, 2))
+        # for i in range(k):
+        #     for y in range(height):
+        #         for x in range(width):
+        #             diff = np.array([x, y]) - new_means[i]
+        #             new_covs[i] = new_covs[i] + gamma[y, x, i] * np.outer(
+        #                 diff, diff
+        #             )
+        # new_covs = new_covs * n_k_reciprocal[:, None, None]
 
         # Update mixing coefficients (alpha)
         # α_k' = Σ_{x,y,i} I_{x,y,i} * γ_{x,y,k} / Σ_{x,y,i} I_{x,y,i}
         pixel_sum = np.sum(self.image)
         pixel_sum_reciprocal = np.reciprocal(pixel_sum)
-        new_alpha = np.zeros(k)
-        for i in range(k):
-            for y in range(height):
-                for x in range(width):
-                    new_alpha[i] = (
-                        new_alpha[i]
-                        + np.sum(self.image[y, x]) * responsibilities[y, x, i]
-                    )
+        new_alpha = np.sum(np.sum(self.image, axis=2)[:, :, None] * gamma, axis=(0, 1))
         new_alpha = new_alpha * pixel_sum_reciprocal
+
+        # pixel_sum = np.sum(self.image)
+        # pixel_sum_reciprocal = np.reciprocal(pixel_sum)
+        # new_alpha = np.zeros(k)
+        # for i in range(k):
+        #     for y in range(height):
+        #         for x in range(width):
+        #             new_alpha[i] = (
+        #                 new_alpha[i]
+        #                 + np.sum(self.image[y, x]) * gamma[y, x, i]
+        #             )
+        # new_alpha = new_alpha * pixel_sum_reciprocal
 
         # Update colors
         # c_k' = Σ_{x,y} γ_{x,y,k} * I_{x,y} / Σ_{x,y} γ_{x,y,k}
-        new_colors = np.zeros((k, 3))
-        for i in range(k):
-            for y in range(height):
-                for x in range(width):
-                    new_colors[i] = (
-                        new_colors[i] + responsibilities[y, x, i] * self.image[y, x]
-                    )
+        new_colors = np.sum(
+            self.image[:, :, None, :] * gamma[:, :, :, None], axis=(0, 1)
+        )
         new_colors = new_colors * n_k_reciprocal[:, None]
+
+        # new_colors = np.zeros((k, 3))
+        # for i in range(k):
+        #     for y in range(height):
+        #         for x in range(width):
+        #             new_colors[i] = (
+        #                 new_colors[i] + gamma[y, x, i] * self.image[y, x]
+        #             )
+        # new_colors = new_colors * n_k_reciprocal[:, None]
 
         return TwoDGaussians(new_means, new_covs, new_colors, new_alpha)

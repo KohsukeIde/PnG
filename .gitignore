@@ -14,3 +14,4 @@ __pycache__
 !environments/cpu/.env
 !environments/gpu/.env
 !data/tsukuba/*
+.DS_Store
