@@ -28,7 +28,7 @@ class SingleImageGaussianMixtureEM:
         # if self.image.ndim != 3 or self.image.shape[2] != 3:
         #     raise ValueError("Input image must be a 3-channel color image")
 
-    def initialize_gaussians(self, n_gauss: int, alpha_0: float = 0.4) -> TwoDGaussians:
+    def initialize_gaussians(self, n_gaussians: int, alpha_0: float = 0.4) -> TwoDGaussians:
         """Initialize Gaussians with naive settings.
 
         Args:
@@ -41,17 +41,17 @@ class SingleImageGaussianMixtureEM:
         height, width = self.image.shape[:2]
 
         # Initialize positions randomly
-        means = np.random.rand(n_gauss, 2) * [height, width]
+        means = np.random.rand(n_gaussians, 2) * [height, width]
 
         # Initialize covariances with constant for now
-        cov_const = min(height, width) / 10  # You can adjust this constant
-        covs = np.array([np.eye(2) * cov_const for _ in range(n_gauss)])
-
+        cov_const = min(height, width)  # adjustable  constant
+        covs = np.array([np.eye(2) * cov_const for _ in range(n_gaussians)])
         # Initialize RGB values from the image
         rgb = np.array([self.image[int(y), int(x)] for y, x in means])
 
         # Initialize alpha values
-        alpha = np.full(n_gauss, alpha_0)
+        alpha = np.full(n_gaussians, alpha_0)
+        alpha /= np.sum(alpha)
 
         return TwoDGaussians(means, covs, rgb, alpha)
 
@@ -70,7 +70,8 @@ class SingleImageGaussianMixtureEM:
             np.ndarray: Gaussian PDF values, shape (height, width, K)
         """
         k = mean.shape[0]
-        cov_inv = np.linalg.inv(cov)  # (K, 2, 2)
+        
+        cov_inv = np.linalg.pinv(cov)  # (K, 2, 2)
         cov_det = np.linalg.det(cov)  # (K,)
 
         # y, x = np.mgrid[0:height, 0:width]
@@ -147,11 +148,15 @@ class SingleImageGaussianMixtureEM:
             TwoDGaussians: Updated Gaussian mixture model.
         """
         height, width = self.image.shape[:2]
-        # k = gaussians.k
+        k = gaussians.k
 
         # Compute sum of responsibilities for each Gaussian
         n_k = np.sum(gamma, axis=(0, 1))  # shape: (k,)
         n_k_reciprocal = np.reciprocal(n_k)
+        # print(f"nk min: {n_k.min()}, max: {n_k.max()}, mean: {n_k.mean()}")
+        # small_nk_count = np.sum(n_k < 1e-6)
+        # print(f"Number of Gaussians with nk < 1e-6: {small_nk_count}")
+
 
         # Create meshgrid for x and y coordinates
         y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
@@ -159,7 +164,6 @@ class SingleImageGaussianMixtureEM:
 
         # Update means
         # μ_k' = Σ_{x,y} γ_{x,y,k} * (x,y) / Σ_{x,y} γ_{x,y,k}
-
         new_means = np.sum(gamma[:, :, :, None] * xy[:, :, None, :], axis=(0, 1))
         new_means = new_means * n_k_reciprocal[:, None]
 
@@ -187,6 +191,13 @@ class SingleImageGaussianMixtureEM:
         #                 diff, diff
         #             )
         # new_covs = new_covs * n_k_reciprocal[:, None, None]
+        
+        #Ensure covariance matrices are positive definite
+        epsilon = 1e-6
+        for i in range(k):
+            min_eig = np.min(np.real(np.linalg.eigvals(new_covs[i])))
+            if min_eig < epsilon:
+                new_covs[i] += (epsilon - min_eig) * np.eye(2)
 
         # Update mixing coefficients (alpha)
         # α_k' = Σ_{x,y,i} I_{x,y,i} * γ_{x,y,k} / Σ_{x,y,i} I_{x,y,i}
@@ -213,6 +224,7 @@ class SingleImageGaussianMixtureEM:
             self.image[:, :, None, :] * gamma[:, :, :, None], axis=(0, 1)
         )
         new_colors = new_colors * n_k_reciprocal[:, None]
+        
 
         # new_colors = np.zeros((k, 3))
         # for i in range(k):

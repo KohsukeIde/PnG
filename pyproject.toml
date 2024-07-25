@@ -37,6 +37,7 @@ pytest-cov = "^5.0.0"
 opencv-python = "^4.10.0"
 numpy = "^2.0.0"
 pillow = "^10.4.0"
+matplotlib = "^3.9.1"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

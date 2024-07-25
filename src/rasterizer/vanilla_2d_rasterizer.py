@@ -48,10 +48,19 @@ class Vanilla2DRasterizer:
         )
         # Initialize image with 0
         img = np.zeros((self.height * self.width, 3), np.float64)
+
+        # print(f"Number of Gaussians: {gaussians.k}")
+        # print(f"Means shape: {gaussians.means.shape}")
+        # print(f"Covs shape: {gaussians.covs.shape}")
+        # print(f"RGB shape: {gaussians.rgb.shape}")
+        # print(f"Alpha shape: {gaussians.alpha.shape}")
+
         for k in range(gaussians.k):
             cov_det = np.linalg.det(gaussians.covs[k, :, :])
             if cov_det < 0:
-                raise ValueError("Covariance determinant should positive.")
+                print(f"Warning: Negative covariance determinant for Gaussian {k}")
+                continue
+
             cov_inv = np.linalg.inv(gaussians.covs[k, :, :])
             # Scaled Color (ndarray[1, 3])
             scaled_color = (
@@ -60,6 +69,17 @@ class Vanilla2DRasterizer:
                 * gaussians.alpha[k]
                 * gaussians.rgb[k, None, :]
             )
+            # scaled_color = (
+            #     gaussians.alpha[k]
+            #     * gaussians.rgb[k, None, :]
+            # )
+            # print(f"Gaussian {k}:")
+            # print(f"  Mean: {gaussians.means[k]}")
+            # print(f"  Cov: {gaussians.covs[k]}")
+            # print(f"  RGB: {gaussians.rgb[k]}")
+            # print(f"  Alpha: {gaussians.alpha[k]}")
+            # print(f"  Scaled color: {scaled_color}")
+
             # Coordinates with gaussian's mean as origin (ndarray[height * width, 2])
             xy_k = xy - gaussians.means[k, None, :]
             # Normalized coordinates (ndarray[height*width, 2])
@@ -67,6 +87,7 @@ class Vanilla2DRasterizer:
             img += scaled_color * np.exp(-xy_n)
 
         # Reshape and convert to save image
+        img = img / img.max() * 255 # 0-255 scaling
         img_cv = img.reshape(self.height, self.width, 3).clip(0, 255).astype(np.uint8)
         if save_to_file:
             cv2.imwrite("outputs/tmp.png", img_cv)
