@@ -87,7 +87,7 @@ class Vanilla2DRasterizer:
             img += scaled_color * np.exp(-xy_n)
 
         # Reshape and convert to save image
-        img = img / img.max() * 255 # 0-255 scaling
+        img = img * 255 # 0-255 scaling
         img_cv = img.reshape(self.height, self.width, 3).clip(0, 255).astype(np.uint8)
         if save_to_file:
             cv2.imwrite("outputs/tmp.png", img_cv)

@@ -15,3 +15,7 @@ __pycache__
 !environments/gpu/.env
 !data/tsukuba/*
 .DS_Store
+/gaussian_mixture_results
+/debug_output
+
+

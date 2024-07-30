@@ -25,12 +25,63 @@ def visualize_gaussians(image, gaussians, iteration, output_dir):
     output_path = os.path.join(output_dir, f'gaussian_distribution_iter_{iteration}.png')
     plt.savefig(output_path)
     plt.close()
-    print(f"Saved: {output_path}")  # デバッグ用の出力を追加
+    print(f"Saved: {output_path}")
 
-def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=14):
+def visualize_responsibilities(responsibilities, iteration, output_dir):
+    plt.figure(figsize=(10, 8))
+    plt.imshow(np.sum(responsibilities, axis=2), cmap='hot')
+    plt.colorbar()
+    plt.title(f'Responsibilities Sum (Iteration {iteration})')
+    output_path = os.path.join(output_dir, f'responsibilities_sum_iter_{iteration}.png')
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Saved: {output_path}")
+
+def visualize_gaussian_parameters(gaussians, iteration, output_dir, image_height, image_width):
+    fig, axs = plt.subplots(2, 2, figsize=(20, 20))
+    
+    # Means
+    axs[0, 0].scatter(gaussians.means[:, 1], gaussians.means[:, 0])
+    axs[0, 0].set_title("Gaussian Means")
+    axs[0, 0].set_xlim(0, image_width)
+    axs[0, 0].set_ylim(image_height, 0)
+    
+    # Covariances
+    cov_det = np.array([np.linalg.det(cov) for cov in gaussians.covs])
+    axs[0, 1].hist(cov_det, bins=50)
+    axs[0, 1].set_title("Covariance Determinants")
+    
+    # Weights (alpha)
+    axs[1, 0].bar(range(len(gaussians.alpha)), gaussians.alpha)
+    axs[1, 0].set_title("Gaussian Weights (alpha)")
+    
+    # RGB values
+    axs[1, 1].scatter(range(gaussians.k), gaussians.rgb[:, 0], c='r', alpha=0.5, label='R')
+    axs[1, 1].scatter(range(gaussians.k), gaussians.rgb[:, 1], c='g', alpha=0.5, label='G')
+    axs[1, 1].scatter(range(gaussians.k), gaussians.rgb[:, 2], c='b', alpha=0.5, label='B')
+    axs[1, 1].set_title("RGB Values")
+    axs[1, 1].legend()
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, f'gaussian_parameters_iter_{iteration}.png')
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Saved: {output_path}")
+
+def visualize_log_likelihood(log_likelihood, iteration, output_dir):
+    plt.figure(figsize=(10, 8))
+    plt.imshow(log_likelihood, cmap='viridis')
+    plt.colorbar()
+    plt.title(f'Log Likelihood (Iteration {iteration})')
+    output_path = os.path.join(output_dir, f'log_likelihood_iter_{iteration}.png')
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Saved: {output_path}")
+
+def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
     gmm = SingleImageGaussianMixtureEM(image_path)
     
-    # 出力ディレクトリの作成
+    # 出力ディレクトリ
     base_output_dir = "gaussian_mixture_results"
     output_dir = os.path.join(base_output_dir, f"gaussians_{n_gaussians}_iterations_{n_iterations}")
     os.makedirs(output_dir, exist_ok=True)
@@ -50,6 +101,7 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=14):
     print("------------------------------------------------------------")
 
     visualize_gaussians(gmm.image, gaussians, 0, output_dir)
+    visualize_gaussian_parameters(gaussians, 0, output_dir, gmm.image.shape[0], gmm.image.shape[1])
 
     for i in range(n_iterations):
         responsibilities = gmm.e_step(gaussians)
@@ -57,6 +109,10 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=14):
         
         print(f"\nIteration {i+1} completed")
         visualize_gaussians(gmm.image, gaussians, i+1, output_dir)
+        visualize_responsibilities(responsibilities, i+1, output_dir)
+        visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
+        
+        # visualize_log_likelihood(log_likelihood, i+1, output_dir)
 
     print("\nFinal Gaussian statistics-------------------------------------")
     print(f"Means min-max: {gaussians.means.min()}, {gaussians.means.max()}")
