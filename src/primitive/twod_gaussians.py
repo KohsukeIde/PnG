@@ -22,6 +22,9 @@ class TwoDGaussians:
     covs: np.ndarray  # [k,2, 2, float]
     rgb: np.ndarray  # [k, 3, float]
     alpha: np.ndarray  # [k, float]
+    # rotation_angles: np.ndarray  # [k]
+    # scale_x: np.ndarray  # [k]
+    # scale_y: np.ndarray  # [k]
 
     def __post_init__(self) -> None:
         """Validate the shape and dimensions of the data arrays.
@@ -57,8 +60,42 @@ class TwoDGaussians:
         # Check if alpha is a 1D array
         if self.alpha.ndim != 1:
             raise ValueError("Alpha should be a 1D array")
+        
+        self._covs = self.covs
 
     @property
     def k(self) -> int:
         """Return the number of means, which is the number of Gaussians."""
         return self.means.shape[0]
+    
+    # @staticmethod
+    # def cov_to_params(cov):
+    #     eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    #     # print("{eigenvalue=}")
+    #     rotation_angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+    #     scale_x = np.sqrt(max(eigenvalues[0], 1e-6))
+    #     scale_y = np.sqrt(max(eigenvalues[1], 1e-6))
+    #     return rotation_angle, scale_x, scale_y
+
+    # @staticmethod
+    # def params_to_cov(rotation_angle, scale_x, scale_y):
+    #     R = np.array([[np.cos(rotation_angle), -np.sin(rotation_angle)],
+    #                 [np.sin(rotation_angle), np.cos(rotation_angle)]])
+    #     S = np.diag([scale_x, scale_y])
+    #     return R @ S @ S @ R.T
+
+    # @property
+    # def covs(self):
+    #     if self._covs is None:
+    #         return np.array([self.params_to_cov(angle, sx, sy) 
+    #                         for angle, sx, sy in zip(self.rotation_angles, self.scale_x, self.scale_y)])
+    #     return self._covs
+
+    # @covs.setter
+    # def covs(self, new_covs):
+    #     if new_covs is None:
+    #         self._covs = None
+    #     else:
+    #         self._covs = new_covs
+    #         params = [self.cov_to_params(cov) for cov in new_covs]
+    #         self.rotation_angles, self.scale_x, self.scale_y = map(np.array, zip(*params))

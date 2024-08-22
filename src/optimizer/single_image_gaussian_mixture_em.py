@@ -47,18 +47,29 @@ class SingleImageGaussianMixtureEM:
 
         # Initialize positions randomly
         means = np.random.rand(n_gaussians, 2) * [height, width]
-
+        
+        # Initialize rotation angles randomly
+        # rotation_angles = np.random.uniform(0, 2*np.pi, n_gaussians)
+        
+        # Initialize scales with constant for now
+        # scale_const = np.sqrt(min(height, width)/10)
+        # scale_x = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
+        # scale_y = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
+        
         # Initialize covariances with constant for now
         cov_const = min(height, width)/10 # adjustable  constant
         covs = np.array([np.eye(2) * cov_const for _ in range(n_gaussians)])
+        # covs = np.array([TwoDGaussians.params_to_cov(angle, sx, sy) for angle, sx, sy in zip(rotation_angles, scale_x, scale_y)])
+        
         # Initialize RGB values from the image
         rgb = np.array([self.image[int(y), int(x)] for y, x in means])
-
+        print(f"{rgb=}")
+        print(f"np.max{rgb=}")
         # Initialize alpha values
         alpha = np.full(n_gaussians, alpha_0)
         alpha /= np.sum(alpha)
 
-        return TwoDGaussians(means, covs, rgb, alpha)
+        return TwoDGaussians(means, covs ,rgb, alpha)
 
     def gaussian_pdf(
         self, mean: np.ndarray, cov: np.ndarray, height: int, width: int
@@ -111,6 +122,7 @@ class SingleImageGaussianMixtureEM:
                     )
                 )
         return n
+    
 
     def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
         """Compute the responsibilities (gamma) for each pixel and each Gaussian."""
@@ -232,6 +244,11 @@ class SingleImageGaussianMixtureEM:
         #                 diff, diff
         #             )
         # new_covs = new_covs * n_k_reciprocal[:, None, None]
+        
+        # Apply constraints to covariance matrices
+        # params = [TwoDGaussians.cov_to_params(cov) for cov in new_covs]
+        # new_rotation_angles, new_scale_x, new_scale_y = zip(*params)
+
 
         # Ensure covariance matrices are positive definite
         epsilon = 1e-6
@@ -267,7 +284,7 @@ class SingleImageGaussianMixtureEM:
         new_colors = np.sum(
             self.image[:, :, None, :] * gamma[:, :, :, None], axis=(0, 1)
         )
-        new_colors = new_colors * n_k_reciprocal[:, None]
+        # new_colors = new_colors * n_k_reciprocal[:, None]
 
         # new_colors = np.zeros((k, 3))
         # for i in range(k):
