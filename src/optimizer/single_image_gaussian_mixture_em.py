@@ -1,8 +1,11 @@
+import os
+
 import numpy as np
 from PIL import Image
 
 from src.primitive.twod_gaussians import TwoDGaussians
-import os
+
+
 
 class SingleImageGaussianMixtureEM:
     """conduct Gaussian Mixture Model optimization on a single image using the EM algorithm."""
@@ -27,14 +30,14 @@ class SingleImageGaussianMixtureEM:
 
         # if self.image.ndim != 3 or self.image.shape[2] != 3:
         #     raise ValueError("Input image must be a 3-channel color image")
-        
-        
 
-    def initialize_gaussians(self, n_gaussians: int, alpha_0: float = 0.4) -> TwoDGaussians:
+    def initialize_gaussians(
+        self, n_gaussians: int, alpha_0: float = 0.4
+    ) -> TwoDGaussians:
         """Initialize Gaussians with naive settings.
 
         Args:
-            n_gauss (int): Number of Gaussians to initialize.
+            n_gaussians (int): Number of Gaussians to initialize.
             alpha_0 (float, optional): Initial alpha value. Defaults to 0.4.
 
         Returns:
@@ -46,7 +49,7 @@ class SingleImageGaussianMixtureEM:
         means = np.random.rand(n_gaussians, 2) * [height, width]
 
         # Initialize covariances with constant for now
-        cov_const = min(height, width)  # adjustable  constant
+        cov_const = min(height, width)/10 # adjustable  constant
         covs = np.array([np.eye(2) * cov_const for _ in range(n_gaussians)])
         # Initialize RGB values from the image
         rgb = np.array([self.image[int(y), int(x)] for y, x in means])
@@ -73,10 +76,10 @@ class SingleImageGaussianMixtureEM:
         """
         k = mean.shape[0]
         cov_inv = np.linalg.pinv(cov)  # (K, 2, 2)
-        cov_inv += np.eye(2)[None, :, :] * 1e-6 
-        
+        cov_inv += np.eye(2)[None, :, :] * 1e-6
+
         cov_det = np.linalg.det(cov)  # (K,)
-        
+
         n = np.zeros((height, width, k))
         for i in range(height):
             for j in range(width):
@@ -111,38 +114,54 @@ class SingleImageGaussianMixtureEM:
 
     def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
         """Compute the responsibilities (gamma) for each pixel and each Gaussian."""
-        os.makedirs('debug_output', exist_ok=True)
+        os.makedirs("debug_output", exist_ok=True)
         height, width = self.image.shape[:2]
+        
+        image_pixels = self.image.reshape(-1, 3)
 
-        with open('debug_output/e_step_debug.txt', 'w') as f:
+        with open("debug_output/e_step_debug.txt", "w") as f:
             f.write(f"Image shape: {self.image.shape}\n")
             f.write(f"Gaussians: {gaussians}\n\n")
-            
+            f.write(f"Image pixels shape: {image_pixels.shape}\n\n")  # 新しいデバッグ出力
+
+
             # spatial probabilities: N(x,y|μ_k,Σ_k)
             n = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
             f.write(f"n shape: {n.shape}\n")
             f.write(f"n min: {n.min()}, max: {n.max()}, mean: {n.mean()}\n\n")
 
             # color probabilities: ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
-            color_prob = np.prod(gaussians.rgb[None, None, :, :] ** self.image[:, :, None, :], axis=3)
+            color_prob = np.prod(
+                gaussians.rgb[None, None, :, :] ** self.image[:, :, None, :], axis=3
+            )
             f.write(f"color_prob shape: {color_prob.shape}\n")
-            f.write(f"color_prob min: {color_prob.min()}, max: {color_prob.max()}, mean: {color_prob.mean()}\n\n")
+            f.write(
+                f"color_prob min: {color_prob.min()}, max: {color_prob.max()}, mean: {color_prob.mean()}\n\n"
+            )
 
             # concatenated probabilities: α_k N(x,y|μ_k,Σ_k) ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
             responsibilities = gaussians.alpha[None, None, :] * n * color_prob
             f.write(f"responsibilities shape: {responsibilities.shape}\n")
-            f.write(f"responsibilities min: {responsibilities.min()}, max: {responsibilities.max()}, mean: {responsibilities.mean()}\n\n")
+            f.write(
+                f"responsibilities min: {responsibilities.min()}, max: {responsibilities.max()}, mean: {responsibilities.mean()}\n\n"
+            )
 
             # Normalize: γ_{x,y,k} = (concatenated probability) / (sum of concatenated probabilities over all k)
             responsibilities_sum = np.sum(responsibilities, axis=-1, keepdims=True)
-            responsibilities_sum = np.maximum(responsibilities_sum, 1e-10)  # 数値的安定性のため
+            responsibilities_sum = np.maximum(
+                responsibilities_sum, 1e-10
+            )  # 数値的安定性のため
             responsibilities_reciprocal = np.reciprocal(responsibilities_sum)
             responsibilities = responsibilities * responsibilities_reciprocal
 
-            f.write(f"Normalized responsibilities min: {responsibilities.min()}, max: {responsibilities.max()}, mean: {responsibilities.mean()}\n\n")
+            f.write(
+                f"Normalized responsibilities min: {responsibilities.min()}, max: {responsibilities.max()}, mean: {responsibilities.mean()}\n\n"
+            )
 
         assert isinstance(responsibilities, np.ndarray)
         return responsibilities
+    
+
 
     def m_step(self, gamma: np.ndarray, gaussians: TwoDGaussians) -> TwoDGaussians:
         """Update the parameters of the Gaussian mixture model.
@@ -159,12 +178,26 @@ class SingleImageGaussianMixtureEM:
 
         # Compute sum of responsibilities for each Gaussian
         n_k = np.sum(gamma, axis=(0, 1))  # shape: (k,)
-        n_k = np.maximum(n_k, 1e-10) #avoid division by zero
+        # processing Gaussians with low responsibility
+        responsibility_threshold = 1e-6
+        small_responsibility_indices = np.where(n_k < responsibility_threshold)[0]
+        
+        if len(small_responsibility_indices) > 0:
+            print(f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities")
+            for idx in small_responsibility_indices:
+                # assign random means and covariances
+                gaussians.means[idx] = np.random.rand(2) * [height, width]
+                gaussians.covs[idx] = np.eye(2) * min(height, width) / 10
+                gaussians.rgb[idx] = self.image[int(gaussians.means[idx, 0]), int(gaussians.means[idx, 1])]
+            # recompute responsibility
+            gamma = self.e_step(gaussians)
+            
+        n_k = np.sum(gamma, axis=(0, 1))
+        n_k = np.maximum(n_k, 1e-10)  # avoid division by zero
         n_k_reciprocal = np.reciprocal(n_k)
         # print(f"nk min: {n_k.min()}, max: {n_k.max()}, mean: {n_k.mean()}")
         # small_nk_count = np.sum(n_k < 1e-6)
         # print(f"Number of Gaussians with nk < 1e-6: {small_nk_count}")
-
 
         # Create meshgrid for x and y coordinates
         y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
@@ -199,8 +232,8 @@ class SingleImageGaussianMixtureEM:
         #                 diff, diff
         #             )
         # new_covs = new_covs * n_k_reciprocal[:, None, None]
-        
-        #Ensure covariance matrices are positive definite
+
+        # Ensure covariance matrices are positive definite
         epsilon = 1e-6
         for i in range(k):
             min_eig = np.min(np.real(np.linalg.eigvals(new_covs[i])))
@@ -211,7 +244,10 @@ class SingleImageGaussianMixtureEM:
         # α_k' = Σ_{x,y,i} I_{x,y,i} * γ_{x,y,k} / Σ_{x,y,i} I_{x,y,i}
         pixel_sum = np.sum(self.image)
         pixel_sum_reciprocal = np.reciprocal(pixel_sum)
-        new_alpha = np.sum(np.sum(self.image[:, :, :, None] * gamma[:, :, None, :], axis=2), axis=(0, 1))
+        new_alpha = np.sum(
+            np.sum(self.image[:, :, :, None] * gamma[:, :, None, :], axis=2),
+            axis=(0, 1),
+        )
         new_alpha = new_alpha * pixel_sum_reciprocal
 
         # pixel_sum = np.sum(self.image)
@@ -232,7 +268,6 @@ class SingleImageGaussianMixtureEM:
             self.image[:, :, None, :] * gamma[:, :, :, None], axis=(0, 1)
         )
         new_colors = new_colors * n_k_reciprocal[:, None]
-        
 
         # new_colors = np.zeros((k, 3))
         # for i in range(k):
