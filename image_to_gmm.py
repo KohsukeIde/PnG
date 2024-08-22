@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil 
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -81,11 +82,16 @@ def visualize_log_likelihood(log_likelihood, iteration, output_dir):
 def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
     gmm = SingleImageGaussianMixtureEM(image_path)
     
-    # 出力ディレクトリ
     base_output_dir = "gaussian_mixture_results"
     output_dir = os.path.join(base_output_dir, f"gaussians_{n_gaussians}_iterations_{n_iterations}")
-    os.makedirs(output_dir, exist_ok=True)
     
+    # Check if the output directory exists, and if so, delete it
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+        print(f"Deleted existing directory: {output_dir}")
+        
+    # Recreate the directory
+    os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory created: {output_dir}")
     
     print("Image shape:", gmm.image.shape)
@@ -112,7 +118,6 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
         visualize_responsibilities(responsibilities, i+1, output_dir)
         visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
         
-        # visualize_log_likelihood(log_likelihood, i+1, output_dir)
 
     print("\nFinal Gaussian statistics-------------------------------------")
     print(f"Means min-max: {gaussians.means.min()}, {gaussians.means.max()}")
@@ -154,8 +159,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Gaussian Mixture Model EM algorithm on an image")
     parser.add_argument("--image_path", type=str, default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
                         help="Path to the input image")
-    parser.add_argument("--n_gaussians", type=int, default=300, help="Number of Gaussians")
-    parser.add_argument("--n_iterations", type=int, default=14, help="Number of EM iterations")
+    parser.add_argument("--n_gaussians", type=int, default=3000, help="Number of Gaussians")
+    parser.add_argument("--n_iterations", type=int, default=5, help="Number of EM iterations")
     args = parser.parse_args()
 
     final_gaussians = run_gaussian_mixture_on_image(args.image_path, args.n_gaussians, args.n_iterations)
