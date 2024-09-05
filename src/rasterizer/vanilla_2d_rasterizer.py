@@ -3,7 +3,6 @@ import numpy as np
 
 from src.primitive.twod_gaussians import TwoDGaussians
 
-
 class Vanilla2DRasterizer:
     """Rasterize 2D Gaussians to rgb image.
     This class is naive(slow) implementation of GS rasterizer.
@@ -51,7 +50,7 @@ class Vanilla2DRasterizer:
         for k in range(gaussians.k):
             cov_det = np.linalg.det(gaussians.covs[k, :, :])
             if cov_det < 0:
-                raise ValueError("Covariance determinant should positive.")
+                raise ValueError("Covariance determinant should be positive.")
             cov_inv = np.linalg.inv(gaussians.covs[k, :, :])
             # Scaled Color (ndarray[1, 3])
             scaled_color = (
@@ -64,11 +63,13 @@ class Vanilla2DRasterizer:
             xy_k = xy - gaussians.means[k, None, :]
             # Normalized coordinates (ndarray[height*width, 2])
             xy_n = np.sum(np.matmul(xy_k, cov_inv) * xy_k, axis=1, keepdims=True)
+            # print(f"{scaled_color=}")
             img += scaled_color * np.exp(-xy_n)
 
         # Reshape and convert to save image
-        img = img / img * 255
+        img = img * 255
         img_cv = img.reshape(self.height, self.width, 3).clip(0, 255).astype(np.uint8)
+        # print(f"{np.max(img_cv)=}")
         if save_to_file:
             cv2.imwrite("outputs/tmp.png", img_cv)
 
