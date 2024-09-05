@@ -6,8 +6,6 @@ import numpy as np
 @dataclass
 class TwoDGaussians:
     """Represents a collection of 2D Gaussians with associated properties.
-
-
     Attributes:
         means (np.ndarray): Array of shape [k, 2] representing the means of k Gaussians.
         covs (np.ndarray): Array of shape [k, 2, 2] representing the covariance matrices of k Gaussians.
@@ -22,9 +20,9 @@ class TwoDGaussians:
     covs: np.ndarray  # [k,2, 2, float]
     rgb: np.ndarray  # [k, 3, float]
     alpha: np.ndarray  # [k, float]
-    # rotation_angles: np.ndarray  # [k]
-    # scale_x: np.ndarray  # [k]
-    # scale_y: np.ndarray  # [k]
+    # rotation_angles: np.ndarray  # [k, float]
+    # scale_x: np.ndarray  # [k, float]
+    # scale_y: np.ndarray  # [k, float]
 
     def __post_init__(self) -> None:
         """Validate the shape and dimensions of the data arrays.
@@ -68,34 +66,94 @@ class TwoDGaussians:
         """Return the number of means, which is the number of Gaussians."""
         return self.means.shape[0]
     
-    # @staticmethod
-    # def cov_to_params(cov):
-    #     eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    #     # print("{eigenvalue=}")
-    #     rotation_angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
-    #     scale_x = np.sqrt(max(eigenvalues[0], 1e-6))
-    #     scale_y = np.sqrt(max(eigenvalues[1], 1e-6))
-    #     return rotation_angle, scale_x, scale_y
 
-    # @staticmethod
-    # def params_to_cov(rotation_angle, scale_x, scale_y):
-    #     R = np.array([[np.cos(rotation_angle), -np.sin(rotation_angle)],
-    #                 [np.sin(rotation_angle), np.cos(rotation_angle)]])
-    #     S = np.diag([scale_x, scale_y])
-    #     return R @ S @ S @ R.T
 
-    # @property
-    # def covs(self):
-    #     if self._covs is None:
-    #         return np.array([self.params_to_cov(angle, sx, sy) 
-    #                         for angle, sx, sy in zip(self.rotation_angles, self.scale_x, self.scale_y)])
-    #     return self._covs
+# @dataclass
+# class TwoDGaussians:
+#     """Represents a collection of 2D Gaussians with associated properties.
+#     Attributes:
+#         means (np.ndarray): Array of shape [k, 2] representing the means of k Gaussians.
+#         covs (np.ndarray): Array of shape [k, 2, 2] representing the covariance matrices of k Gaussians.
+#         rgb (np.ndarray): Array of shape [k, 3] representing the RGB colors of k Gaussians.
+#         alpha (np.ndarray): Array of shape [k] representing the alpha values of k Gaussians.
 
-    # @covs.setter
-    # def covs(self, new_covs):
-    #     if new_covs is None:
-    #         self._covs = None
-    #     else:
-    #         self._covs = new_covs
-    #         params = [self.cov_to_params(cov) for cov in new_covs]
-    #         self.rotation_angles, self.scale_x, self.scale_y = map(np.array, zip(*params))
+#     Properties:
+#         k (int): The number of Gaussians in the collection.
+#     """
+
+#     means: np.ndarray  # [k, 2, float]
+#     scales: np.ndarray  # [k, 2, float]
+#     rotation_angles: np.ndarray  # [k, float]
+#     rgb: np.ndarray  # [k, 3, float]
+#     alpha: np.ndarray  # [k, float]
+
+#     def __post_init__(self) -> None:
+#         """Validate the shape and dimensions of the data arrays."""
+        
+#         # Check if all arrays have the same number of Gaussians
+#         if not (
+#             self.means.shape[0]
+#             == self.scales.shape[0]
+#             == self.rotation_angles.shape[0]
+#             == self.rgb.shape[0]
+#             == self.alpha.shape[0]
+#         ):
+#             raise ValueError("All arrays must have the same number of Gaussians")
+
+#         # Check if means are 2D
+#         if self.means.shape[1] != 2:
+#             raise ValueError("Means should be 2D")
+
+#         # Check if scales are 2D
+#         if self.scales.shape[1] != 2:
+#             raise ValueError("Scales should be 2D")
+
+#         # Check if rotation_angles is 1D
+#         if self.rotation_angles.ndim != 1:
+#             raise ValueError("Rotation angles should be a 1D array")
+
+#         # Check if RGB values have 3 channels
+#         if self.rgb.shape[1] != 3:
+#             raise ValueError("RGB values should have 3 channels")
+
+#         # Check if alpha is a 1D array
+#         if self.alpha.ndim != 1:
+#             raise ValueError("Alpha should be a 1D array")
+
+#     @property
+#     def k(self) -> int:
+#         """Return the number of means, which is the number of Gaussians."""
+#         return self.means.shape[0]
+
+#     @property
+#     def covs(self):
+#         return self.compute_covs_from_params()
+
+#     def compute_covs_from_params(self):
+#         covs = np.zeros((self.k, 2, 2))
+#         for i in range(self.k):
+#             R = self.rotation_matrix(self.rotation_angles[i])
+#             S = np.diag(self.scales[i])
+#             covs[i] = R @ S @ S.T @ R.T
+#         return covs
+
+#     @staticmethod
+#     def rotation_matrix(angle):
+#         c, s = np.cos(angle), np.sin(angle)
+#         return np.array([[c, -s], [s, c]])
+
+#     @staticmethod
+#     def cov_to_params(cov):
+#         eigenvalues, eigenvectors = np.linalg.eigh(cov)
+#         scales = np.sqrt(eigenvalues)
+#         rotation_angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+#         return scales, rotation_angle
+
+#     @classmethod
+#     def from_covs(cls, means, covs, rgb, alpha):
+#         k = means.shape[0]
+#         scales = np.zeros((k, 2))
+#         rotation_angles = np.zeros(k)
+#         for i in range(k):
+#             scales[i], rotation_angles[i] = cls.cov_to_params(covs[i])
+#         return cls(means, scales, rotation_angles, rgb, alpha)
