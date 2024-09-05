@@ -8,6 +8,7 @@ from matplotlib.patches import Ellipse
 import argparse
 
 from src.optimizer.single_image_gaussian_mixture_em import SingleImageGaussianMixtureEM
+# from src.optimizer.SIGMM import SingleImageGaussianMixtureEM
 from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
 
 def visualize_gaussians(image, gaussians, iteration, output_dir):
@@ -108,15 +109,35 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
 
     visualize_gaussians(gmm.image, gaussians, 0, output_dir)
     visualize_gaussian_parameters(gaussians, 0, output_dir, gmm.image.shape[0], gmm.image.shape[1])
-
+    
     for i in range(n_iterations):
         responsibilities = gmm.e_step(gaussians)
         gaussians = gmm.m_step(responsibilities, gaussians)
-        
         print(f"\nIteration {i+1} completed")
         visualize_gaussians(gmm.image, gaussians, i+1, output_dir)
-        visualize_responsibilities(responsibilities, i+1, output_dir)
+        # visualize_responsibilities(responsibilities, i+1, output_dir)
         visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
+        print(f"Iteration {i+1} - Gaussians RGB min-max: {gaussians.rgb.min()}, {gaussians.rgb.max()}")
+        print(f"Iteration {i+1} - Gaussians alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
+        
+        if (i + 1) % 1 == 0:  # Save every n iterations
+            height, width = gmm.image.shape[:2]
+            rasterizer = Vanilla2DRasterizer(height, width)
+            reconstructed_image = rasterizer.rasterize(gaussians)
+            reconstructed_image = reconstructed_image.astype(np.uint8)
+            
+            mse = np.mean((gmm.image - reconstructed_image/255.0)**2)
+            print(f"\nMean Squared Error at Iteration {i+1}: {mse}")
+            
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.imshow(reconstructed_image)
+            ax.set_title(f"Reconstructed Image (Iteration {i+1}, MSE: {mse:.5f})")
+            ax.axis('off')
+            
+            reconstructed_path = os.path.join(output_dir, f"reconstructed_image_iter_{i+1}.png")
+            plt.savefig(reconstructed_path)
+            plt.close()
+            print(f"Reconstructed image saved to {reconstructed_path}")
         
 
     print("\nFinal Gaussian statistics-------------------------------------")
@@ -160,7 +181,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_path", type=str, default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
                         help="Path to the input image")
     parser.add_argument("--n_gaussians", type=int, default=3000, help="Number of Gaussians")
-    parser.add_argument("--n_iterations", type=int, default=5, help="Number of EM iterations")
+    parser.add_argument("--n_iterations", type=int, default=8, help="Number of EM iterations")
     args = parser.parse_args()
 
     final_gaussians = run_gaussian_mixture_on_image(args.image_path, args.n_gaussians, args.n_iterations)
