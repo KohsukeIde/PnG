@@ -3,6 +3,7 @@ import numpy as np
 
 from src.primitive.twod_gaussians import TwoDGaussians
 
+
 class Vanilla2DRasterizer:
     """Rasterize 2D Gaussians to rgb image.
     This class is naive(slow) implementation of GS rasterizer.

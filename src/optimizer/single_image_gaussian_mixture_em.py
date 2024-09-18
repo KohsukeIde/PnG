@@ -6,7 +6,6 @@ from PIL import Image
 from src.primitive.twod_gaussians import TwoDGaussians
 
 
-
 class SingleImageGaussianMixtureEM:
     """conduct Gaussian Mixture Model optimization on a single image using the EM algorithm."""
 
@@ -47,20 +46,20 @@ class SingleImageGaussianMixtureEM:
 
         # Initialize positions randomly
         means = np.random.rand(n_gaussians, 2) * [height, width]
-        
+
         # Initialize rotation angles randomly
         # rotation_angles = np.random.uniform(0, 2*np.pi, n_gaussians)
-        
+
         # Initialize scales with constant for now
         # scale_const = np.sqrt(min(height, width)/10)
         # scale_x = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
         # scale_y = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
-        
+
         # Initialize covariances with constant for now
-        cov_const = min(height, width)/10 # adjustable  constant
+        cov_const = min(height, width) / 10  # adjustable  constant
         covs = np.array([np.eye(2) * cov_const for _ in range(n_gaussians)])
         # covs = np.array([TwoDGaussians.params_to_cov(angle, sx, sy) for angle, sx, sy in zip(rotation_angles, scale_x, scale_y)])
-        
+
         # Initialize RGB values from the image
         rgb = np.array([self.image[int(y), int(x)] for y, x in means])
         print(f"{rgb=}")
@@ -69,7 +68,7 @@ class SingleImageGaussianMixtureEM:
         alpha = np.full(n_gaussians, alpha_0)
         alpha /= np.sum(alpha)
 
-        return TwoDGaussians(means, covs ,rgb, alpha)
+        return TwoDGaussians(means, covs, rgb, alpha)
 
     def gaussian_pdf(
         self, mean: np.ndarray, cov: np.ndarray, height: int, width: int
@@ -122,20 +121,20 @@ class SingleImageGaussianMixtureEM:
                     )
                 )
         return n
-    
 
     def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
         """Compute the responsibilities (gamma) for each pixel and each Gaussian."""
         os.makedirs("debug_output", exist_ok=True)
         height, width = self.image.shape[:2]
-        
+
         image_pixels = self.image.reshape(-1, 3)
 
         with open("debug_output/e_step_debug.txt", "w") as f:
             f.write(f"Image shape: {self.image.shape}\n")
             f.write(f"Gaussians: {gaussians}\n\n")
-            f.write(f"Image pixels shape: {image_pixels.shape}\n\n")  # 新しいデバッグ出力
-
+            f.write(
+                f"Image pixels shape: {image_pixels.shape}\n\n"
+            )  
 
             # spatial probabilities: N(x,y|μ_k,Σ_k)
             n = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
@@ -172,8 +171,6 @@ class SingleImageGaussianMixtureEM:
 
         assert isinstance(responsibilities, np.ndarray)
         return responsibilities
-    
-
 
     def m_step(self, gamma: np.ndarray, gaussians: TwoDGaussians) -> TwoDGaussians:
         """Update the parameters of the Gaussian mixture model.
@@ -193,17 +190,21 @@ class SingleImageGaussianMixtureEM:
         # processing Gaussians with low responsibility
         responsibility_threshold = 1e-6
         small_responsibility_indices = np.where(n_k < responsibility_threshold)[0]
-        
+
         if len(small_responsibility_indices) > 0:
-            print(f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities")
+            print(
+                f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities"
+            )
             for idx in small_responsibility_indices:
                 # assign random means and covariances
                 gaussians.means[idx] = np.random.rand(2) * [height, width]
                 gaussians.covs[idx] = np.eye(2) * min(height, width) / 10
-                gaussians.rgb[idx] = self.image[int(gaussians.means[idx, 0]), int(gaussians.means[idx, 1])]
+                gaussians.rgb[idx] = self.image[
+                    int(gaussians.means[idx, 0]), int(gaussians.means[idx, 1])
+                ]
             # recompute responsibility
             gamma = self.e_step(gaussians)
-            
+
         n_k = np.sum(gamma, axis=(0, 1))
         n_k = np.maximum(n_k, 1e-10)  # avoid division by zero
         n_k_reciprocal = np.reciprocal(n_k)
@@ -244,11 +245,10 @@ class SingleImageGaussianMixtureEM:
         #                 diff, diff
         #             )
         # new_covs = new_covs * n_k_reciprocal[:, None, None]
-        
+
         # Apply constraints to covariance matrices
         # params = [TwoDGaussians.cov_to_params(cov) for cov in new_covs]
         # new_rotation_angles, new_scale_x, new_scale_y = zip(*params)
-
 
         # Ensure covariance matrices are positive definite
         epsilon = 1e-6

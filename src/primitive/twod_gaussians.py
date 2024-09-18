@@ -6,6 +6,7 @@ import numpy as np
 @dataclass
 class TwoDGaussians:
     """Represents a collection of 2D Gaussians with associated properties.
+
     Attributes:
         means (np.ndarray): Array of shape [k, 2] representing the means of k Gaussians.
         covs (np.ndarray): Array of shape [k, 2, 2] representing the covariance matrices of k Gaussians.
@@ -58,14 +59,13 @@ class TwoDGaussians:
         # Check if alpha is a 1D array
         if self.alpha.ndim != 1:
             raise ValueError("Alpha should be a 1D array")
-        
+
         self._covs = self.covs
 
     @property
     def k(self) -> int:
         """Return the number of means, which is the number of Gaussians."""
         return self.means.shape[0]
-    
 
 
 # @dataclass
@@ -89,7 +89,7 @@ class TwoDGaussians:
 
 #     def __post_init__(self) -> None:
 #         """Validate the shape and dimensions of the data arrays."""
-        
+
 #         # Check if all arrays have the same number of Gaussians
 #         if not (
 #             self.means.shape[0]

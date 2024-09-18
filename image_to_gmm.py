@@ -8,7 +8,6 @@ from matplotlib.patches import Ellipse
 import argparse
 
 from src.optimizer.single_image_gaussian_mixture_em import SingleImageGaussianMixtureEM
-# from src.optimizer.SIGMM import SingleImageGaussianMixtureEM
 from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
 
 def visualize_gaussians(image, gaussians, iteration, output_dir):
@@ -180,7 +179,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Gaussian Mixture Model EM algorithm on an image")
     parser.add_argument("--image_path", type=str, default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
                         help="Path to the input image")
-    parser.add_argument("--n_gaussians", type=int, default=3000, help="Number of Gaussians")
+    parser.add_argument("--n_gaussians", type=int, default=5000, help="Number of Gaussians")
     parser.add_argument("--n_iterations", type=int, default=8, help="Number of EM iterations")
     args = parser.parse_args()
 
