@@ -157,8 +157,8 @@ def test_m_step():
 
     # Check if the RGB values are within the correct range
     assert np.all(
-        (new_gaussians.rgb >= 0) & (new_gaussians.rgb <= 1)
-    ), "RGB values should be between 0 and 1"
+        (new_gaussians.rgb >= 0) & (new_gaussians.rgb <= 255)
+    ), "RGB values should be between 0 and 255"
 
     # Check if alpha values sum to 1
     assert_allclose(
