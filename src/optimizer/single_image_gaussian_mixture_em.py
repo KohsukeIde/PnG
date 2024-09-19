@@ -1,7 +1,9 @@
 import os
+from typing import List
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from src.primitive.twod_gaussians import TwoDGaussians
 
@@ -56,18 +58,14 @@ class SingleImageGaussianMixtureEM:
         # scale_y = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
 
         # Initialize covariances with constant for now
-        cov_const = min(height, width) / 10  # adjustable  constant
+        cov_const = np.sqrt(height * width) / 10  # adjustable constant
         covs = np.array([np.eye(2) * cov_const for _ in range(n_gaussians)])
         # covs = np.array([TwoDGaussians.params_to_cov(angle, sx, sy) for angle, sx, sy in zip(rotation_angles, scale_x, scale_y)])
 
         # Initialize RGB values from the image
         rgb = np.array([self.image[int(y), int(x)] for y, x in means])
-        print(f"{rgb=}")
-        print(f"np.max{rgb=}")
         # Initialize alpha values
         alpha = np.full(n_gaussians, alpha_0)
-        alpha /= np.sum(alpha)
-
         return TwoDGaussians(means, covs, rgb, alpha)
 
     def gaussian_pdf(
@@ -132,9 +130,7 @@ class SingleImageGaussianMixtureEM:
         with open("debug_output/e_step_debug.txt", "w") as f:
             f.write(f"Image shape: {self.image.shape}\n")
             f.write(f"Gaussians: {gaussians}\n\n")
-            f.write(
-                f"Image pixels shape: {image_pixels.shape}\n\n"
-            )  
+            f.write(f"Image pixels shape: {image_pixels.shape}\n\n")
 
             # spatial probabilities: N(x,y|μ_k,Σ_k)
             n = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
@@ -158,16 +154,10 @@ class SingleImageGaussianMixtureEM:
             )
 
             # Normalize: γ_{x,y,k} = (concatenated probability) / (sum of concatenated probabilities over all k)
-            responsibilities_sum = np.sum(responsibilities, axis=-1, keepdims=True)
-            responsibilities_sum = np.maximum(
-                responsibilities_sum, 1e-10
-            )  # 数値的安定性のため
-            responsibilities_reciprocal = np.reciprocal(responsibilities_sum)
-            responsibilities = responsibilities * responsibilities_reciprocal
-
-            f.write(
-                f"Normalized responsibilities min: {responsibilities.min()}, max: {responsibilities.max()}, mean: {responsibilities.mean()}\n\n"
+            sum_reciprocal = np.reciprocal(
+                np.sum(responsibilities, axis=-1, keepdims=True)
             )
+            responsibilities = responsibilities * sum_reciprocal
 
         assert isinstance(responsibilities, np.ndarray)
         return responsibilities
@@ -184,13 +174,16 @@ class SingleImageGaussianMixtureEM:
         """
         height, width = self.image.shape[:2]
         k = gaussians.k
-
         # Compute sum of responsibilities for each Gaussian
-        n_k = np.sum(gamma, axis=(0, 1))  # shape: (k,)
+        n_k = np.sum(gamma, axis=(0, 1))
+        n_k = np.maximum(n_k, 1e-10)  # avoid division by zero
+        n_k_reciprocal = np.reciprocal(n_k)
+
         # processing Gaussians with low responsibility
         responsibility_threshold = 1e-6
         small_responsibility_indices = np.where(n_k < responsibility_threshold)[0]
 
+        # randomly initialize gaussian with small responsibility
         if len(small_responsibility_indices) > 0:
             print(
                 f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities"
@@ -205,7 +198,7 @@ class SingleImageGaussianMixtureEM:
             # recompute responsibility
             gamma = self.e_step(gaussians)
 
-        n_k = np.sum(gamma, axis=(0, 1))
+            n_k = np.sum(gamma, axis=(0, 1))
         n_k = np.maximum(n_k, 1e-10)  # avoid division by zero
         n_k_reciprocal = np.reciprocal(n_k)
         # print(f"nk min: {n_k.min()}, max: {n_k.max()}, mean: {n_k.mean()}")
@@ -251,11 +244,8 @@ class SingleImageGaussianMixtureEM:
         # new_rotation_angles, new_scale_x, new_scale_y = zip(*params)
 
         # Ensure covariance matrices are positive definite
-        epsilon = 1e-6
-        for i in range(k):
-            min_eig = np.min(np.real(np.linalg.eigvals(new_covs[i])))
-            if min_eig < epsilon:
-                new_covs[i] += (epsilon - min_eig) * np.eye(2)
+        for i in tqdm(range(k), desc="Updating covariances"):
+            new_covs[i] = self.ensure_positive_definite(new_covs[i])
 
         # Update mixing coefficients (alpha)
         # α_k' = Σ_{x,y,i} I_{x,y,i} * γ_{x,y,k} / Σ_{x,y,i} I_{x,y,i}
@@ -265,7 +255,10 @@ class SingleImageGaussianMixtureEM:
             np.sum(self.image[:, :, :, None] * gamma[:, :, None, :], axis=2),
             axis=(0, 1),
         )
+        # alphaのtotalは1になる？？？
         new_alpha = new_alpha * pixel_sum_reciprocal
+
+        # new_alpha = np.sum(gamma, axis=(0, 1)) / (height * width)
 
         # pixel_sum = np.sum(self.image)
         # pixel_sum_reciprocal = np.reciprocal(pixel_sum)
@@ -286,6 +279,12 @@ class SingleImageGaussianMixtureEM:
         )
         # new_colors = new_colors * n_k_reciprocal[:, None]
 
+        # new colors must stay in range between 0 and 255?)
+        new_colors = new_colors * 255
+        max_value = np.max(new_colors)
+        if max_value > 255:
+            new_colors = (new_colors / max_value) * 255
+
         # new_colors = np.zeros((k, 3))
         # for i in range(k):
         #     for y in range(height):
@@ -294,10 +293,63 @@ class SingleImageGaussianMixtureEM:
         #                 new_colors[i] + gamma[y, x, i] * self.image[y, x]
         #             )
         # new_colors = new_colors * n_k_reciprocal[:, None]
-
+        print("############################################################")
         print(f"New means min-max: {np.min(new_means)}, {np.max(new_means)}")
         print(f"New covs min-max: {np.min(new_covs)}, {np.max(new_covs)}")
         print(f"New colors min-max: {np.min(new_colors)}, {np.max(new_colors)}")
         print(f"New alpha min-max: {np.min(new_alpha)}, {np.max(new_alpha)}")
+        self.print_covariance_stats(new_covs)
+        print("############################################################")
 
         return TwoDGaussians(new_means, new_covs, new_colors, new_alpha)
+
+    def ensure_positive_definite(
+        self, cov: np.ndarray, min_eigenvalue: float = 1e-6
+    ) -> np.ndarray:
+        """Ensure the covariance matrix is positive definite.
+
+        Args:
+            cov (np.ndarray): The covariance matrix to check and adjust.
+            min_eigenvalue (float): The minimum eigenvalue threshold.
+
+        Returns:
+            np.ndarray: The adjusted positive definite covariance matrix.
+        """
+        try:
+            np.linalg.cholesky(cov)
+            return cov
+        except np.linalg.LinAlgError:
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            eigenvalues = np.maximum(eigenvalues, min_eigenvalue)
+            return np.ndarray(eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T)
+
+    def check_positive_definite(self, cov: np.ndarray) -> bool:
+        """Check if the covariance matrix is positive definite.
+
+        Args:
+            cov (np.ndarray): The covariance matrix to check.
+
+        Returns:
+            bool: True if the matrix is positive definite, False otherwise.
+        """
+        eigenvalues = np.linalg.eigvals(cov)
+        return bool(np.all(eigenvalues > 0))
+
+    def print_covariance_stats(self, new_covs: List[np.ndarray]) -> None:
+        """Print statistics about the covariance matrices.
+
+        Args:
+            new_covs (List[np.ndarray]): List of new covariance matrices.
+        """
+        det_values = np.array([np.linalg.det(cov) for cov in new_covs])
+        min_eigenvalues = np.array([np.min(np.linalg.eigvals(cov)) for cov in new_covs])
+
+        print(
+            f"New covs determinant min-max: {np.min(det_values)}, {np.max(det_values)}"
+        )
+        print(
+            f"New covs min eigenvalue min-max: {np.min(min_eigenvalues)}, {np.max(min_eigenvalues)}"
+        )
+        print(
+            f"Positive definite covariances: {np.sum([self.check_positive_definite(cov) for cov in new_covs])}/{len(new_covs)}"
+        )
