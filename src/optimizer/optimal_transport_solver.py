@@ -1,5 +1,6 @@
-import numpy as np
 import copy
+
+import numpy as np
 from scipy.linalg import sqrtm
 
 from src.primitive.twod_gaussians import TwoDGaussians
@@ -40,17 +41,21 @@ class OptimalTransportSolver:
         for i in range(k1):
             for j in range(k2):
                 wasserstein_sq = self._wasserstein_distance(
-                    self.gaussians1.means[i],  
+                    self.gaussians1.means[i],
                     self.gaussians1.covs[i],
-                    self.gaussians2.means[j], 
+                    self.gaussians2.means[j],
                     self.gaussians2.covs[j],
                 )
-                color_diff_sq = np.sum((self.gaussians1.rgb[i] - self.gaussians2.rgb[j]) ** 2)
+                color_diff_sq = np.sum(
+                    (self.gaussians1.rgb[i] - self.gaussians2.rgb[j]) ** 2
+                )
                 cost = wasserstein_sq + self.lambda_color * color_diff_sq
                 cost_matrix[i, j] = cost
 
                 reverse_cost = cost_matrix[j, i] if j < k1 else "N/A"
-                print(f"Cost[{i},{j}]: {cost:.6f}, Reverse Cost[{j},{i}]: {reverse_cost}")
+                print(
+                    f"Cost[{i},{j}]: {cost:.6f}, Reverse Cost[{j},{i}]: {reverse_cost}"
+                )
                 # print(f"Cost[{i},{j}]:")
                 # print(f"  Means1: {self.gaussians1.means[i]}, Means2: {self.gaussians2.means[j]}")
                 # print(f"  Covs1: {self.gaussians1.covs[i]}, Covs2: {self.gaussians2.covs[j]}")
@@ -61,7 +66,9 @@ class OptimalTransportSolver:
                 # print()
         return cost_matrix
 
-    def _wasserstein_distance(self, mu1, sigma1, mu2, sigma2):
+    def _wasserstein_distance(
+        self, mu1: np.ndarray, sigma1: np.ndarray, mu2: np.ndarray, sigma2: np.ndarray
+    ) -> float:
         """Compute the squared 2-Wasserstein distance between two Gaussian distributions.
 
         Args:
@@ -91,8 +98,7 @@ class OptimalTransportSolver:
         # Compute the trace term
         trace_term = np.trace(sigma1 + sigma2 - 2 * sqrt_intermediate)
 
-        return diff_means + trace_term
-
+        return float(diff_means + trace_term)
 
     # def _matrix_sqrt(self, matrix):
     #     """
@@ -108,7 +114,7 @@ class OptimalTransportSolver:
     #     sqrt_eigenvalues = np.sqrt(np.maximum(eigenvalues, 0))  # Ensure non-negative eigenvalues
     #     return eigenvectors @ np.diag(sqrt_eigenvalues) @ eigenvectors.T
 
-    def _matrix_sqrt(self, matrix):
+    def _matrix_sqrt(self, matrix: np.ndarray) -> np.ndarray:
         """Compute the square root of a matrix using scipy's sqrtm for better numerical stability.
 
         Args:
@@ -123,7 +129,7 @@ class OptimalTransportSolver:
             # if not np.allclose(np.imag(sqrt_matrix), 0, atol=1e-10):
             #     raise ValueError("Matrix square root resulted in significant imaginary components.")
             sqrt_matrix = np.real(sqrt_matrix)
-        return sqrt_matrix
+        return np.array(sqrt_matrix)
 
     def sinkhorn_algorithm(self) -> np.ndarray:
         """Implement the Sinkhorn algorithm for optimal transport.

@@ -4,15 +4,15 @@ from src.optimizer.optimal_transport_solver import OptimalTransportSolver
 from src.primitive.twod_gaussians import TwoDGaussians
 
 
-
 def generate_positive_definite_covs(k, dim=2):
     """Generate k positive definite covariance matrices of dimension dim."""
     covs = []
     for _ in range(k):
-        A = np.random.rand(dim, dim)
-        cov = A @ A.T + np.eye(dim)  # Make it symmetric positive definite
+        a = np.random.rand(dim, dim)
+        cov = a @ a.T + np.eye(dim)  # Make it symmetric positive definite
         covs.append(cov)
     return np.array(covs)
+
 
 def test_optimal_transport_solver_initialization():
     """Test the initialization of OptimalTransportSolver with valid input."""
@@ -36,6 +36,7 @@ def test_optimal_transport_solver_initialization():
     assert solver.epsilon == 0.1
     assert solver.lambda_color == 0.5
 
+
 def test_compute_cost_matrix_shape():
     """Test if the computed cost matrix has the correct shape."""
     gaussians1 = TwoDGaussians(
@@ -54,6 +55,7 @@ def test_compute_cost_matrix_shape():
     solver = OptimalTransportSolver(gaussians1, gaussians2)
     cost_matrix = solver.compute_cost_matrix()
     assert cost_matrix.shape == (5, 7)
+
 
 def test_compute_cost_matrix_simple_case():
     """Test the cost matrix computation with a simple case."""
@@ -76,11 +78,12 @@ def test_compute_cost_matrix_simple_case():
     expected_cost = np.array(
         [
             [0, 10],  # (0,0) to (0,0) and (0,0) to (2,2)
-            [4, 4],   # (1,1) to (0,0) and (1,1) to (2,2)
+            [4, 4],  # (1,1) to (0,0) and (1,1) to (2,2)
         ]
     )
 
     np.testing.assert_allclose(cost_matrix, expected_cost, atol=1e-6)
+
 
 def test_compute_cost_matrix_identical_distribution():
     """Test if the cost matrix diagonal is zero for identical distributions."""
@@ -97,6 +100,7 @@ def test_compute_cost_matrix_identical_distribution():
     cost_matrix = solver.compute_cost_matrix()
     # print(cost_matrix)
     np.testing.assert_allclose(np.diag(cost_matrix), 0, atol=1e-6)
+
 
 def test_compute_cost_matrix_similarity():
     """Test the similarity of the cost matrix when swapping input order."""
@@ -133,6 +137,7 @@ def test_compute_cost_matrix_similarity():
 
     # Check that the average absolute difference is small
     assert np.mean(diff) < 0.05, f"Mean difference {np.mean(diff)} exceeds tolerance"
+
 
 def test_sinkhorn_algorithm_shape():
     """Test if the Sinkhorn algorithm returns a matrix of the correct shape."""
