@@ -53,10 +53,10 @@ class OptimalTransportSolver:
                 cost_matrix[i, j] = cost
 
                 reverse_cost = cost_matrix[j, i] if j < k1 else "N/A"
-                print(
-                    f"Cost[{i},{j}]: {cost:.6f}, Reverse Cost[{j},{i}]: {reverse_cost}"
-                )
-                # print(f"Cost[{i},{j}]:")
+                # print(
+                #     f"Cost[{i},{j}]: {cost:.6f}, Reverse Cost[{j},{i}]: {reverse_cost}"
+                # )
+                # # print(f"Cost[{i},{j}]:")
                 # print(f"  Means1: {self.gaussians1.means[i]}, Means2: {self.gaussians2.means[j]}")
                 # print(f"  Covs1: {self.gaussians1.covs[i]}, Covs2: {self.gaussians2.covs[j]}")
                 # print(f"  RGB1: {self.gaussians1.rgb[i]}, RGB2: {self.gaussians2.rgb[j]}")
@@ -131,12 +131,42 @@ class OptimalTransportSolver:
             sqrt_matrix = np.real(sqrt_matrix)
         return np.array(sqrt_matrix)
 
-    def sinkhorn_algorithm(self) -> np.ndarray:
+    def sinkhorn_algorithm(self, max_iter: int = 1000, tol: float = 1e-6) -> np.ndarray:
         """Implement the Sinkhorn algorithm for optimal transport.
+
+        Args:
+            max_iter (int): Maximum number of iterations. Defaults to 100.
+            tol (float): Convergence tolerance. Defaults to 1e-6.
 
         Returns:
             np.ndarray: The transport plan matrix.
         """
-        # TODO: Implement Sinkhorn algorithm
-        k1, k2 = self.gaussians1.k, self.gaussians2.k
-        return np.zeros((k1, k2))  # Placeholder
+        # Compute cost matrix
+        c = self.compute_cost_matrix()
+
+        # Initialize Gibbs kernel
+        k = np.exp(-c / self.epsilon)
+
+        # Initialize scaling vectors
+        u = np.ones(self.gaussians1.k)
+        v = np.ones(self.gaussians2.k)
+
+        # Normalize alpha and beta
+        alpha = self.gaussians1.alpha / np.sum(self.gaussians1.alpha)
+        beta = self.gaussians2.alpha / np.sum(self.gaussians2.alpha)
+
+        for _ in range(max_iter):
+            u_new = alpha / (k @ v)
+            v_new = beta / (k.T @ u)
+
+            if np.max(np.abs(u_new - u)) < tol and np.max(np.abs(v_new - v)) < tol:
+                break
+
+            u, v = u_new, v_new
+
+        # Compute the transport plan
+        p = np.diag(u) @ k @ np.diag(v)
+        p /= p.sum()  # 全体を1に正規化
+        p *= min(np.sum(self.gaussians1.alpha), np.sum(self.gaussians2.alpha))
+
+        return np.array(p)
