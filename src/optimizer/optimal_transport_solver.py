@@ -52,18 +52,6 @@ class OptimalTransportSolver:
                 cost = wasserstein_sq + self.lambda_color * color_diff_sq
                 cost_matrix[i, j] = cost
 
-                reverse_cost = cost_matrix[j, i] if j < k1 else "N/A"
-                # print(
-                #     f"Cost[{i},{j}]: {cost:.6f}, Reverse Cost[{j},{i}]: {reverse_cost}"
-                # )
-                # # print(f"Cost[{i},{j}]:")
-                # print(f"  Means1: {self.gaussians1.means[i]}, Means2: {self.gaussians2.means[j]}")
-                # print(f"  Covs1: {self.gaussians1.covs[i]}, Covs2: {self.gaussians2.covs[j]}")
-                # print(f"  RGB1: {self.gaussians1.rgb[i]}, RGB2: {self.gaussians2.rgb[j]}")
-                # print(f"  Wasserstein_sq: {wasserstein_sq}")
-                # print(f"  Color_diff_sq: {color_diff_sq}")
-                # print(f"  Total cost: {cost_matrix[i,j]}")
-                # print()
         return cost_matrix
 
     def _wasserstein_distance(
@@ -131,21 +119,21 @@ class OptimalTransportSolver:
             sqrt_matrix = np.real(sqrt_matrix)
         return np.array(sqrt_matrix)
 
-    def sinkhorn_algorithm(self, max_iter: int = 1000, tol: float = 1e-6) -> np.ndarray:
+    def sinkhorn_algorithm(
+        self, cost_matrix: np.ndarray, max_iter: int = 1000, tol: float = 1e-6
+    ) -> np.ndarray:
         """Implement the Sinkhorn algorithm for optimal transport.
 
         Args:
-            max_iter (int): Maximum number of iterations. Defaults to 100.
+            cost_matrix (np.ndarray): The cost matrix.
+            max_iter (int): Maximum number of iterations. Defaults to 1000.
             tol (float): Convergence tolerance. Defaults to 1e-6.
 
         Returns:
             np.ndarray: The transport plan matrix.
         """
-        # Compute cost matrix
-        c = self.compute_cost_matrix()
-
         # Initialize Gibbs kernel
-        k = np.exp(-c / self.epsilon)
+        k = np.exp(-cost_matrix / self.epsilon)
 
         # Initialize scaling vectors
         u = np.ones(self.gaussians1.k)
@@ -156,9 +144,17 @@ class OptimalTransportSolver:
         beta = self.gaussians2.alpha / np.sum(self.gaussians2.alpha)
 
         for _ in range(max_iter):
-            u_new = alpha / (k @ v)
-            v_new = beta / (k.T @ u)
+            # Update u
+            denominator = k @ v
+            denominator = np.maximum(denominator, 1e-16)  # Prevent division by zero
+            u_new = alpha / denominator
 
+            # Update v
+            denominator = k.T @ u_new
+            denominator = np.maximum(denominator, 1e-16)  # Prevent division by zero
+            v_new = beta / denominator
+
+            # Check for convergence
             if np.max(np.abs(u_new - u)) < tol and np.max(np.abs(v_new - v)) < tol:
                 break
 
@@ -166,7 +162,5 @@ class OptimalTransportSolver:
 
         # Compute the transport plan
         p = np.diag(u) @ k @ np.diag(v)
-        p /= p.sum()  # 全体を1に正規化
-        p *= min(np.sum(self.gaussians1.alpha), np.sum(self.gaussians2.alpha))
-
+        p = np.asarray(p, dtype=np.float64)
         return np.array(p)
