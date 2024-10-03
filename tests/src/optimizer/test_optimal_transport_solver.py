@@ -61,14 +61,35 @@ def test_compute_cost_matrix_simple_case():
     """Test the cost matrix computation with a simple case."""
     gaussians1 = TwoDGaussians(
         means=np.array([[0, 0], [1, 1]]),
-        covs=np.array([[[1, 0], [0, 1]], [[1, 0], [0, 1]]]),
-        rgb=np.array([[1, 0, 0], [0, 1, 0]]),
-        alpha=np.array([0.5, 0.5]),
+        covs=np.array(
+            [
+                [[1, 0], [0, 1]],  # Covariance for Gaussian 1
+                [[1, 0], [0, 1]],  # Covariance for Gaussian 2
+            ]
+        ),
+        rgb=np.array(
+            [
+                [1, 0, 0],  # Color for Gaussian 1
+                [0, 1, 0],  # Color for Gaussian 2
+            ]
+        ),
+        alpha=np.array([0.5, 0.5]),  # Mixing coefficients
     )
+
     gaussians2 = TwoDGaussians(
         means=np.array([[0, 0], [2, 2]]),
-        covs=np.array([[[1, 0], [0, 1]], [[1, 0], [0, 1]]]),
-        rgb=np.array([[1, 0, 0], [0, 0, 1]]),
+        covs=np.array(
+            [
+                [[1, 0], [0, 1]],  # Covariance for Gaussian 1
+                [[1, 0], [0, 1]],  # Covariance for Gaussian 2
+            ]
+        ),
+        rgb=np.array(
+            [
+                [1, 0, 0],  # Color for Gaussian 1 (same as gaussians1)
+                [0, 0, 1],  # Color for Gaussian 2 (different from gaussians1)
+            ]
+        ),
         alpha=np.array([0.5, 0.5]),
     )
 
