@@ -269,8 +269,8 @@ def test_sinkhorn_algorithm_simple_case():
 
 def test_sinkhorn_algorithm_convergence():
     """Test if the Sinkhorn algorithm converges within a reasonable number of iterations."""
-    np.random.seed(42)  
-    
+    np.random.seed(42)
+
     gaussians1 = TwoDGaussians(
         means=np.random.rand(5, 2),
         covs=generate_positive_definite_covs(5),
