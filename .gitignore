@@ -17,5 +17,6 @@ __pycache__
 .DS_Store
 /gaussian_mixture_results
 /debug_output
+/data/DTU
 
 
