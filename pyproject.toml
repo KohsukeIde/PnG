@@ -42,6 +42,7 @@ scipy = "^1.9.0"
 tqdm = "^4.66.5"
 torch = "^2.4.0"
 scikit-learn = "^1.5.2"
+tyro = "^0.8.11"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
