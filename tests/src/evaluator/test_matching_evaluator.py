@@ -406,7 +406,6 @@ def test_matching_evaluator_visualize_matches():
 #         alpha=np.array([1.0]),
 #     )
 
-#     # OptimalTransportSolverの初期化
 #     solver = OptimalTransportSolver(
 #         gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
 #     )
