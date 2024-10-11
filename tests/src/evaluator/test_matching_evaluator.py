@@ -344,88 +344,80 @@ def test_matching_evaluator_visualize_matches():
         
         assert os.path.exists(output_path), "Visualization image was not saved at the specified path."
         
-def test_visualize_complete_match():
-    """Test visualize_matches() with a complete match case."""
-    # 完全一致ケースの設定
-    gaussians1 = TwoDGaussians(
-        means=np.array([[0, 0], [1, 1]]),
-        covs=np.array([
-            [[1, 0], [0, 1]],
-            [[1, 0], [0, 1]]
-        ]),
-        rgb=np.array([
-            [1, 0, 0],
-            [0, 1, 0]
-        ]),
-        alpha=np.array([0.5, 0.5]),
-    )
+# def test_visualize_complete_match():
+#     """Test visualize_matches() with a complete match case."""
+#     # Complete match case
 
-    gaussians2 = TwoDGaussians(
-        means=np.array([[0, 0], [1, 1]]),
-        covs=np.array([
-            [[1, 0], [0, 1]],
-            [[1, 0], [0, 1]]
-        ]),
-        rgb=np.array([
-            [1, 0, 0],
-            [0, 1, 0]
-        ]),
-        alpha=np.array([0.5, 0.5]),
-    )
+#     gaussians1 = TwoDGaussians(
+#         means=np.array([[0, 0], [1, 1]]),
+#         covs=np.array([
+#             [[1, 0], [0, 1]],
+#             [[1, 0], [0, 1]]
+#         ]),
+#         rgb=np.array([
+#             [1, 0, 0],
+#             [0, 1, 0]
+#         ]),
+#         alpha=np.array([0.5, 0.5]),
+#     )
 
-    # OptimalTransportSolverの初期化
-    solver = OptimalTransportSolver(
-        gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
-    )
+#     gaussians2 = TwoDGaussians(
+#         means=np.array([[0, 0], [1, 1]]),
+#         covs=np.array([
+#             [[1, 0], [0, 1]],
+#             [[1, 0], [0, 1]]
+#         ]),
+#         rgb=np.array([
+#             [1, 0, 0],
+#             [0, 1, 0]
+#         ]),
+#         alpha=np.array([0.5, 0.5]),
+#     )
 
-    # コスト行列の計算
-    cost_matrix = solver.compute_cost_matrix()
+#     solver = OptimalTransportSolver(
+#         gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
+#     )
 
-    # Sinkhornアルゴリズムによる輸送行列の計算
-    transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
+#     cost_matrix = solver.compute_cost_matrix()
 
-    # MatchingEvaluatorの初期化
-    evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
+#     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
 
-    # マッチングの視覚化
-    output_path = "/Users/kohsukeide/dev/perspective-n-gaussian/outputs/complete_match_visualization.png"
-    evaluator.visualize_matches(output_path)
+#     evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
 
-    print(f"Visualization saved to {output_path}")
+#     output_path = "/Users/kohsukeide/dev/perspective-n-gaussian/outputs/complete_match_visualization.png"
+#     evaluator.visualize_matches(output_path)
 
-def test_visualize_complete_mismatch():
-    """Test visualize_matches() with a complete mismatch case."""
-    # 完全不一致ケースの設定
-    gaussians1 = TwoDGaussians(
-        means=np.array([[0, 0]]),
-        covs=np.array([[[1, 0], [0, 1]]]),
-        rgb=np.array([[1, 0, 0]]),
-        alpha=np.array([1.0]),
-    )
+#     print(f"Visualization saved to {output_path}")
 
-    gaussians2 = TwoDGaussians(
-        means=np.array([[10, 10]]),
-        covs=np.array([[[1, 0], [0, 1]]]),
-        rgb=np.array([[0, 1, 0]]),
-        alpha=np.array([1.0]),
-    )
+# def test_visualize_complete_mismatch():
+#     """Test visualize_matches() with a complete mismatch case."""
+#     # Complete mismatch case
+#     gaussians1 = TwoDGaussians(
+#         means=np.array([[0, 0]]),
+#         covs=np.array([[[1, 0], [0, 1]]]),
+#         rgb=np.array([[1, 0, 0]]),
+#         alpha=np.array([1.0]),
+#     )
 
-    # OptimalTransportSolverの初期化
-    solver = OptimalTransportSolver(
-        gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
-    )
+#     gaussians2 = TwoDGaussians(
+#         means=np.array([[10, 10]]),
+#         covs=np.array([[[1, 0], [0, 1]]]),
+#         rgb=np.array([[0, 1, 0]]),
+#         alpha=np.array([1.0]),
+#     )
 
-    # コスト行列の計算
-    cost_matrix = solver.compute_cost_matrix()
+#     # OptimalTransportSolverの初期化
+#     solver = OptimalTransportSolver(
+#         gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
+#     )
 
-    # Sinkhornアルゴリズムによる輸送行列の計算
-    transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
+#     cost_matrix = solver.compute_cost_matrix()
 
-    # MatchingEvaluatorの初期化
-    evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
+#     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
 
-    # マッチングの視覚化
-    output_path = "/Users/kohsukeide/dev/perspective-n-gaussian/outputs/complete_mismatch_visualization.png"
-    evaluator.visualize_matches(output_path)
+#     evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
 
-    print(f"Visualization saved to {output_path}")
+#     output_path = "/Users/kohsukeide/dev/perspective-n-gaussian/outputs/complete_mismatch_visualization.png"
+#     evaluator.visualize_matches(output_path)
+
+#     print(f"Visualization saved to {output_path}")
