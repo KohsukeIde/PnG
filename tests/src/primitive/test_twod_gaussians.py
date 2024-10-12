@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
+
 from src.primitive.twod_gaussians_rs import TwoDGaussians
+
 
 def test_twod_gaussians_creation():
     """Test the creation of TwoDGaussians instance."""
@@ -10,9 +12,10 @@ def test_twod_gaussians_creation():
         np.random.rand(16, 3),
         np.random.rand(16),
         np.random.rand(16),
-        np.random.rand(16, 2)
+        np.random.rand(16, 2),
     )
     assert obj.k == 16
+
 
 def test_twod_gaussians_invalid_creation():
     """Test that creating TwoDGaussians with invalid data raises ValueError."""
@@ -23,8 +26,9 @@ def test_twod_gaussians_invalid_creation():
             np.random.rand(14, 3),
             np.random.rand(13),
             np.random.rand(12),
-            np.random.rand(11, 2)
+            np.random.rand(11, 2),
         )
+
 
 def test_twod_gaussians_properties():
     """Test if the properties of TwoDGaussians are set correctly."""
@@ -44,6 +48,7 @@ def test_twod_gaussians_properties():
     assert np.all(obj.rotations == rotations)
     assert np.all(obj.scales == scales)
 
+
 def test_twod_gaussians_k_property():
     """Test the k property of TwoDGaussians."""
     for k in [1, 5, 10, 20]:
@@ -53,9 +58,10 @@ def test_twod_gaussians_k_property():
             np.random.rand(k, 3),
             np.random.rand(k),
             np.random.rand(k),
-            np.random.rand(k, 2)
+            np.random.rand(k, 2),
         )
         assert obj.k == k
+
 
 def test_twod_gaussians_invalid_means():
     """Test that creating TwoDGaussians with invalid means raises ValueError."""
@@ -66,8 +72,9 @@ def test_twod_gaussians_invalid_means():
             np.random.rand(16, 3),
             np.random.rand(16),
             np.random.rand(16),
-            np.random.rand(16, 2)
+            np.random.rand(16, 2),
         )
+
 
 # def test_twod_gaussians_invalid_covs():
 #     """Test that creating TwoDGaussians with invalid covariances raises ValueError."""

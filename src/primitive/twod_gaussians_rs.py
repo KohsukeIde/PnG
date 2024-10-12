@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+
 import numpy as np
+
 
 @dataclass
 class TwoDGaussians:
@@ -15,11 +17,11 @@ class TwoDGaussians:
     """
 
     means: np.ndarray  # [k, 2]
-    covs: np.ndarray   # [k, 2, 2]
-    rgb: np.ndarray    # [k, 3]
+    covs: np.ndarray  # [k, 2, 2]
+    rgb: np.ndarray  # [k, 3]
     alpha: np.ndarray  # [k]
     rotations: np.ndarray  # [k]
-    scales: np.ndarray     # [k, 2]
+    scales: np.ndarray  # [k, 2]
 
     def __post_init__(self) -> None:
         """Validate the shape and dimensions of the data arrays.

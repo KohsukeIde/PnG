@@ -21,9 +21,9 @@ def generate_covariances_from_rotations_and_scales(rotations, scales):
         s = scales[i]
         cos_r = np.cos(theta)
         sin_r = np.sin(theta)
-        R = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
-        S = np.diag(s ** 2)
-        covs[i] = R @ S @ R.T
+        r = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+        s = np.diag(s**2)
+        covs[i] = r @ s @ r.T
     return covs
 
 
@@ -152,7 +152,7 @@ def test_compute_cost_matrix_simple_case():
     expected_cost = np.array(
         [
             [0, 10],  # From Gaussian 1 in gaussians1 to Gaussians in gaussians2
-            [4, 4],   # From Gaussian 2 in gaussians1 to Gaussians in gaussians2
+            [4, 4],  # From Gaussian 2 in gaussians1 to Gaussians in gaussians2
         ]
     )
 
@@ -170,7 +170,14 @@ def test_compute_cost_matrix_identical_distribution():
     covs = generate_covariances_from_rotations_and_scales(rotations, scales)
 
     gaussians1 = TwoDGaussians(means, covs, rgb, alpha, rotations, scales)
-    gaussians2 = TwoDGaussians(means.copy(), covs.copy(), rgb.copy(), alpha.copy(), rotations.copy(), scales.copy())
+    gaussians2 = TwoDGaussians(
+        means.copy(),
+        covs.copy(),
+        rgb.copy(),
+        alpha.copy(),
+        rotations.copy(),
+        scales.copy(),
+    )
 
     solver = OptimalTransportSolver(gaussians1, gaussians2, lambda_color=1.0)
     cost_matrix = solver.compute_cost_matrix()
@@ -299,7 +306,9 @@ def test_sinkhorn_algorithm_simple_case():
     gaussians1 = TwoDGaussians(means1, covs1, rgb1, alpha1, rotations1, scales1)
     gaussians2 = TwoDGaussians(means2, covs2, rgb2, alpha2, rotations2, scales2)
 
-    solver = OptimalTransportSolver(gaussians1, gaussians2, epsilon=0.1, lambda_color=1.0)
+    solver = OptimalTransportSolver(
+        gaussians1, gaussians2, epsilon=0.1, lambda_color=1.0
+    )
     cost_matrix = solver.compute_cost_matrix()
     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
 
@@ -333,10 +342,14 @@ def test_sinkhorn_algorithm_convergence():
     cost_matrix = solver.compute_cost_matrix()
 
     # Compute transport matrix with a small number of iterations
-    transport_matrix_few = solver.sinkhorn_algorithm(cost_matrix, max_iter=100, tol=1e-4)
+    transport_matrix_few = solver.sinkhorn_algorithm(
+        cost_matrix, max_iter=100, tol=1e-4
+    )
 
     # Compute transport matrix with a large number of iterations
-    transport_matrix_many = solver.sinkhorn_algorithm(cost_matrix, max_iter=1000, tol=1e-4)
+    transport_matrix_many = solver.sinkhorn_algorithm(
+        cost_matrix, max_iter=1000, tol=1e-4
+    )
 
     # Check if the results are close, indicating convergence
     np.testing.assert_allclose(transport_matrix_few, transport_matrix_many, atol=1e-2)

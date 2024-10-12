@@ -1,5 +1,7 @@
 import copy
+
 import numpy as np
+from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 
@@ -36,25 +38,35 @@ class OptimalTransportSolver:
         k1, k2 = self.gaussians1.k, self.gaussians2.k
         cost_matrix = np.zeros((k1, k2))
 
-        for i in range(k1):
-            mu1 = self.gaussians1.means[i]
-            s1 = self.gaussians1.scales[i]
-            theta1 = self.gaussians1.rotations[i]
+        total_iterations = k1 * k2
 
-            for j in range(k2):
-                mu2 = self.gaussians2.means[j]
-                s2 = self.gaussians2.scales[j]
-                theta2 = self.gaussians2.rotations[j]
+        with tqdm(
+            total=total_iterations, desc="Computing cost matrix", unit="pair"
+        ) as pbar:
+            for i in range(k1):
+                mu1 = self.gaussians1.means[i]
+                s1 = self.gaussians1.scales[i]
+                theta1 = self.gaussians1.rotations[i]
 
-                # Compute the squared 2-Wasserstein distance
-                wasserstein_sq = self._wasserstein_distance(mu1, s1, theta1, mu2, s2, theta2)
+                for j in range(k2):
+                    mu2 = self.gaussians2.means[j]
+                    s2 = self.gaussians2.scales[j]
+                    theta2 = self.gaussians2.rotations[j]
 
-                # Compute the squared color difference
-                color_diff_sq = np.sum((self.gaussians1.rgb[i] - self.gaussians2.rgb[j]) ** 2)
+                    # Compute the squared 2-Wasserstein distance
+                    wasserstein_sq = self._wasserstein_distance(
+                        mu1, s1, theta1, mu2, s2, theta2
+                    )
 
-                # Total cost
-                cost = wasserstein_sq + self.lambda_color * color_diff_sq
-                cost_matrix[i, j] = cost
+                    # Compute the squared color difference
+                    color_diff_sq = np.sum(
+                        (self.gaussians1.rgb[i] - self.gaussians2.rgb[j]) ** 2
+                    )
+
+                    # Total cost
+                    cost = wasserstein_sq + self.lambda_color * color_diff_sq
+                    cost_matrix[i, j] = cost
+                    pbar.update(1)
 
         return cost_matrix
 
@@ -71,12 +83,12 @@ class OptimalTransportSolver:
         cos_r = np.cos(rotation)
         sin_r = np.sin(rotation)
         # Rotation matrix
-        R = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+        r = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
         # Scale matrix
-        S = np.diag(scales ** 2)
+        s = np.diag(scales**2)
         # Covariance matrix
-        covariance = R @ S @ R.T
-        return covariance
+        covariance = r @ s @ r.T
+        return np.array(covariance)
 
     def _matrix_sqrt_2x2(self, matrix: np.ndarray) -> np.ndarray:
         """Compute the square root of a 2x2 symmetric positive-definite matrix analytically.
@@ -93,7 +105,7 @@ class OptimalTransportSolver:
         sqrt_eigenvalues = np.sqrt(np.maximum(eigenvalues, 0))
         # Reconstruct the square root matrix
         sqrt_matrix = eigenvectors @ np.diag(sqrt_eigenvalues) @ eigenvectors.T
-        return sqrt_matrix
+        return np.array(sqrt_matrix)
 
     def _wasserstein_distance(
         self,
@@ -142,14 +154,14 @@ class OptimalTransportSolver:
     def sinkhorn_algorithm(
         self,
         cost_matrix: np.ndarray,
-        max_iter: int = 1000,
+        max_iter: int = 100,
         tol: float = 1e-6,
     ) -> np.ndarray:
         """Implement the Sinkhorn algorithm for optimal transport.
 
         Args:
             cost_matrix (np.ndarray): The cost matrix.
-            max_iter (int): Maximum number of iterations. Defaults to 1000.
+            max_iter (int): Maximum number of iterations. Defaults to 100.
             tol (float): Convergence tolerance. Defaults to 1e-6.
 
         Returns:
@@ -166,7 +178,7 @@ class OptimalTransportSolver:
         alpha = self.gaussians1.alpha / np.sum(self.gaussians1.alpha)
         beta = self.gaussians2.alpha / np.sum(self.gaussians2.alpha)
 
-        for _ in range(max_iter):
+        for _ in tqdm(range(max_iter), desc="Sinkhorn iterations"):
             # Update u
             denominator = k @ v
             denominator = np.maximum(denominator, 1e-16)  # Prevent division by zero
@@ -186,4 +198,4 @@ class OptimalTransportSolver:
         # Compute the transport plan
         p = np.diag(u) @ k @ np.diag(v)
         p = np.asarray(p, dtype=np.float64)
-        return p
+        return np.array(p)

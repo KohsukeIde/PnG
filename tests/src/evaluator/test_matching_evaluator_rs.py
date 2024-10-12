@@ -1,9 +1,12 @@
-import numpy as np
 import os
-import tempfile
+
+import numpy as np
+
 from src.evaluator.matching_evaluator import MatchingEvaluator
-from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.optimizer.optimal_transport_solver_rs import OptimalTransportSolver
+from src.primitive.twod_gaussians_rs import TwoDGaussians
+
+
 def generate_covariances_from_rotations_and_scales(rotations, scales):
     """Generate covariance matrices from rotations and scales.
 
@@ -21,9 +24,9 @@ def generate_covariances_from_rotations_and_scales(rotations, scales):
         s = scales[i]
         cos_r = np.cos(theta)
         sin_r = np.sin(theta)
-        R = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
-        S = np.diag(s ** 2)
-        covs[i] = R @ S @ R.T
+        r = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+        s = np.diag(s**2)
+        covs[i] = r @ s @ r.T
     return covs
 
 
@@ -76,9 +79,11 @@ def test_matching_evaluator_initialization():
 
     # Initialize MatchingEvaluator with computed transport_matrix
     evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
-    assert isinstance(evaluator, MatchingEvaluator), "Failed to create an instance of MatchingEvaluator."
-    
-    
+    assert isinstance(
+        evaluator, MatchingEvaluator
+    ), "Failed to create an instance of MatchingEvaluator."
+
+
 def test_matching_evaluator_extract_matches():
     """Test if extract_matches() returns a list of tuples with correct indices."""
     # Define Gaussians with identity covariance matrices
@@ -86,20 +91,14 @@ def test_matching_evaluator_extract_matches():
     scales1 = np.array([[1, 1], [1, 1]])
     rotations1 = np.array([0.0, 0.0])
     covs1 = generate_covariances_from_rotations_and_scales(rotations1, scales1)
-    rgb1 = np.array([
-        [1, 0, 0],
-        [0, 1, 0]
-    ])
+    rgb1 = np.array([[1, 0, 0], [0, 1, 0]])
     alpha1 = np.array([0.5, 0.5])
 
     means2 = np.array([[0, 0], [2, 2]])
     scales2 = np.array([[1, 1], [1, 1]])
     rotations2 = np.array([0.0, 0.0])
     covs2 = generate_covariances_from_rotations_and_scales(rotations2, scales2)
-    rgb2 = np.array([
-        [1, 0, 0],
-        [0, 0, 1]
-    ])
+    rgb2 = np.array([[1, 0, 0], [0, 0, 1]])
     alpha2 = np.array([0.5, 0.5])
 
     gaussians1 = TwoDGaussians(
@@ -120,33 +119,30 @@ def test_matching_evaluator_extract_matches():
         scales=scales2,
     )
 
-    # Initialize OptimalTransportSolver with lambda_color=0 and epsilon=1.0
     solver = OptimalTransportSolver(
         gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
     )
 
-    # Compute cost matrix
     cost_matrix = solver.compute_cost_matrix()
     print("Cost Matrix:")
     print(cost_matrix)
 
-    # Compute transport_matrix via Sinkhorn algorithm
     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
     print("Transport Matrix:")
     print(transport_matrix)
 
-    # Initialize MatchingEvaluator with computed transport_matrix
     evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
 
-    # Extract matches
     matches = evaluator.matches
     print("Extracted Matches:")
     print(matches)
 
     # Define expected_matches based on the input Gaussians and transport_matrix computation
-    expected_matches = [(0, 0), (1, 1)]  # Assuming optimal transport aligns as such
+    expected_matches = [(0, 0), (1, 1)]
 
-    assert matches == expected_matches, f"Matching pairs {matches} differ from expected pairs {expected_matches}"
+    assert (
+        matches == expected_matches
+    ), f"Matching pairs {matches} differ from expected pairs {expected_matches}"
 
 
 def test_matching_evaluator_evaluate_matches():
@@ -155,20 +151,14 @@ def test_matching_evaluator_evaluate_matches():
     scales1 = np.array([[1, 1], [1, 1]])
     rotations1 = np.array([0.0, 0.0])
     covs1 = generate_covariances_from_rotations_and_scales(rotations1, scales1)
-    rgb1 = np.array([
-        [1, 0, 0],
-        [0, 1, 0]
-    ])
+    rgb1 = np.array([[1, 0, 0], [0, 1, 0]])
     alpha1 = np.array([0.5, 0.5])
 
     means2 = np.array([[0, 0], [2, 2]])
     scales2 = np.array([[1, 1], [1, 1]])
     rotations2 = np.array([0.0, 0.0])
     covs2 = generate_covariances_from_rotations_and_scales(rotations2, scales2)
-    rgb2 = np.array([
-        [1, 0, 0],
-        [0, 0, 1]
-    ])
+    rgb2 = np.array([[1, 0, 0], [0, 0, 1]])
     alpha2 = np.array([0.5, 0.5])
 
     gaussians1 = TwoDGaussians(
@@ -194,17 +184,14 @@ def test_matching_evaluator_evaluate_matches():
         gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
     )
 
-    # Compute cost matrix
     cost_matrix = solver.compute_cost_matrix()
     print("Cost Matrix:")
     print(cost_matrix)
 
-    # Compute transport_matrix via Sinkhorn algorithm
     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
     print("Transport Matrix:")
     print(transport_matrix)
 
-    # Initialize MatchingEvaluator with computed transport_matrix
     evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
     metrics = evaluator.evaluate_matches()
 
@@ -223,11 +210,13 @@ def test_matching_evaluator_evaluate_matches():
     print("Computed Metrics:")
     print(metrics)
     print("Expected Metrics:")
-    print({
-        "average_distance": expected_distance,
-        "average_color_difference": expected_color_diff,
-        "matching_rate": expected_matching_rate
-    })
+    print(
+        {
+            "average_distance": expected_distance,
+            "average_color_difference": expected_color_diff,
+            "matching_rate": expected_matching_rate,
+        }
+    )
 
     # Assert metrics
     np.testing.assert_allclose(
@@ -239,6 +228,8 @@ def test_matching_evaluator_evaluate_matches():
     np.testing.assert_allclose(
         metrics["matching_rate"], expected_matching_rate, atol=1e-6
     )
+
+
 def test_visualize_complete_match():
     """Test visualize_matches() with a complete match case."""
     # Define Gaussians with identical parameters
@@ -246,20 +237,24 @@ def test_visualize_complete_match():
     rotations1 = np.array([0.0, 0.0])  # No rotation
     scales1 = np.array([[1, 1], [1, 1]])  # Unit scales
     covs1 = generate_covariances_from_rotations_and_scales(rotations1, scales1)
-    rgb1 = np.array([
-        [1, 0, 0],  # Red
-        [0, 1, 0]   # Green
-    ])
+    rgb1 = np.array(
+        [
+            [1, 0, 0],  # Red
+            [0, 1, 0],  # Green
+        ]
+    )
     alpha1 = np.array([0.5, 0.5])
 
     means2 = np.array([[0, 0], [1, 1]])
     rotations2 = np.array([0.0, 0.0])  # No rotation
     scales2 = np.array([[1, 1], [1, 1]])  # Unit scales
     covs2 = generate_covariances_from_rotations_and_scales(rotations2, scales2)
-    rgb2 = np.array([
-        [1, 0, 0],  # Red (same as gaussians1)
-        [0, 1, 0]   # Green (same as gaussians1)
-    ])
+    rgb2 = np.array(
+        [
+            [1, 0, 0],  # Red (same as gaussians1)
+            [0, 1, 0],  # Green (same as gaussians1)
+        ]
+    )
     alpha2 = np.array([0.5, 0.5])
 
     # Initialize TwoDGaussians instances
@@ -281,28 +276,24 @@ def test_visualize_complete_match():
         scales=scales2,
     )
 
-    # Initialize OptimalTransportSolver
     solver = OptimalTransportSolver(
         gaussians1, gaussians2, epsilon=1.0, lambda_color=0.0
     )
 
-    # Compute cost matrix
     cost_matrix = solver.compute_cost_matrix()
     print("Cost Matrix:")
     print(cost_matrix)
 
-    # Compute transport_matrix via Sinkhorn algorithm
     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
     print("Transport Matrix:")
     print(transport_matrix)
 
-    # Initialize MatchingEvaluator with computed transport_matrix
     evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
 
-    # Define output path (Use a temporary directory for testing)
     output_path = "/Users/kohsukeide/dev/perspective-n-gaussian/outputs/complete_match_visualization_rs.png"
     evaluator.visualize_matches(output_path)
     print(f"Visualization saved to {output_path}")
 
-    # Assert that the image file was created
-    assert os.path.exists(output_path), "Visualization image was not saved at the specified path."
+    assert os.path.exists(
+        output_path
+    ), "Visualization image was not saved at the specified path."
