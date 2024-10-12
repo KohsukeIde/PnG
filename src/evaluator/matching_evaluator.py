@@ -68,38 +68,86 @@ class MatchingEvaluator:
             "matching_rate": matching_rate
         }
 
-    def visualize_matches(self, output_path: str) -> None:
-            """
-            マッチングを視覚化し、指定されたパスに保存するメソッド。
+    # def visualize_matches(self, output_path: str) -> None:
+    #     """
+    #     Method to visualize matches and save to the specified path.
 
-            Args:
-                output_path (str): 可視化画像の保存先パス。
-            """
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            # 定数として左右の画像間のオフセットを設定
-            offset_x = np.max(self.gaussians1.means[:, 0]) + 5  # 画像1の最大X座標に余裕を持たせたオフセット
-            
-            # Gaussians1の可視化（左側）
-            ax.scatter(self.gaussians1.means[:, 0], self.gaussians1.means[:, 1], 
-                    c=self.gaussians1.rgb, marker='o', label='Image1 Gaussians')
-            
-            # Gaussians2の可視化（右側にシフト）
-            shifted_means2 = self.gaussians2.means + np.array([offset_x, 0])
-            ax.scatter(shifted_means2[:, 0], shifted_means2[:, 1], 
-                    c=self.gaussians2.rgb, marker='x', label='Image2 Gaussians')
-            
-            # マッチングの可視化
-            for i, j in self.matches:
-                point1 = self.gaussians1.means[i]
-                point2 = self.gaussians2.means[j] + np.array([offset_x, 0])
-                ax.plot([point1[0], point2[0]], [point1[1], point2[1]], 'k--', linewidth=0.5)
-            
-            # グラフの設定
-            ax.legend()
-            ax.set_title('Gaussian Matching Visualization Between Two Images')
-            ax.set_xlabel('X-axis')
-            ax.set_ylabel('Y-axis')
-            plt.tight_layout()
-            plt.savefig(output_path)
-            plt.close()
+    #     Args:
+    #         output_path (str): Path to save the visualization image.
+    #     """
+    #     fig, ax = plt.subplots(figsize=(12, 6))
+        
+    #     # Set offset for the right image
+    #     offset_x = np.max(self.gaussians1.means[:, 0]) + 5  # X-coordinate offset with some margin
+        
+    #     # Gaussians1 visualization (left side)
+    #     ax.scatter(self.gaussians1.means[:, 0], self.gaussians1.means[:, 1], 
+    #             c=self.gaussians1.rgb, marker='o', label='Image1 Gaussians')
+        
+    #     # Gaussians2 visualization (right side)
+    #     shifted_means2 = self.gaussians2.means + np.array([offset_x, 0])
+    #     ax.scatter(shifted_means2[:, 0], shifted_means2[:, 1], 
+    #             c=self.gaussians2.rgb, marker='x', label='Image2 Gaussians')
+        
+    #     # Visualize matching
+    #     for i, j in self.matches:
+    #         point1 = self.gaussians1.means[i]
+    #         point2 = self.gaussians2.means[j] + np.array([offset_x, 0])
+    #         ax.plot([point1[0], point2[0]], [point1[1], point2[1]], 'k--', linewidth=0.5)
+        
+    #     ax.legend()
+    #     ax.set_title('Gaussian Matching Visualization Between Two Images')
+    #     ax.set_xlabel('X-axis')
+    #     ax.set_ylabel('Y-axis')
+    #     plt.tight_layout()
+    #     plt.savefig(output_path)
+    #     plt.close()
+    
+    def visualize_matches(self, output_path: str, top_k: int = 100) -> None:
+        """
+        Visualize matches and save the figure to the specified path.
+
+        Args:
+            output_path (str): Path to save the visualization image.
+            top_k (int, optional): Number of top matches to visualize. If None, visualize all matches.
+        """
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Set offset between the two images
+        offset_x = np.max(self.gaussians1.means[:, 0]) + 5  # Offset for the right image
+        
+        # Visualize Gaussians1 (left side)
+        ax.scatter(self.gaussians1.means[:, 0], self.gaussians1.means[:, 1], 
+                c=self.gaussians1.rgb, marker='o', label='Image1 Gaussians')
+        
+        # Visualize Gaussians2 (shifted to the right)
+        shifted_means2 = self.gaussians2.means + np.array([offset_x, 0])
+        ax.scatter(shifted_means2[:, 0], shifted_means2[:, 1], 
+                c=self.gaussians2.rgb, marker='x', label='Image2 Gaussians')
+        
+        # Get matches and associated transport values
+        matches_with_transport = []
+        for i, j in self.matches:
+            transport_value = self.transport_matrix[i, j]
+            matches_with_transport.append((i, j, transport_value))
+        
+        # Sort matches by transport value in descending order
+        matches_with_transport.sort(key=lambda x: x[2], reverse=True)
+        
+        # Select top K matches if top_k is specified
+        if top_k is not None:
+            matches_with_transport = matches_with_transport[:top_k]
+        
+        # Visualize matches
+        for i, j, transport_value in matches_with_transport:
+            point1 = self.gaussians1.means[i]
+            point2 = self.gaussians2.means[j] + np.array([offset_x, 0])
+            ax.plot([point1[0], point2[0]], [point1[1], point2[1]], 'k--', linewidth=0.5)
+        
+        ax.legend()
+        ax.set_title(f'Gaussian Matching Visualization (Top {top_k} Matches)' if top_k else 'Gaussian Matching Visualization')
+        ax.set_xlabel('X-axis')
+        ax.set_ylabel('Y-axis')
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
