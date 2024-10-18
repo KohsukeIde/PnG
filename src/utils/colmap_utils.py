@@ -2,6 +2,7 @@ import os
 from collections import OrderedDict
 import numpy as np
 from src.camera.colmap_camera_utils import Camera
+import struct
 
 def load_cameras_from_colmap(colmap_dir: str):
     cameras = OrderedDict()
@@ -96,7 +97,6 @@ def read_images_text(path):
     return images
 
 def read_images_binary(path_to_model_file):
-    import struct
     images = {}
     with open(path_to_model_file, "rb") as fid:
         num_reg_images = struct.unpack('<Q', fid.read(8))[0]
