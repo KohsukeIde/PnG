@@ -1,96 +1,102 @@
-import torch
+# src/camera/camera_model.py
+
+import numpy as np
+import sys
+from typing import Tuple
+from src.camera.colmap_camera_utils import Camera
+from src.utils.colmap_utils import quaternion_to_rotation_matrix
 
 class CameraModel:
-    def __init__(self, intrinsics: torch.Tensor, extrinsics: torch.Tensor):
+    def __init__(self, camera: Camera, image_id: int, images_data: dict):
         """
-        Initialize the CameraModel.
-
         Args:
-            intrinsics (torch.Tensor): Camera intrinsic parameters (3x3 matrix)
-            extrinsics (torch.Tensor): Camera extrinsic parameters (4x4 matrix)
-
-        Raises:
-            ValueError: If input tensors have incorrect shapes
+            camera: Camera, an instance of the existing Camera class
+            image_id: int, ID of the image corresponding to this camera
+            images_data: dict, external parameter information for the image (obtained from COLMAP's images.bin or images.txt)
         """
-        if intrinsics.shape != (3, 3):
-            raise ValueError("Intrinsics must be a 3x3 tensor")
-        if extrinsics.shape != (4, 4):
-            raise ValueError("Extrinsics must be a 4x4 tensor")
+        self.camera = camera
+        self.image_id = image_id
+        self.images_data = images_data
 
-        self.intrinsics = intrinsics
-        self.extrinsics = extrinsics
+        # Camera intrinsic parameter matrix K
+        self.K = self.camera.get_camera_matrix()
+        self.K_inv = self.camera.get_inverse_camera_matrix()
 
-    def project_3d_to_2d(self, points_3d: torch.Tensor) -> torch.Tensor:
+        # Camera extrinsic parameters (rotation matrix R, translation vector t)
+        self.R, self.t = self.get_extrinsics()
+
+        # Projection matrix P
+        self.P = self.get_projection_matrix()
+        # print(f"Camera {image_id} Projection Matrix P:\n{self.P}")
+
+
+    def get_extrinsics(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Project 3D points to 2D image plane.
-
-        Args:
-            points_3d (torch.Tensor): 3D points in world coordinates (Nx3)
+        Get the camera's extrinsic parameters (rotation matrix and translation vector).
 
         Returns:
-            torch.Tensor: 2D points in image coordinates (Nx2)
+            R: np.ndarray, rotation matrix (3x3)
+            t: np.ndarray, translation vector (3,)
         """
-        # Ensure points_3d is homogeneous
-        if points_3d.shape[1] == 3:
-            points_3d = torch.cat([points_3d, torch.ones_like(points_3d[:, :1])], dim=1)
+        # Get quaternion and camera position from images_data
+        image_info = self.images_data[self.image_id]
+        # print(f"{image_info=}")
+        # sys.exit()
+        qw, qx, qy, qz = image_info['qw'], image_info['qx'], image_info['qy'], image_info['qz']
+        tx, ty, tz = image_info['tx'], image_info['ty'], image_info['tz']
 
-        # Transform points to camera coordinates
-        points_cam = torch.matmul(self.extrinsics, points_3d.t()).t()
+        # Convert quaternion to rotation matrix
+        R = quaternion_to_rotation_matrix(qw, qx, qy, qz)
+        t = np.array([tx, ty, tz])
 
-        # Project to image plane
-        points_2d = torch.matmul(self.intrinsics, points_cam[:, :3].t()).t()
+        return R, t
 
-        # Normalize
-        points_2d = points_2d[:, :2] / points_2d[:, 2:3]
-
-        return points_2d
-
-    def back_project_2d_to_3d(self, points_2d: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
+    def get_projection_matrix(self) -> np.ndarray:
         """
-        Back-project 2D points to 3D space.
-
-        Args:
-            points_2d (torch.Tensor): 2D points in image coordinates (Nx2)
-            depth (torch.Tensor): Depth values for each point (N)
+        Get the camera's projection matrix.
 
         Returns:
-            torch.Tensor: 3D points in world coordinates (Nx3)
+            P: np.ndarray, projection matrix (3x4)
         """
-        # Create homogeneous coordinates
-        points_2d_h = torch.cat([points_2d, torch.ones_like(points_2d[:, :1])], dim=1)
+        print(f"{self.K=}")
+        print(f"{self.R=}")
+        print(f"{self.t=}")
+        P = self.K @ np.hstack((self.R, self.t.reshape(-1, 1)))
+        print(f"{P=}")
+        sys.exit()
+        return P
 
-        # Invert intrinsics
-        inv_intrinsics = torch.inverse(self.intrinsics)
-
-        # Back-project to camera space
-        points_cam = torch.matmul(inv_intrinsics, points_2d_h.t()).t()
-        points_cam *= depth.unsqueeze(1)
-
-        # Transform to world coordinates
-        points_3d = torch.matmul(torch.inverse(self.extrinsics), 
-                                 torch.cat([points_cam, torch.ones_like(points_cam[:, :1])], dim=1).t()).t()
-
-        return points_3d[:, :3]
-
-    def update_extrinsics(self, rotation: torch.Tensor, translation: torch.Tensor):
+    def get_position(self) -> np.ndarray:
         """
-        Update camera extrinsics.
+        Get the camera's position in world coordinates.
+
+        Returns:
+            position: np.ndarray, camera position (3,)
+        """
+        # Calculate the position of the camera center
+        position = -self.R.T @ self.t
+        return position
+
+    def undistort_points(self, x: np.ndarray) -> np.ndarray:
+        """
+        Perform distortion correction.
 
         Args:
-            rotation (torch.Tensor): 3x3 rotation matrix
-            translation (torch.Tensor): 3x1 translation vector
+            x: np.ndarray, pixel coordinates with distortion (N, 2)
 
-        Raises:
-            ValueError: If input tensors have incorrect shapes
+        Returns:
+            xu: np.ndarray, pixel coordinates after distortion correction (N, 2)
         """
-        if rotation.shape != (3, 3):
-            raise ValueError("Rotation must be a 3x3 tensor")
-        if translation.shape != (3, 1) and translation.shape != (3,):
-            raise ValueError("Translation must be a 3x1 or 3-element tensor")
+        return self.camera.undistort_points(x, normalized=False, denormalize=True)
 
-        translation = translation.view(3, 1)
-        new_extrinsics = torch.eye(4, device=rotation.device)
-        new_extrinsics[:3, :3] = rotation
-        new_extrinsics[:3, 3] = translation.squeeze()
+    def distort_points(self, x: np.ndarray) -> np.ndarray:
+        """
+        Apply distortion.
 
-        self.extrinsics = new_extrinsics
+        Args:
+            x: np.ndarray, pixel coordinates without distortion (N, 2)
+
+        Returns:
+            xd: np.ndarray, pixel coordinates after applying distortion (N, 2)
+        """
+        return self.camera.distort_points(x, normalized=False, denormalize=True)
