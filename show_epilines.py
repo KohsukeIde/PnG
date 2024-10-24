@@ -1,33 +1,35 @@
 import pickle
 import sys
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from scipy.optimize import linear_sum_assignment
+import time
+
 from src.evaluator.matching_evaluator import MatchingEvaluator
 from src.optimizer.optimal_transport_solver_rs import OptimalTransportSolver
-import time
-from scipy.optimize import linear_sum_assignment
-
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
-def load_gaussians(file_path: str) -> tuple:
+from twodgs import TwoDGaussians  # Ensure this is correctly mapped
+
+def load_gaussians(pickle_path: str) -> tuple:
     """
     Load Gaussian data, view matrix, and camera intrinsic matrix from a pickle file.
 
     Args:
-        file_path (str): Path to the pickle file
+        pickle_path (str): Path to the pickle file
 
     Returns:
-        tuple: (gaussians, viewmat, K)
+        tuple: (original_gaussians, projected_gaussians, viewmat, K)
     """
-    with open(file_path, 'rb') as f:
+    with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
-        gaussians = data["gaussians"]
+        original_gaussians = data["original_gaussians"]
+        projected_gaussians = data["projected_gaussians"]
         viewmat = data["viewmat"]
         K = data["K"]
-    return gaussians, viewmat, K
+    return original_gaussians, projected_gaussians, viewmat, K
 
 def load_images(img1_path: str, img2_path: str) -> tuple:
     """
@@ -50,37 +52,22 @@ def load_images(img1_path: str, img2_path: str) -> tuple:
     
     return img1, img2
 
-def extract_feature_points(gaussians, K, viewmat):
+def extract_feature_points(projected_gaussians: TwoDGaussians) -> np.ndarray:
     """
     Extract Gaussian centers as feature points in pixel coordinates.
 
     Args:
-        gaussians: TwoDGaussians object
-        K (np.ndarray): Camera intrinsic matrix (3x3)
-        viewmat (np.ndarray): Camera view matrix (4x4)
+        projected_gaussians (TwoDGaussians): Projected Gaussians in image coordinates.
 
     Returns:
         np.ndarray: Array of feature points (N, 2)
     """
     try:
-        centers = gaussians.means  # (N, 2)
+        centers = projected_gaussians.means  # (N, 2)
     except AttributeError:
-        raise AttributeError("Gaussians object does not have 'means' attribute.")
+        raise AttributeError("Projected Gaussians object does not have 'means' attribute.")
 
-    num_points = centers.shape[0]
-
-    # Add Z coordinate (Z=0) and convert to homogeneous coordinates
-    centers_homog = np.hstack([centers, np.zeros((num_points, 1)), np.ones((num_points, 1))])  # (N, 4)
-
-    # Apply viewmat to convert to camera coordinates
-    camera_coords_homog = (viewmat @ centers_homog.T).T  # (N, 4)
-    camera_coords = camera_coords_homog[:, :3]  # (N, 3)
-
-    # Apply camera intrinsic matrix K to convert to pixel coordinates
-    pts_pixel_homog = (K @ camera_coords.T).T  # (N, 3)
-    pts_pixel = pts_pixel_homog[:, :2] / pts_pixel_homog[:, 2, np.newaxis]  # (N, 2)
-
-    return pts_pixel
+    return centers  # [N, 2]
 
 def draw_epilines(img, lines, pts, colors, point_radius=5):
     """
@@ -126,26 +113,30 @@ def draw_epilines(img, lines, pts, colors, point_radius=5):
 
     return img_copy
 
-def visualize_epilines_on_images(img1, img2, pts1_inliers, pts2_inliers, F, output_path='epilines_visualization.png'):
+def visualize_epilines_on_images(img, img2, pts1_inliers, pts2_inliers, F, output_path=None):
     """
-    Draw epipolar lines and corresponding points on images and visualize them.
+    Draw epipolar lines and corresponding points on the images.
 
     Args:
-        img1 (np.ndarray): Image 1
+        img (np.ndarray): Image 1
         img2 (np.ndarray): Image 2
         pts1_inliers (np.ndarray): Inlier feature points in image 1 (M, 2)
         pts2_inliers (np.ndarray): Inlier feature points in image 2 (M, 2)
         F (np.ndarray): Fundamental matrix
-        output_path (str): Path to save the visualization result
+        output_path (str): Path to save the visualization result (optional)
+
+    Returns:
+        tuple: (img1_with_epilines, img2_with_epilines)
     """
     if len(pts1_inliers) == 0:
         print("No inliers found. Cannot visualize epilines.")
-        return
+        return img, img2
 
-    # Calculate epipolar lines
+    # Calculate epipolar lines for image1
     lines1 = cv2.computeCorrespondEpilines(pts2_inliers.reshape(-1,1,2), 2, F)
     lines1 = lines1.reshape(-1, 3)
 
+    # Calculate epipolar lines for image2
     lines2 = cv2.computeCorrespondEpilines(pts1_inliers.reshape(-1,1,2), 1, F)
     lines2 = lines2.reshape(-1, 3)
 
@@ -153,10 +144,15 @@ def visualize_epilines_on_images(img1, img2, pts1_inliers, pts2_inliers, F, outp
     np.random.seed(42)  # For reproducibility
     colors = np.random.randint(0, 255, (len(pts1_inliers), 3))
 
-    img1_with_lines = draw_epilines(img1, lines1, pts1_inliers, colors)
-    img2_with_lines = draw_epilines(img2, lines2, pts2_inliers, colors)
+    img1_with_epilines = draw_epilines(img, lines1, pts1_inliers, colors)
+    img2_with_epilines = draw_epilines(img2, lines2, pts2_inliers, colors)
 
-    return img1_with_lines, img2_with_lines
+    if output_path:
+        combined = np.hstack((img1_with_epilines, img2_with_epilines))
+        cv2.imwrite(output_path, combined)
+        print(f"Epilines visualization saved to '{output_path}'.")
+
+    return img1_with_epilines, img2_with_epilines
 
 def compute_epipolar_errors(pts1, pts2, F):
     """
@@ -210,7 +206,7 @@ def sift_feature_matching(img1, img2):
     matches = sorted(matches, key=lambda x: x.distance)
 
     # Use only top matches
-    num_matches = 100
+    num_matches = 1000
     matches = matches[:num_matches]
 
     # Get matched keypoints
@@ -221,20 +217,19 @@ def sift_feature_matching(img1, img2):
 
 def main():
     print("Loading Gaussians...")
-    gaussians1, viewmat1, K1 = load_gaussians('/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/fitted_gaussians_22_1k.pkl')
-    gaussians2, viewmat2, K2 = load_gaussians('/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/fitted_gaussians_23_1k.pkl')
+    original_gaussians1, projected_gaussians1, viewmat1, K1 = load_gaussians('/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/fitted_gaussians_22_200.pkl')
+    original_gaussians2, projected_gaussians2, viewmat2, K2 = load_gaussians('/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/fitted_gaussians_23_200.pkl')
     print("Gaussians loaded.")
-    print(f"Number of Gaussians in gaussians1: {gaussians1.k}")
-    print(f"Number of Gaussians in gaussians2: {gaussians2.k}")
+    print(f"Number of Gaussians in gaussians1: {projected_gaussians1.k}")
+    print(f"Number of Gaussians in gaussians2: {projected_gaussians2.k}")
 
-    viewmat1 = viewmat1.astype(np.float32)
-    viewmat2 = viewmat2.astype(np.float32)
-    K1 = K1.astype(np.float32)
-    K2 = K2.astype(np.float32)
+    # viewmat1 = viewmat1.astype(np.float32)
+    # viewmat2 = viewmat2.astype(np.float32)
+    # K1 = K1.astype(np.float32)
+    # K2 = K2.astype(np.float32)
 
     print("Initializing OptimalTransportSolver...")
-    from src.optimizer.optimal_transport_solver_rs import OptimalTransportSolver
-    solver = OptimalTransportSolver(gaussians1, gaussians2)
+    solver = OptimalTransportSolver(projected_gaussians1, projected_gaussians2)
 
     print("Computing cost matrix...")
     start_time = time.time()
@@ -249,8 +244,7 @@ def main():
     print(f"Transport matrix computed in {end_time - start_time:.2f} seconds.")
 
     print("Initializing MatchingEvaluator...")
-    from src.evaluator.matching_evaluator import MatchingEvaluator
-    evaluator = MatchingEvaluator(gaussians1, gaussians2, transport_matrix)
+    evaluator = MatchingEvaluator(projected_gaussians1, projected_gaussians2, transport_matrix)
 
     print("Evaluating matches...")
     metrics = evaluator.evaluate_matches()
@@ -267,11 +261,10 @@ def main():
     img1, img2 = load_images(img1_path, img2_path)
     print("Images loaded.")
 
-    ### using transport matrix ###
     print("\n--- Using Custom Features ---")
-    print("Extracting feature points from Gaussians...")
-    pts1 = extract_feature_points(gaussians1, K1, viewmat1)
-    pts2 = extract_feature_points(gaussians2, K2, viewmat2)
+    print("Extracting feature points from Projected Gaussians...")
+    pts1 = extract_feature_points(projected_gaussians1)
+    pts2 = extract_feature_points(projected_gaussians2)
     print(f"Extracted {pts1.shape[0]} feature points from image1.")
     print(f"Extracted {pts2.shape[0]} feature points from image2.")
 
@@ -300,11 +293,11 @@ def main():
     else:
         sorted_matches = matches
 
-    max_lines = 50
+    max_lines = 1000
     limited_matches = sorted_matches[:max_lines] if len(sorted_matches) >= max_lines else sorted_matches
     print(f"Number of matched points to visualize: {len(limited_matches)}")
 
-    # extract corersponding points
+    # extract corresponding points
     pts1_matched = pts1[limited_matches[:, 0]]
     pts2_matched = pts2[limited_matches[:, 1]]
 
@@ -337,9 +330,10 @@ def main():
             pts1_inliers_custom,
             pts2_inliers_custom,
             F_custom,
+            output_path='/Users/kohsukeide/dev/perspective-n-gaussian/outputs/epilines_custom.png'
         )
 
-    ###using SIFT ###
+    ### using SIFT ###
     print("\n--- Using SIFT Features ---")
     print("Detecting and matching features using SIFT...")
     pts1_sift, pts2_sift = sift_feature_matching(img1, img2)
@@ -379,6 +373,7 @@ def main():
         pts1_inliers_sift,
         pts2_inliers_sift,
         F_sift,
+        output_path='/Users/kohsukeide/dev/perspective-n-gaussian/outputs/epilines_sift.png'
     )
 
     print("\n--- Displaying Comparison ---")
