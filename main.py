@@ -5,23 +5,24 @@ import sys
 import pickle
 import cv2
 
+
 # sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.optimizer.optimal_transport_solver_rs import OptimalTransportSolver
-from src.reconstruction.initial_reconstruction import perform_initial_reconstruction, visualize_reconstruction, save_points_to_ply, test_projection_matrix
+from src.reconstruction.initial_reconstruction import perform_initial_reconstruction, visualize_reconstruction, save_points_to_ply
 from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
-def load_gaussians(file_path: str) -> tuple:
-    # GS in 2D world coordinates
-    with open(file_path, 'rb') as f:
+def load_gaussians(pickle_path: str) -> tuple:
+    with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
-        gaussians = data["gaussians"]
+        original_gaussians = data["original_gaussians"]
+        projected_gaussians = data["projected_gaussians"]
         viewmat = data["viewmat"]
         K = data["K"]
-    return gaussians, viewmat, K
+    return original_gaussians, projected_gaussians, viewmat, K
 
 
 def main():
@@ -36,8 +37,8 @@ def main():
     image2_name = '0023.png' 
 
     # Gaussiansの読み込み
-    gaussians1, _, _ = load_gaussians(gaussians1_path)
-    gaussians2, _, _ = load_gaussians(gaussians2_path)
+    _, gaussians1, _, _ = load_gaussians(gaussians1_path)
+    _, gaussians2, _, _ = load_gaussians(gaussians2_path)
     print(f"{gaussians1.means=}")
 
     # COLMAPからカメラと画像の情報を読み込み
@@ -96,7 +97,6 @@ def main():
 
     visualize_reconstruction(points_3d, inlier_matches, img1, img2, pts1_inliers, pts2_inliers)
     
-    test_projection_matrix(camera1)
     
 
 if __name__ == '__main__':
