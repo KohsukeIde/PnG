@@ -3,6 +3,7 @@
 import numpy as np
 import sys
 from typing import Tuple
+from scipy.spatial.transform import Rotation as R
 from src.camera.colmap_camera_utils import Camera
 from src.utils.colmap_utils import quaternion_to_rotation_matrix
 
@@ -22,13 +23,16 @@ class CameraModel:
         self.K = self.camera.get_camera_matrix()
         self.K_inv = self.camera.get_inverse_camera_matrix()
 
-        # Camera extrinsic parameters (rotation matrix R, translation vector t)
-        self.R, self.t = self.get_extrinsics()
+        # Camera extrinsic parameters (rotation matrix R_wc, translation vector t_wc)
+        self.R_wc, self.t_wc = self.get_extrinsics()
+
+        # Transformation from camera coordinate system to world coordinate system
+        self.R_cw = self.R_wc.T
+        self.t_cw = -self.R_wc.T @ self.t_wc
 
         # Projection matrix P
         self.P = self.get_projection_matrix()
         # print(f"Camera {image_id} Projection Matrix P:\n{self.P}")
-
 
     def get_extrinsics(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -40,16 +44,18 @@ class CameraModel:
         """
         # Get quaternion and camera position from images_data
         image_info = self.images_data[self.image_id]
-        # print(f"{image_info=}")
-        # sys.exit()
         qw, qx, qy, qz = image_info['qw'], image_info['qx'], image_info['qy'], image_info['qz']
         tx, ty, tz = image_info['tx'], image_info['ty'], image_info['tz']
 
         # Convert quaternion to rotation matrix
-        R = quaternion_to_rotation_matrix(qw, qx, qy, qz)
-        t = np.array([tx, ty, tz])
+        # Note: In scipy, the quaternion order is (qx, qy, qz, qw)
+        rotation = R.from_quat([qx, qy, qz, qw])
+        R_wc = rotation.as_matrix()
 
-        return R, t
+        # Translation vector
+        t_wc = np.array([tx, ty, tz])
+
+        return R_wc, t_wc
 
     def get_projection_matrix(self) -> np.ndarray:
         """
@@ -58,12 +64,7 @@ class CameraModel:
         Returns:
             P: np.ndarray, projection matrix (3x4)
         """
-        print(f"{self.K=}")
-        print(f"{self.R=}")
-        print(f"{self.t=}")
-        P = self.K @ np.hstack((self.R, self.t.reshape(-1, 1)))
-        print(f"{P=}")
-        sys.exit()
+        P = self.K @ np.hstack((self.R_cw, self.t_cw.reshape(-1, 1)))
         return P
 
     def get_position(self) -> np.ndarray:
@@ -74,7 +75,8 @@ class CameraModel:
             position: np.ndarray, camera position (3,)
         """
         # Calculate the position of the camera center
-        position = -self.R.T @ self.t
+        position = -self.R_wc.T @ self.t_wc
+        print(f"{position=}")
         return position
 
     def undistort_points(self, x: np.ndarray) -> np.ndarray:
