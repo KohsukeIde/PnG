@@ -1,4 +1,5 @@
 import copy
+from typing import Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -14,7 +15,9 @@ class OptimalTransportSolver:
         gaussians1: TwoDGaussians,
         gaussians2: TwoDGaussians,
         epsilon: float = 0.1,
+        lambda_pos: float = 0.3,
         lambda_color: float = 1.0,
+        lambda_shape: float = 1.0,
     ):
         """Initialize the OptimalTransportSolver.
 
@@ -22,12 +25,16 @@ class OptimalTransportSolver:
             gaussians1 (TwoDGaussians): First set of 2D Gaussians.
             gaussians2 (TwoDGaussians): Second set of 2D Gaussians.
             epsilon (float): Entropy regularization parameter. Defaults to 0.1.
+            lambda_pos (float): Weight for position difference in cost calculation. Defaults to 1.0.
             lambda_color (float): Weight for color difference in cost calculation. Defaults to 1.0.
+            lambda_shape (float): Weight for shape difference in cost calculation. Defaults to 1.0.
         """
         self.gaussians1 = copy.deepcopy(gaussians1)
         self.gaussians2 = copy.deepcopy(gaussians2)
         self.epsilon = epsilon
+        self.lambda_pos = lambda_pos
         self.lambda_color = lambda_color
+        self.lambda_shape = lambda_shape
 
     def compute_cost_matrix(self) -> np.ndarray:
         """Compute the cost matrix between two sets of 2D Gaussians using scales and rotations.
@@ -53,18 +60,22 @@ class OptimalTransportSolver:
                     s2 = self.gaussians2.scales[j]
                     theta2 = self.gaussians2.rotations[j]
 
-                    # Compute the squared 2-Wasserstein distance
-                    wasserstein_sq = self._wasserstein_distance(
+                    # Compute the squared 2-Wasserstein distance components
+                    D_pos, D_shape = self._wasserstein_distance(
                         mu1, s1, theta1, mu2, s2, theta2
                     )
 
                     # Compute the squared color difference
-                    color_diff_sq = np.sum(
+                    D_color = np.sum(
                         (self.gaussians1.rgb[i] - self.gaussians2.rgb[j]) ** 2
                     )
 
-                    # Total cost
-                    cost = wasserstein_sq + self.lambda_color * color_diff_sq
+                    # Total cost with weights
+                    cost = (
+                        self.lambda_pos * D_pos
+                        + self.lambda_shape * D_shape
+                        + self.lambda_color * D_color
+                    )
                     cost_matrix[i, j] = cost
                     pbar.update(1)
 
@@ -115,8 +126,8 @@ class OptimalTransportSolver:
         mu2: np.ndarray,
         s2: np.ndarray,
         theta2: float,
-    ) -> float:
-        """Compute the squared 2-Wasserstein distance between two Gaussians using scales and rotations.
+    ) -> Tuple[float, float]:
+        """Compute the squared 2-Wasserstein distance components between two Gaussians.
 
         Args:
             mu1 (np.ndarray): Mean of the first Gaussian (shape: (2,)).
@@ -127,7 +138,7 @@ class OptimalTransportSolver:
             theta2 (float): Rotation angle of the second Gaussian in radians.
 
         Returns:
-            float: Squared 2-Wasserstein distance between the two Gaussians.
+            Tuple[float, float]: Tuple containing squared mean difference and trace term (shape difference).
         """
         # Compute the squared norm of the mean difference
         diff_means = np.sum((mu1 - mu2) ** 2)
@@ -148,8 +159,8 @@ class OptimalTransportSolver:
         # Compute the trace term
         trace_term = np.trace(sigma1 + sigma2 - 2 * sqrt_intermediate)
 
-        # Total squared Wasserstein distance
-        return float(diff_means + trace_term)
+        # Return the components separately
+        return diff_means, trace_term
 
     def sinkhorn_algorithm(
         self,
