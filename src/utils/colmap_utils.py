@@ -1,8 +1,11 @@
 import os
-from collections import OrderedDict
-import numpy as np
-from src.camera.colmap_camera_utils import Camera
 import struct
+from collections import OrderedDict
+
+import numpy as np
+
+from src.camera.colmap_camera_utils import Camera
+
 
 def load_cameras_from_colmap(colmap_dir: str):
     cameras = OrderedDict()

@@ -1,19 +1,21 @@
 # src/camera/camera_model.py
 
-import numpy as np
 import sys
 from typing import Tuple
+
+import numpy as np
 from scipy.spatial.transform import Rotation as R
+
 from src.camera.colmap_camera_utils import Camera
 from src.utils.colmap_utils import quaternion_to_rotation_matrix
 
+
 class CameraModel:
     def __init__(self, camera: Camera, image_id: int, images_data: dict):
-        """
-        Args:
-            camera: Camera, an instance of the existing Camera class
-            image_id: int, ID of the image corresponding to this camera
-            images_data: dict, external parameter information for the image (obtained from COLMAP's images.bin or images.txt)
+        """Args:
+        camera: Camera, an instance of the existing Camera class
+        image_id: int, ID of the image corresponding to this camera
+        images_data: dict, external parameter information for the image (obtained from COLMAP's images.bin or images.txt)
         """
         self.camera = camera
         self.image_id = image_id
@@ -35,8 +37,7 @@ class CameraModel:
         # print(f"Camera {image_id} Projection Matrix P:\n{self.P}")
 
     def get_extrinsics(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the camera's extrinsic parameters (rotation matrix and translation vector).
+        """Get the camera's extrinsic parameters (rotation matrix and translation vector).
 
         Returns:
             R: np.ndarray, rotation matrix (3x3)
@@ -58,8 +59,7 @@ class CameraModel:
         return R_wc, t_wc
 
     def get_projection_matrix(self) -> np.ndarray:
-        """
-        Get the camera's projection matrix.
+        """Get the camera's projection matrix.
 
         Returns:
             P: np.ndarray, projection matrix (3x4)
@@ -68,8 +68,7 @@ class CameraModel:
         return P
 
     def get_position(self) -> np.ndarray:
-        """
-        Get the camera's position in world coordinates.
+        """Get the camera's position in world coordinates.
 
         Returns:
             position: np.ndarray, camera position (3,)
@@ -80,8 +79,7 @@ class CameraModel:
         return position
 
     def undistort_points(self, x: np.ndarray) -> np.ndarray:
-        """
-        Perform distortion correction.
+        """Perform distortion correction.
 
         Args:
             x: np.ndarray, pixel coordinates with distortion (N, 2)
@@ -92,8 +90,7 @@ class CameraModel:
         return self.camera.undistort_points(x, normalized=False, denormalize=True)
 
     def distort_points(self, x: np.ndarray) -> np.ndarray:
-        """
-        Apply distortion.
+        """Apply distortion.
 
         Args:
             x: np.ndarray, pixel coordinates without distortion (N, 2)

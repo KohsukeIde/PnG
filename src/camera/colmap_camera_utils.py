@@ -3,7 +3,6 @@
 import numpy as np
 from scipy.optimize import root
 
-
 #-------------------------------------------------------------------------------
 #
 # camera distortion functions for arrays of size (..., 2)

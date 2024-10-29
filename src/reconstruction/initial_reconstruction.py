@@ -1,15 +1,17 @@
 # src/reconstruction/initial_reconstruction.py
 
-import numpy as np
-import cv2
-from typing import List, Tuple
-from src.primitive.twod_gaussians_rs import TwoDGaussians
-from src.camera.camera_model import CameraModel
-from scipy.optimize import linear_sum_assignment
 import os
+from typing import List, Tuple
 
+import cv2
 import matplotlib.pyplot as plt
+import numpy as np
 from mpl_toolkits.mplot3d import Axes3D
+from scipy.optimize import linear_sum_assignment
+
+from src.camera.camera_model import CameraModel
+from src.primitive.twod_gaussians_rs import TwoDGaussians
+
 
 def perform_initial_reconstruction(
     gaussians1: TwoDGaussians,
@@ -19,8 +21,7 @@ def perform_initial_reconstruction(
     transport_matrix: np.ndarray,
     threshold: float = 1e-6,
 ) -> Tuple[np.ndarray, List[Tuple[int, int]], np.ndarray, np.ndarray]:
-    """
-    Filter matches using epipolar constraints and reconstruct 3D point cloud using triangulation.
+    """Filter matches using epipolar constraints and reconstruct 3D point cloud using triangulation.
 
     Args:
         gaussians1: TwoDGaussians (Gaussian distributions for image 1, in image coordinates)
@@ -80,8 +81,7 @@ def perform_initial_reconstruction(
     return points_3d, inlier_matches, pts1_inliers, pts2_inliers
 
 def extract_matches(transport_matrix: np.ndarray, threshold: float = 1e-6) -> List[Tuple[int, int]]:
-    """
-    Extract matches from the transport matrix.
+    """Extract matches from the transport matrix.
 
     Args:
         transport_matrix: np.ndarray, transport matrix
@@ -90,7 +90,6 @@ def extract_matches(transport_matrix: np.ndarray, threshold: float = 1e-6) -> Li
     Returns:
         matches: List[Tuple[int, int]], index pairs of matches
     """
-
     cost_for_hungarian = -transport_matrix
     row_ind, col_ind = linear_sum_assignment(cost_for_hungarian)
     matches = []
@@ -100,8 +99,7 @@ def extract_matches(transport_matrix: np.ndarray, threshold: float = 1e-6) -> Li
     return matches
 
 def compute_fundamental_matrix(camera1: CameraModel, camera2: CameraModel) -> np.ndarray:
-    """
-    Compute the fundamental matrix from camera intrinsic and extrinsic parameters.
+    """Compute the fundamental matrix from camera intrinsic and extrinsic parameters.
 
     Args:
         camera1: CameraModel, model for camera 1
@@ -137,8 +135,7 @@ def compute_fundamental_matrix(camera1: CameraModel, camera2: CameraModel) -> np
     return F
 
 def apply_epipolar_constraint(pts1: np.ndarray, pts2: np.ndarray, F: np.ndarray, threshold: float = 1e-4) -> np.ndarray:
-    """
-    Apply epipolar constraint to extract inliers.
+    """Apply epipolar constraint to extract inliers.
 
     Args:
         pts1: np.ndarray, feature points from image 1 (N, 2)
@@ -160,8 +157,7 @@ def apply_epipolar_constraint(pts1: np.ndarray, pts2: np.ndarray, F: np.ndarray,
     return inlier_mask
 
 def triangulate_points(pts1: np.ndarray, pts2: np.ndarray, camera1: CameraModel, camera2: CameraModel) -> np.ndarray:
-    """
-    Reconstruct 3D points using triangulation from corresponding feature points.
+    """Reconstruct 3D points using triangulation from corresponding feature points.
 
     Args:
         pts1: np.ndarray, feature points from image 1 (N, 2)
@@ -225,8 +221,7 @@ def visualize_reconstruction(points_3d, inlier_matches, img1, img2, pts1_inliers
     plt.close()
 
 def save_points_to_ply(points_3d, filename='reconstructed_points.ply', colors=None):
-    """
-    Save 3D point cloud to PLY file.
+    """Save 3D point cloud to PLY file.
 
     Args:
         points_3d: np.ndarray of shape (N, 3)

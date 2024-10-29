@@ -1,5 +1,7 @@
 import torch
+
 from src.camera.camera_model import CameraModel
+
 
 def test_camera_model_initialization():
     intrinsics = torch.tensor([
