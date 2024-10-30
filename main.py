@@ -95,7 +95,7 @@ def main():
     img1 = cv2.imread(img1_path)
     img2 = cv2.imread(img2_path)
 
-    visualize_reconstruction(points_3d, inlier_matches, img1, img2, pts1_inliers, pts2_inliers)
+    visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers)
     
     
 
