@@ -1,4 +1,4 @@
-# src/reconstruction/initial_reconstruction.py
+# src/reconstruction/initial_reconstruction_naive.py
 
 import os
 from typing import List, Tuple
@@ -133,7 +133,7 @@ def compute_fundamental_matrix(camera1: CameraModel, camera2: CameraModel) -> np
 
     return F
 
-def apply_epipolar_constraint(pts1: np.ndarray, pts2: np.ndarray, F: np.ndarray, threshold: float = 1e-) -> np.ndarray:
+def apply_epipolar_constraint(pts1: np.ndarray, pts2: np.ndarray, F: np.ndarray, threshold: float = 1e-1) -> np.ndarray:
     """Apply epipolar constraint to extract inliers.
 
     Args:
@@ -179,7 +179,7 @@ def triangulate_points(pts1: np.ndarray, pts2: np.ndarray, camera1: CameraModel,
 
     return points_3d
 
-def visualize_reconstruction(points_3d, inlier_matches, img1, img2, pts1_inliers, pts2_inliers):
+def visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers):
     # Create output directory if it doesn't exist
     output_dir = 'outputs'
     os.makedirs(output_dir, exist_ok=True)
