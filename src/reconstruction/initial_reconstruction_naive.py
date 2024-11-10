@@ -180,24 +180,22 @@ def triangulate_points(pts1: np.ndarray, pts2: np.ndarray, camera1: CameraModel,
     return points_3d
 
 def visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers):
-    # Create output directory if it doesn't exist
     output_dir = 'outputs'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Check if inlier points exist
     if pts1_inliers.size == 0 or pts2_inliers.size == 0:
         print("No inlier points to visualize.")
         return
 
     plt.figure(figsize=(15, 5))
 
-    # Plot inlier points on image 1
+    # inlier points on image 1
     plt.subplot(1, 2, 1)
     plt.imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB))
     plt.scatter(pts1_inliers[:, 0], pts1_inliers[:, 1], c='r', marker='o')
     plt.title('Image 1 with Inlier Points')
 
-    # Plot inlier points on image 2
+    # inlier points on image 2
     plt.subplot(1, 2, 2)
     plt.imshow(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB))
     plt.scatter(pts2_inliers[:, 0], pts2_inliers[:, 1], c='r', marker='o')

@@ -4,14 +4,14 @@ import os
 import sys
 import pickle
 import cv2
-
-
-# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
 
 from src.optimizer.optimal_transport_solver_rs import OptimalTransportSolver
-from src.reconstruction.initial_reconstruction import perform_initial_reconstruction, visualize_reconstruction, save_points_to_ply
+from src.reconstruction.initial_reconstruction_naive import perform_initial_reconstruction
 from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
+from src.reconstruction.visualization import visualize_reconstruction, save_points_to_ply, visualize_new_view_integration
+from src.reconstruction.view_integration import integrate_new_view
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
@@ -24,9 +24,8 @@ def load_gaussians(pickle_path: str) -> tuple:
         K = data["K"]
     return original_gaussians, projected_gaussians, viewmat, K
 
-
 def main():
-    data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63'
+    data_dir = '/Users/kohsukeide/dev/perspective-n-gaus　sian/data/DTU/scan63'
     data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs'
     gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
     gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
@@ -39,6 +38,7 @@ def main():
     # Gaussiansの読み込み
     _, gaussians1, _, _ = load_gaussians(gaussians1_path)
     _, gaussians2, _, _ = load_gaussians(gaussians2_path)
+    # _, gaussians3,
     print(f"{gaussians1.means=}")
 
     # COLMAPからカメラと画像の情報を読み込み
@@ -65,26 +65,20 @@ def main():
     print(f"Camera 1 Translation Vector t_cw:\n{camera1.t_cw}")
     print(f"Camera 1 Projection Matrix P:\n{camera1.P}")
     
-    # print(f"Camera 2 Intrinsic Matrix K:\n{camera2.K}")
-    # print(f"Camera 2 Rotation Matrix R:\n{camera2.R}")
-    # print(f"Camera 2 Translation Vector t:\n{camera2.t}")
-    # print(f"Camera 2 Projection Matrix P:\n{camera2.P}")
-
     # Optimal Transport Solver
     solver = OptimalTransportSolver(gaussians1, gaussians2)
     cost_matrix = solver.compute_cost_matrix()
     transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
 
-    # Perform initial reconstruction
+    # 初期再構成
     points_3d, inlier_matches, pts1_inliers, pts2_inliers = perform_initial_reconstruction(
         gaussians1, gaussians2, camera1, camera2, transport_matrix
     )
 
-    # Check if points_3d is non-empty
     if points_3d.size > 0:
-        # Extract colors from the first image's Gaussians using the indices from inlier_matches
+        # インライアマッチングのインデックスを取得
         indices_gaussians1 = [i for i, _ in inlier_matches]
-        colors = gaussians1.rgb[indices_gaussians1]  # Assuming gaussians1.rgb exists
+        colors = gaussians1.rgb[indices_gaussians1]  # shape: (N, 3), 値は0-255の範囲
         save_points_to_ply(points_3d, filename='reconstructed_points.ply', colors=colors)
         print("Reconstructed 3D points saved to 'reconstructed_points.ply'.")
     else:
@@ -95,9 +89,34 @@ def main():
     img1 = cv2.imread(img1_path)
     img2 = cv2.imread(img2_path)
 
+    # 可視化の実行
     visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers)
     
-    
+    # add new view
+    updated_3d_points, new_matches = integrate_new_view(
+        points_3d,  # 既存の3D点群
+        gaussians2,  # 新しい画像のGaussians
+        camera2,     # 新しいカメラ
+        [camera1]    # 既存のカメラリスト
+    )
+
+    # visualization
+    img2_path = os.path.join(images_dir, image2_name)
+    visualize_new_view_integration(
+        img2_path,
+        points_3d,
+        updated_3d_points,
+        new_matches,
+        gaussians2,
+        camera2
+    )
+
+    # save updated pcl
+    if updated_3d_points.size > 0:
+        save_points_to_ply(updated_3d_points, filename='updated_points.ply')
+        print("Updated 3D points saved to 'updated_points.ply'.")
+    else:
+        print("No updated 3D points to save.")
 
 if __name__ == '__main__':
     main()
