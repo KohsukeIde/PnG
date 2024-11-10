@@ -146,13 +146,16 @@ def test_compute_cost_matrix_simple_case():
         scales=scales2,
     )
 
-    solver = OptimalTransportSolver(gaussians1, gaussians2, lambda_color=1.0)
+    # Set lambda_pos explicitly to match the expected cost
+    solver = OptimalTransportSolver(
+        gaussians1, gaussians2, lambda_pos=1.0, lambda_color=1.0
+    )
     cost_matrix = solver.compute_cost_matrix()
 
     expected_cost = np.array(
         [
-            [0, 10],  # From Gaussian 1 in gaussians1 to Gaussians in gaussians2
-            [4, 4],  # From Gaussian 2 in gaussians1 to Gaussians in gaussians2
+            [0, 10],  # (0,0) to (0,0) and (0,0) to (2,2)
+            [4, 4],  # (1,1) to (0,0) and (1,1) to (2,2)
         ]
     )
 

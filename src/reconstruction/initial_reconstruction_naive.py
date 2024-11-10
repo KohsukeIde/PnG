@@ -1,7 +1,7 @@
 # src/reconstruction/initial_reconstruction_naive.py
 
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import cv2
 import matplotlib.pyplot as plt
@@ -57,11 +57,11 @@ def perform_initial_reconstruction(
     pts2_matched = pts2[idx2]
 
     # Step 4: Compute the fundamental matrix from camera parameters
-    F = compute_fundamental_matrix(camera1, camera2)
-    print(f"{F=}")
+    fund_matrix = compute_fundamental_matrix(camera1, camera2)
+    print(f"{fund_matrix=}")
 
     # Step 5: Apply epipolar constraint to extract inliers
-    inlier_mask = apply_epipolar_constraint(pts1_matched, pts2_matched, F)
+    inlier_mask = apply_epipolar_constraint(pts1_matched, pts2_matched, fund_matrix)
 
     inlier_matches = [match for match, inlier in zip(matches, inlier_mask) if inlier]
     pts1_inliers = pts1_matched[inlier_mask]
@@ -79,7 +79,10 @@ def perform_initial_reconstruction(
 
     return points_3d, inlier_matches, pts1_inliers, pts2_inliers
 
-def extract_matches(transport_matrix: np.ndarray, threshold: float = 1e-6) -> List[Tuple[int, int]]:
+
+def extract_matches(
+    transport_matrix: np.ndarray, threshold: float = 1e-6
+) -> List[Tuple[int, int]]:
     """Extract matches from the transport matrix.
 
     Args:
@@ -97,7 +100,10 @@ def extract_matches(transport_matrix: np.ndarray, threshold: float = 1e-6) -> Li
             matches.append((i, j))
     return matches
 
-def compute_fundamental_matrix(camera1: CameraModel, camera2: CameraModel) -> np.ndarray:
+
+def compute_fundamental_matrix(
+    camera1: CameraModel, camera2: CameraModel
+) -> np.ndarray:
     """Compute the fundamental matrix from camera intrinsic and extrinsic parameters.
 
     Args:
@@ -105,41 +111,42 @@ def compute_fundamental_matrix(camera1: CameraModel, camera2: CameraModel) -> np
         camera2: CameraModel, model for camera 2
 
     Returns:
-        F: np.ndarray, fundamental matrix (3x3)
+        fund_matrix: np.ndarray, fundamental matrix (3x3)
     """
     # Get camera parameters for camera 1 and camera 2
-    R1_wc, t1_wc = camera1.R_wc, camera1.t_wc
-    R2_wc, t2_wc = camera2.R_wc, camera2.t_wc
+    r1_wc, t1_wc = camera1.R_wc, camera1.t_wc
+    r2_wc, t2_wc = camera2.R_wc, camera2.t_wc
 
     # Compute relative rotation and translation
-    R_rel = R2_wc @ R1_wc.T
-    t_rel = t2_wc - R_rel @ t1_wc
+    r_rel = r2_wc @ r1_wc.T
+    t_rel = t2_wc - r_rel @ t1_wc
 
     # Compute essential matrix
-    t_x = np.array([
-        [0, -t_rel[2], t_rel[1]],
-        [t_rel[2], 0, -t_rel[0]],
-        [-t_rel[1], t_rel[0], 0]
-    ])
-    E = t_x @ R_rel
+    t_x = np.array(
+        [[0, -t_rel[2], t_rel[1]], [t_rel[2], 0, -t_rel[0]], [-t_rel[1], t_rel[0], 0]]
+    )
+    ess_matrix = t_x @ r_rel
 
     # Compute fundamental matrix
-    K1_inv = np.linalg.inv(camera1.K)
-    K2_inv = np.linalg.inv(camera2.K)
-    F = K2_inv.T @ E @ K1_inv
+    k1_inv = np.linalg.inv(camera1.K)
+    k2_inv = np.linalg.inv(camera2.K)
+    fund_matrix = k2_inv.T @ ess_matrix @ k1_inv
 
     # Normalize
-    F /= np.linalg.norm(F)
+    fund_matrix /= np.linalg.norm(fund_matrix)
 
-    return F
+    return np.array(fund_matrix)
 
-def apply_epipolar_constraint(pts1: np.ndarray, pts2: np.ndarray, F: np.ndarray, threshold: float = 1e-1) -> np.ndarray:
+
+def apply_epipolar_constraint(
+    pts1: np.ndarray, pts2: np.ndarray, fund_matrix: np.ndarray, threshold: float = 1e-1
+) -> np.ndarray:
     """Apply epipolar constraint to extract inliers.
 
     Args:
         pts1: np.ndarray, feature points from image 1 (N, 2)
         pts2: np.ndarray, feature points from image 2 (N, 2)
-        F: np.ndarray, fundamental matrix (3x3)
+        fund_matrix: np.ndarray, fundamental matrix (3x3)
         threshold: float, threshold for epipolar constraint
 
     Returns:
@@ -149,13 +156,16 @@ def apply_epipolar_constraint(pts1: np.ndarray, pts2: np.ndarray, F: np.ndarray,
     pts2_hom = np.hstack([pts2, np.ones((pts2.shape[0], 1))])  # (N, 3)
 
     # Compute epipolar constraint errors
-    errors = np.abs(np.sum(pts2_hom * (F @ pts1_hom.T).T, axis=1))
+    errors = np.abs(np.sum(pts2_hom * (fund_matrix @ pts1_hom.T).T, axis=1))
 
     # Keep points with errors below the threshold
     inlier_mask = errors < threshold
-    return inlier_mask
+    return np.array(inlier_mask)
 
-def triangulate_points(pts1: np.ndarray, pts2: np.ndarray, camera1: CameraModel, camera2: CameraModel) -> np.ndarray:
+
+def triangulate_points(
+    pts1: np.ndarray, pts2: np.ndarray, camera1: CameraModel, camera2: CameraModel
+) -> np.ndarray:
     """Reconstruct 3D points using triangulation from corresponding feature points.
 
     Args:
@@ -168,19 +178,35 @@ def triangulate_points(pts1: np.ndarray, pts2: np.ndarray, camera1: CameraModel,
         points_3d: np.ndarray, reconstructed 3D point cloud (N, 3)
     """
     # Compute camera matrices
-    P1 = camera1.P  # (3, 4)
-    P2 = camera2.P  # (3, 4)
+    proj1 = camera1.P  # (3, 4)
+    proj2 = camera2.P  # (3, 4)
 
     # Triangulation
     pts1_hom = pts1.T  # (2, N)
     pts2_hom = pts2.T  # (2, N)
-    points_4d_hom = cv2.triangulatePoints(P1, P2, pts1_hom, pts2_hom)
+    points_4d_hom = cv2.triangulatePoints(proj1, proj2, pts1_hom, pts2_hom)
     points_3d = (points_4d_hom[:3, :] / points_4d_hom[3, :]).T  # (N, 3)
 
-    return points_3d
+    return np.array(points_3d)
 
-def visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers):
-    output_dir = 'outputs'
+
+def visualize_reconstruction(
+    points_3d: np.ndarray,
+    img1: np.ndarray,
+    img2: np.ndarray,
+    pts1_inliers: np.ndarray,
+    pts2_inliers: np.ndarray,
+) -> None:
+    """Visualize the reconstruction results.
+
+    Args:
+        points_3d: np.ndarray, reconstructed 3D points
+        img1: np.ndarray, first image
+        img2: np.ndarray, second image
+        pts1_inliers: np.ndarray, inlier points from first image
+        pts2_inliers: np.ndarray, inlier points from second image
+    """
+    output_dir = "outputs"
     os.makedirs(output_dir, exist_ok=True)
 
     if pts1_inliers.size == 0 or pts2_inliers.size == 0:
@@ -192,16 +218,16 @@ def visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers):
     # inlier points on image 1
     plt.subplot(1, 2, 1)
     plt.imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB))
-    plt.scatter(pts1_inliers[:, 0], pts1_inliers[:, 1], c='r', marker='o')
-    plt.title('Image 1 with Inlier Points')
+    plt.scatter(pts1_inliers[:, 0], pts1_inliers[:, 1], c="r", marker="o")
+    plt.title("Image 1 with Inlier Points")
 
     # inlier points on image 2
     plt.subplot(1, 2, 2)
     plt.imshow(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB))
-    plt.scatter(pts2_inliers[:, 0], pts2_inliers[:, 1], c='r', marker='o')
-    plt.title('Image 2 with Inlier Points')
+    plt.scatter(pts2_inliers[:, 0], pts2_inliers[:, 1], c="r", marker="o")
+    plt.title("Image 2 with Inlier Points")
 
-    plt.savefig(os.path.join(output_dir, 'inlier_points.png'))
+    plt.savefig(os.path.join(output_dir, "inlier_points.png"))
     plt.close()
 
     # Visualize 3D points
@@ -210,14 +236,19 @@ def visualize_reconstruction(points_3d, img1, img2, pts1_inliers, pts2_inliers):
         return
 
     fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(points_3d[:, 0], points_3d[:, 1], points_3d[:, 2], c='b', marker='o')
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(points_3d[:, 0], points_3d[:, 1], points_3d[:, 2], c="b", marker="o")
 
-    plt.title('Reconstructed 3D Points')
-    plt.savefig(os.path.join(output_dir, '3d_points.png'))
+    plt.title("Reconstructed 3D Points")
+    plt.savefig(os.path.join(output_dir, "3d_points.png"))
     plt.close()
 
-def save_points_to_ply(points_3d, filename='reconstructed_points.ply', colors=None):
+
+def save_points_to_ply(
+    points_3d: np.ndarray,
+    filename: str = "reconstructed_points.ply",
+    colors: Union[np.ndarray, None] = None,
+) -> None:
     """Save 3D point cloud to PLY file.
 
     Args:
@@ -225,35 +256,37 @@ def save_points_to_ply(points_3d, filename='reconstructed_points.ply', colors=No
         filename: str, name of the output PLY file
         colors: np.ndarray of shape (N, 3), optional RGB values for points (0-1 range)
     """
-    output_dir = 'outputs'
+    output_dir = "outputs"
     os.makedirs(output_dir, exist_ok=True)
 
     file_path = os.path.join(output_dir, filename)
 
     num_points = points_3d.shape[0]
-    header = f'''ply
+    header = f"""ply
 format ascii 1.0
 element vertex {num_points}
 property float x
 property float y
 property float z
-'''
+"""
     if colors is not None:
-        header += '''property uchar red
+        header += """property uchar red
 property uchar green
 property uchar blue
-'''
+"""
 
-    header += 'end_header\n'
+    header += "end_header\n"
 
-    with open(file_path, 'w') as f:
+    with open(file_path, "w") as f:
         f.write(header)
         if colors is not None:
             for point, color in zip(points_3d, colors):
                 # Convert color values to 0-255 range if they are in the 0-1 range
                 if color.max() <= 1.0:
                     color = (color * 255).astype(int)
-                f.write(f"{point[0]} {point[1]} {point[2]} {int(color[0])} {int(color[1])} {int(color[2])}\n")
+                f.write(
+                    f"{point[0]} {point[1]} {point[2]} {int(color[0])} {int(color[1])} {int(color[2])}\n"
+                )
         else:
             for point in points_3d:
                 f.write(f"{point[0]} {point[1]} {point[2]}\n")

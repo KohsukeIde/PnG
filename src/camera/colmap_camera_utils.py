@@ -1,5 +1,7 @@
 # Author: True Price <jtprice at cs.unc.edu>
 
+from typing import Callable, Optional, Tuple, Union
+
 import numpy as np
 from scipy.optimize import root
 
@@ -10,7 +12,7 @@ from scipy.optimize import root
 # -------------------------------------------------------------------------------
 
 
-def simple_radial_distortion(camera, x):
+def simple_radial_distortion(camera: "Camera", x: np.ndarray) -> np.ndarray:
     """Apply simple radial distortion to points.
 
     Args:
@@ -20,10 +22,13 @@ def simple_radial_distortion(camera, x):
     Returns:
         np.ndarray: Distorted points
     """
-    return x * (1.0 + camera.k1 * np.square(x).sum(axis=-1, keepdims=True))
+    if camera.k1 is None:
+        raise ValueError("k1 cannot be None for simple_radial_distortion")
+    k1 = float(camera.k1)
+    return np.ndarray(x * (1.0 + k1 * np.square(x).sum(axis=-1, keepdims=True)))
 
 
-def radial_distortion(camera, x):
+def radial_distortion(camera: "Camera", x: np.ndarray) -> np.ndarray:
     """Apply radial distortion to points.
 
     Args:
@@ -33,11 +38,15 @@ def radial_distortion(camera, x):
     Returns:
         np.ndarray: Distorted points
     """
+    if camera.k1 is None or camera.k2 is None:
+        raise ValueError("k1 and k2 cannot be None for radial_distortion")
+    k1 = float(camera.k1)
+    k2 = float(camera.k2)
     r_sq = np.square(x).sum(axis=-1, keepdims=True)
-    return x * (1.0 + r_sq * (camera.k1 + camera.k2 * r_sq))
+    return np.ndarray(x * (1.0 + r_sq * (k1 + k2 * r_sq)))
 
 
-def opencv_distortion(camera, x):
+def opencv_distortion(camera: "Camera", x: np.ndarray) -> np.ndarray:
     """Apply OpenCV-style distortion to points.
 
     Args:
@@ -47,18 +56,22 @@ def opencv_distortion(camera, x):
     Returns:
         np.ndarray: Distorted points
     """
+    if camera.k1 is None or camera.k2 is None:
+        raise ValueError("k1 and k2 cannot be None for opencv_distortion")
+    k1 = float(camera.k1)
+    k2 = float(camera.k2)
+    p1 = float(camera.p1) if camera.p1 is not None else 0.0
+    p2 = float(camera.p2) if camera.p2 is not None else 0.0
+
     x_sq = np.square(x)
     xy = np.prod(x, axis=-1, keepdims=True)
     r_sq = x_sq.sum(axis=-1, keepdims=True)
     y_sq = x_sq[..., 1:]  # Get y-squared component
 
-    return x * (1.0 + r_sq * (camera.k1 + camera.k2 * r_sq)) + np.concatenate(
-        (
-            2.0 * camera.p1 * xy + camera.p2 * (r_sq + 2.0 * x_sq[..., :1]),
-            camera.p1 * (r_sq + 2.0 * y_sq) + 2.0 * camera.p2 * xy,
-        ),
-        axis=-1,
-    )
+    distorted = x * (1.0 + r_sq * (k1 + k2 * r_sq))
+    distort_xy = 2.0 * p1 * xy + p2 * (r_sq + 2.0 * x_sq[..., :1])
+    distort_yx = p1 * (r_sq + 2.0 * y_sq) + 2.0 * p2 * xy
+    return np.ndarray(distorted + np.concatenate((distort_xy, distort_yx), axis=-1))
 
 
 # -------------------------------------------------------------------------------
@@ -71,8 +84,23 @@ def opencv_distortion(camera, x):
 class Camera:
     """A class representing a camera with various distortion models. Based off of gsplat Camera class."""
 
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    k1: Optional[float]
+    k2: Optional[float]
+    p1: Optional[float]
+    p2: Optional[float]
+    k3: Optional[float]
+    k4: Optional[float]
+    width: int
+    height: int
+    distortion_func: Optional[Callable[["Camera", np.ndarray], np.ndarray]]
+    camera_type: int
+
     @staticmethod
-    def get_num_params(type_):
+    def get_num_params(type_: Union[int, str]) -> int:
         """Get the number of parameters for a given camera type.
 
         Args:
@@ -96,7 +124,7 @@ class Camera:
         raise Exception("Camera type not supported")
 
     @staticmethod
-    def get_name_from_type(type_):
+    def get_name_from_type(type_: int) -> str:
         """Get the camera type name from its identifier.
 
         Args:
@@ -119,7 +147,13 @@ class Camera:
             return "OPENCV_FISHEYE"
         raise Exception("Camera type not supported")
 
-    def __init__(self, type_, width_, height_, params):
+    def __init__(
+        self,
+        type_: Union[int, str],
+        width_: int,
+        height_: int,
+        params: Union[np.ndarray, Tuple[float, ...]],
+    ) -> None:
         """Initialize a camera instance.
 
         Args:
@@ -128,43 +162,62 @@ class Camera:
             height_: int, image height
             params: array-like, camera parameters
         """
-        self.width = width_
-        self.height = height_
+        self.width: int = width_
+        self.height: int = height_
 
         if type_ == 0 or type_ == "SIMPLE_PINHOLE":
-            self.fx, self.cx, self.cy = params
-            self.fy = self.fx
+            if len(params) != 3:
+                raise ValueError("SIMPLE_PINHOLE requires 3 parameters.")
+            self.fx, self.cx, self.cy = map(float, params)
+            self.fy: float = self.fx
             self.distortion_func = None
-            self.camera_type = 0
+            self.camera_type: int = 0
+            self.k1 = self.k2 = self.p1 = self.p2 = self.k3 = self.k4 = None
 
         elif type_ == 1 or type_ == "PINHOLE":
-            self.fx, self.fy, self.cx, self.cy = params
+            if len(params) != 4:
+                raise ValueError("PINHOLE requires 4 parameters.")
+            self.fx, self.fy, self.cx, self.cy = map(float, params)
             self.distortion_func = None
             self.camera_type = 1
+            self.k1 = self.k2 = self.p1 = self.p2 = self.k3 = self.k4 = None
 
         elif type_ == 2 or type_ == "SIMPLE_RADIAL":
-            self.fx, self.cx, self.cy, self.k1 = params
+            if len(params) != 4:
+                raise ValueError("SIMPLE_RADIAL requires 4 parameters.")
+            self.fx, self.cx, self.cy, self.k1 = map(float, params)
             self.fy = self.fx
             self.distortion_func = simple_radial_distortion
             self.camera_type = 2
+            self.k2 = self.p1 = self.p2 = self.k3 = self.k4 = None
 
         elif type_ == 3 or type_ == "RADIAL":
-            self.fx, self.cx, self.cy, self.k1, self.k2 = params
+            if len(params) != 5:
+                raise ValueError("RADIAL requires 5 parameters.")
+            self.fx, self.cx, self.cy, self.k1, self.k2 = map(float, params)
             self.fy = self.fx
             self.distortion_func = radial_distortion
             self.camera_type = 3
+            self.p1 = self.p2 = self.k3 = self.k4 = None
 
         elif type_ == 4 or type_ == "OPENCV":
-            self.fx, self.fy, self.cx, self.cy = params[:4]
-            self.k1, self.k2, self.p1, self.p2 = params[4:]
+            if len(params) != 8:
+                raise ValueError("OPENCV requires 8 parameters.")
+            self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.p1, self.p2 = (
+                map(float, params)
+            )
             self.distortion_func = opencv_distortion
             self.camera_type = 4
+            self.k3 = self.k4 = None
 
         elif type_ == 5 or type_ == "OPENCV_FISHEYE":
-            self.fx, self.fy, self.cx, self.cy = params[:4]
-            self.k1, self.k2, self.k3, self.k4 = params[4:]
+            if len(params) != 8:
+                raise ValueError("OPENCV_FISHEYE requires 8 parameters.")
+            self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.k3, self.k4 = (
+                map(float, params)
+            )
 
-            def fn(camera, x):
+            def fn(camera: "Camera", x: np.ndarray) -> np.ndarray:
                 raise Exception("Fisheye distortion not supported")
 
             self.distortion_func = fn
@@ -173,7 +226,7 @@ class Camera:
         else:
             raise Exception("Camera type not supported")
 
-    def __str__(self):
+    def __str__(self) -> str:
         """Return a string representation of the camera.
 
         Returns:
@@ -202,53 +255,78 @@ class Camera:
 
         return s
 
-    def get_params(self):
+    def get_params(self) -> np.ndarray:
         """Get the camera parameters in COLMAP format.
 
         Returns:
             np.ndarray: Array of camera parameters
         """
         if self.camera_type == 0:
-            return np.array((self.fx, self.cx, self.cy))
+            return np.array([self.fx, self.cx, self.cy], dtype=float)
         if self.camera_type == 1:
-            return np.array((self.fx, self.fy, self.cx, self.cy))
+            return np.array([self.fx, self.fy, self.cx, self.cy], dtype=float)
         if self.camera_type == 2:
-            return np.array((self.fx, self.cx, self.cy, self.k1))
+            return np.array([self.fx, self.cx, self.cy, self.k1], dtype=float)
         if self.camera_type == 3:
-            return np.array((self.fx, self.cx, self.cy, self.k1, self.k2))
+            return np.array([self.fx, self.cx, self.cy, self.k1, self.k2], dtype=float)
         if self.camera_type == 4:
             return np.array(
-                (self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.p1, self.p2)
+                [
+                    self.fx,
+                    self.fy,
+                    self.cx,
+                    self.cy,
+                    self.k1,
+                    self.k2,
+                    self.p1,
+                    self.p2,
+                ],
+                dtype=float,
             )
         if self.camera_type == 5:
             return np.array(
-                (self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.k3, self.k4)
+                [
+                    self.fx,
+                    self.fy,
+                    self.cx,
+                    self.cy,
+                    self.k1,
+                    self.k2,
+                    self.k3,
+                    self.k4,
+                ],
+                dtype=float,
             )
+        raise Exception("Camera type not supported")
 
-    def get_camera_matrix(self):
+    def get_camera_matrix(self) -> np.ndarray:
         """Get the camera intrinsic matrix.
 
         Returns:
             np.ndarray: 3x3 camera intrinsic matrix
         """
-        return np.array(((self.fx, 0, self.cx), (0, self.fy, self.cy), (0, 0, 1)))
+        return np.array(
+            [[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
 
-    def get_inverse_camera_matrix(self):
+    def get_inverse_camera_matrix(self) -> np.ndarray:
         """Get the inverse of the camera intrinsic matrix.
 
         Returns:
             np.ndarray: 3x3 inverse camera intrinsic matrix
         """
         return np.array(
-            (
-                (1.0 / self.fx, 0, -self.cx / self.fx),
-                (0, 1.0 / self.fy, -self.cy / self.fy),
-                (0, 0, 1),
-            )
+            [
+                [1.0 / self.fx, 0.0, -self.cx / self.fx],
+                [0.0, 1.0 / self.fy, -self.cy / self.fy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
         )
 
     @property
-    def k(self):
+    def k(self) -> np.ndarray:
         """Get the camera matrix.
 
         Returns:
@@ -257,7 +335,7 @@ class Camera:
         return self.get_camera_matrix()
 
     @property
-    def k_inv(self):
+    def k_inv(self) -> np.ndarray:
         """Get the inverse camera matrix.
 
         Returns:
@@ -265,18 +343,24 @@ class Camera:
         """
         return self.get_inverse_camera_matrix()
 
-    def get_inv_camera_matrix(self):
+    def get_inv_camera_matrix(self) -> np.ndarray:
         """Get the inverse camera matrix (deprecated).
 
         Returns:
             np.ndarray: 3x3 inverse camera matrix
         """
-        inv_fx, inv_fy = 1.0 / self.fx, 1.0 / self.fy
+        inv_fx = 1.0 / self.fx
+        inv_fy = 1.0 / self.fy
         return np.array(
-            ((inv_fx, 0, -inv_fx * self.cx), (0, inv_fy, -inv_fy * self.cy), (0, 0, 1))
+            [
+                [inv_fx, 0.0, -inv_fx * self.cx],
+                [0.0, inv_fy, -inv_fy * self.cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
         )
 
-    def get_image_grid(self):
+    def get_image_grid(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get an (x, y) pixel coordinate grid for this camera.
 
         Returns:
@@ -286,11 +370,14 @@ class Camera:
         xmax = (self.width - 0.5 - self.cx) / self.fx
         ymin = (0.5 - self.cy) / self.fy
         ymax = (self.height - 0.5 - self.cy) / self.fy
-        return np.meshgrid(
-            np.linspace(xmin, xmax, self.width), np.linspace(ymin, ymax, self.height)
-        )
+        x_grid = np.linspace(xmin, xmax, self.width, dtype=float)
+        y_grid = np.linspace(ymin, ymax, self.height, dtype=float)
+        grid_x, grid_y = np.meshgrid(x_grid, y_grid)
+        return np.array(grid_x, dtype=float), np.array(grid_y, dtype=float)
 
-    def distort_points(self, x, normalized=True, denormalize=True):
+    def distort_points(
+        self, x: np.ndarray, normalized: bool = True, denormalize: bool = True
+    ) -> np.ndarray:
         """Apply distortion to points.
 
         Args:
@@ -301,22 +388,24 @@ class Camera:
         Returns:
             np.ndarray: Distorted points
         """
-        x = np.atleast_2d(x)
+        x = np.array(x, dtype=float)
 
         if not normalized:
-            x -= np.array([[self.cx, self.cy]])
-            x /= np.array([[self.fx, self.fy]])
+            x -= np.array([[self.cx, self.cy]], dtype=float)
+            x /= np.array([[self.fx, self.fy]], dtype=float)
 
         if self.distortion_func is not None:
-            x = self.distortion_func(self, x)
+            x = np.array(self.distortion_func(self, x), dtype=float)
 
         if denormalize:
-            x *= np.array([[self.fx, self.fy]])
-            x += np.array([[self.cx, self.cy]])
+            x *= np.array([[self.fx, self.fy]], dtype=float)
+            x += np.array([[self.cx, self.cy]], dtype=float)
 
-        return x
+        return np.array(x, dtype=float)
 
-    def undistort_points(self, x, normalized=False, denormalize=True):
+    def undistort_points(
+        self, x: np.ndarray, normalized: bool = False, denormalize: bool = True
+    ) -> np.ndarray:
         """Perform distortion correction on points.
 
         Args:
@@ -327,23 +416,27 @@ class Camera:
         Returns:
             np.ndarray: Undistorted points
         """
-        x = np.atleast_2d(x)
+        x = np.array(x, dtype=float)
 
         if not normalized:
-            x = x - np.array([self.cx, self.cy])  # creates a copy
-            x /= np.array([self.fx, self.fy])
+            x = x - np.array([self.cx, self.cy], dtype=float)  # creates a copy
+            x /= np.array([self.fx, self.fy], dtype=float)
 
+        xu = x  # Default value if no distortion
         if self.distortion_func is not None:
+            distort_fn = self.distortion_func  # Local copy to satisfy mypy
 
-            def objective(xu):
-                return (x - self.distortion_func(self, xu.reshape(*x.shape))).ravel()
+            def objective(xu: np.ndarray) -> np.ndarray:
+                return np.ndarray(
+                    x - np.array(distort_fn(self, xu.reshape(*x.shape)), dtype=float)
+                ).ravel()
 
-            xu = root(objective, x).x.reshape(*x.shape)
-        else:
-            xu = x
+            solution = root(objective, x)
+            if solution.success:
+                xu = np.array(solution.x.reshape(*x.shape), dtype=float)
 
         if denormalize:
-            xu *= np.array([[self.fx, self.fy]])
-            xu += np.array([[self.cx, self.cy]])
+            xu *= np.array([[self.fx, self.fy]], dtype=float)
+            xu += np.array([[self.cx, self.cy]], dtype=float)
 
-        return xu
+        return np.array(xu, dtype=float)

@@ -61,20 +61,20 @@ class OptimalTransportSolver:
                     theta2 = self.gaussians2.rotations[j]
 
                     # Compute the squared 2-Wasserstein distance components
-                    D_pos, D_shape = self._wasserstein_distance(
+                    d_pos, d_shape = self._wasserstein_distance(
                         mu1, s1, theta1, mu2, s2, theta2
                     )
 
                     # Compute the squared color difference
-                    D_color = np.sum(
+                    d_color = np.sum(
                         (self.gaussians1.rgb[i] - self.gaussians2.rgb[j]) ** 2
                     )
 
                     # Total cost with weights
                     cost = (
-                        self.lambda_pos * D_pos
-                        + self.lambda_shape * D_shape
-                        + self.lambda_color * D_color
+                        self.lambda_pos * d_pos
+                        + self.lambda_shape * d_shape
+                        + self.lambda_color * d_color
                     )
                     cost_matrix[i, j] = cost
                     pbar.update(1)

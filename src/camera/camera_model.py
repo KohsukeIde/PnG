@@ -1,21 +1,23 @@
 # src/camera/camera_model.py
 
-import sys
 from typing import Tuple
 
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation
 
 from src.camera.colmap_camera_utils import Camera
-from src.utils.colmap_utils import quaternion_to_rotation_matrix
 
 
 class CameraModel:
+    """A class representing a camera model with intrinsic and extrinsic parameters. Based off of gsplat CameraModel class."""
+
     def __init__(self, camera: Camera, image_id: int, images_data: dict):
-        """Args:
-        camera: Camera, an instance of the existing Camera class
-        image_id: int, ID of the image corresponding to this camera
-        images_data: dict, external parameter information for the image (obtained from COLMAP's images.bin or images.txt)
+        """Initialize a camera model with given parameters.
+
+        Args:
+            camera: Camera, an instance of the existing Camera class
+            image_id: int, ID of the image corresponding to this camera
+            images_data: dict, external parameter information for the image (obtained from COLMAP's images.bin or images.txt)
         """
         self.camera = camera
         self.image_id = image_id
@@ -40,32 +42,37 @@ class CameraModel:
         """Get the camera's extrinsic parameters (rotation matrix and translation vector).
 
         Returns:
-            R: np.ndarray, rotation matrix (3x3)
-            t: np.ndarray, translation vector (3,)
+            r_wc: np.ndarray, rotation matrix (3x3)
+            t_wc: np.ndarray, translation vector (3,)
         """
         # Get quaternion and camera position from images_data
         image_info = self.images_data[self.image_id]
-        qw, qx, qy, qz = image_info['qw'], image_info['qx'], image_info['qy'], image_info['qz']
-        tx, ty, tz = image_info['tx'], image_info['ty'], image_info['tz']
+        qw, qx, qy, qz = (
+            image_info["qw"],
+            image_info["qx"],
+            image_info["qy"],
+            image_info["qz"],
+        )
+        tx, ty, tz = image_info["tx"], image_info["ty"], image_info["tz"]
 
         # Convert quaternion to rotation matrix
         # Note: In scipy, the quaternion order is (qx, qy, qz, qw)
-        rotation = R.from_quat([qx, qy, qz, qw])
-        R_wc = rotation.as_matrix()
+        rotation = Rotation.from_quat([qx, qy, qz, qw])
+        r_wc = rotation.as_matrix()
 
         # Translation vector
         t_wc = np.array([tx, ty, tz])
 
-        return R_wc, t_wc
+        return r_wc, t_wc
 
     def get_projection_matrix(self) -> np.ndarray:
         """Get the camera's projection matrix.
 
         Returns:
-            P: np.ndarray, projection matrix (3x4)
+            p: np.ndarray, projection matrix (3x4)
         """
-        P = self.K @ np.hstack((self.R_cw, self.t_cw.reshape(-1, 1)))
-        return P
+        p = self.K @ np.hstack((self.R_cw, self.t_cw.reshape(-1, 1)))
+        return np.array(p, dtype=float)
 
     def get_position(self) -> np.ndarray:
         """Get the camera's position in world coordinates.
@@ -76,7 +83,7 @@ class CameraModel:
         # Calculate the position of the camera center
         position = -self.R_wc.T @ self.t_wc
         print(f"{position=}")
-        return position
+        return np.array(position, dtype=float)
 
     def undistort_points(self, x: np.ndarray) -> np.ndarray:
         """Perform distortion correction.

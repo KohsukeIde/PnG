@@ -1,137 +1,120 @@
-import torch
+import numpy as np
 
 from src.camera.camera_model import CameraModel
+from src.camera.colmap_camera_utils import Camera
+
+
+def create_test_camera_data():
+    """Create test camera and image data for testing.
+
+    Returns:
+        tuple: (Camera, dict) containing test camera and image data
+    """
+    # Create test camera data similar to what load_cameras_from_colmap returns
+    camera = Camera(
+        "SIMPLE_PINHOLE",  # model_name
+        1000,  # width
+        1000,  # height
+        np.array([1000.0, 500.0, 500.0], dtype=np.float64),  # params: fx, cx, cy
+    )
+
+    # Create test image data similar to what load_images_from_colmap returns
+    images_data = {
+        1: {
+            "name": "test_image.png",
+            "camera_id": 1,
+            "qw": 1.0,  # Identity rotation
+            "qx": 0.0,
+            "qy": 0.0,
+            "qz": 0.0,
+            "tx": 0.0,  # Zero translation
+            "ty": 0.0,
+            "tz": 0.0,
+        }
+    }
+
+    return camera, images_data
 
 
 def test_camera_model_initialization():
-    intrinsics = torch.tensor([
-        [1000, 0, 500],
-        [0, 1000, 500],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-    extrinsics = torch.eye(4)
-    camera_model = CameraModel(intrinsics, extrinsics)
-    
+    """Test initialization of CameraModel class."""
+    camera, images_data = create_test_camera_data()
+    camera_model = CameraModel(camera, image_id=1, images_data=images_data)
+
     assert isinstance(camera_model, CameraModel)
-    assert camera_model.intrinsics.shape == (3, 3)
-    assert camera_model.extrinsics.shape == (4, 4)
+    assert camera_model.K.shape == (3, 3)
+    assert camera_model.R_wc.shape == (3, 3)
+    assert camera_model.t_wc.shape == (3,)
+
 
 def test_camera_model_initialization_invalid_input():
+    """Test initialization with invalid image_id raises KeyError."""
+    camera, images_data = create_test_camera_data()
+
+    # Test with invalid image_id
     try:
-        CameraModel(torch.rand(2, 2), torch.eye(4))
-        raise AssertionError("ValueError was not raised")
-    except ValueError:
+        CameraModel(camera, image_id=999, images_data=images_data)
+        raise AssertionError("KeyError was not raised")
+    except KeyError:
         pass
 
-    try:
-        CameraModel(torch.rand(3, 3), torch.eye(3))
-        raise AssertionError("ValueError was not raised")
-    except ValueError:
-        pass
 
-def test_project_3d_to_2d():
-    intrinsics = torch.tensor([
-        [1000, 0, 500],
-        [0, 1000, 500],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-    extrinsics = torch.eye(4)
-    camera_model = CameraModel(intrinsics, extrinsics)
-    
-    points_3d = torch.tensor([
-        [1, 0, 5],
-        [0, 1, 5],
-        [-1, -1, 5]
-    ], dtype=torch.float32)
-    points_2d = camera_model.project_3d_to_2d(points_3d)
-    assert points_2d.shape == (3, 2)
+def test_get_extrinsics():
+    """Test getting extrinsic parameters from camera model."""
+    camera, images_data = create_test_camera_data()
+    camera_model = CameraModel(camera, image_id=1, images_data=images_data)
 
-def test_back_project_2d_to_3d():
-    intrinsics = torch.tensor([
-        [1000, 0, 500],
-        [0, 1000, 500],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-    extrinsics = torch.eye(4)
-    camera_model = CameraModel(intrinsics, extrinsics)
-    
-    points_2d = torch.tensor([
-        [600, 500],
-        [500, 600],
-        [400, 400]
-    ], dtype=torch.float32)
-    depth = torch.tensor([5, 5, 5], dtype=torch.float32)
-    points_3d = camera_model.back_project_2d_to_3d(points_2d, depth)
-    assert points_3d.shape == (3, 3)
-
-def test_projection_backprojection_consistency():
-    intrinsics = torch.tensor([
-        [1000, 0, 500],
-        [0, 1000, 500],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-    extrinsics = torch.eye(4)
-    camera_model = CameraModel(intrinsics, extrinsics)
-    
-    points_3d = torch.tensor([
-        [1, 0, 5],
-        [0, 1, 5],
-        [-1, -1, 5]
-    ], dtype=torch.float32)
-    points_2d = camera_model.project_3d_to_2d(points_3d)
-    depth = points_3d[:, 2]
-    points_3d_recovered = camera_model.back_project_2d_to_3d(points_2d, depth)
-    assert torch.allclose(points_3d, points_3d_recovered, atol=1e-5)
-
-def test_update_extrinsics():
-    intrinsics = torch.tensor([
-        [1000, 0, 500],
-        [0, 1000, 500],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-    extrinsics = torch.eye(4)
-    camera_model = CameraModel(intrinsics, extrinsics)
-    
-    rotation = torch.tensor([
-        [0, -1, 0],
-        [1, 0, 0],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-    translation = torch.tensor([1, 2, 3], dtype=torch.float32)
-    camera_model.update_extrinsics(rotation, translation)
-    assert torch.allclose(camera_model.extrinsics[:3, :3], rotation)
-    assert torch.allclose(camera_model.extrinsics[:3, 3], translation)
-
-def test_gradients():
-    intrinsics = torch.rand(3, 3, requires_grad=True)
-    extrinsics = torch.eye(4, requires_grad=True)
-    camera_model = CameraModel(intrinsics, extrinsics)
-    points_3d = torch.rand(10, 3, requires_grad=True)
-    points_2d = camera_model.project_3d_to_2d(points_3d)
-    loss = points_2d.sum()
-    loss.backward()
-    assert points_3d.grad is not None
-    assert intrinsics.grad is not None
-    assert extrinsics.grad is not None
+    r_wc, t_wc = camera_model.get_extrinsics()
+    assert r_wc.shape == (3, 3)
+    assert t_wc.shape == (3,)
+    # For identity quaternion, R should be identity matrix
+    np.testing.assert_allclose(r_wc, np.eye(3))
+    # For zero translation, t should be zero vector
+    np.testing.assert_allclose(t_wc, np.zeros(3))
 
 
-# if torch.cuda.is_available():
-#     def test_gpu_compatibility():
-#         intrinsics = torch.rand(3, 3).cuda()
-#         extrinsics = torch.eye(4).cuda()
-#         camera_model = CameraModel(intrinsics, extrinsics)
-#         points_3d = torch.rand(10, 3).cuda()
-#         points_2d = camera_model.project_3d_to_2d(points_3d)
-#         assert points_2d.is_cuda
+def test_get_position():
+    """Test getting camera position in world coordinates."""
+    camera, images_data = create_test_camera_data()
+    camera_model = CameraModel(camera, image_id=1, images_data=images_data)
 
-def test_mps_compatibility():
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        intrinsics = torch.rand(3, 3).to(device)
-        extrinsics = torch.eye(4).to(device)
-        camera_model = CameraModel(intrinsics, extrinsics)
-        points_3d = torch.rand(10, 3).to(device)
-        points_2d = camera_model.project_3d_to_2d(points_3d)
-        assert points_2d.device == device
-    else:
-        print("MPS not available, skipping MPS compatibility test")
+    # For identity rotation and zero translation, camera position should be at origin
+    position = camera_model.get_position()
+    np.testing.assert_allclose(position, np.zeros(3))
+
+
+def test_get_projection_matrix():
+    """Test getting camera projection matrix."""
+    camera, images_data = create_test_camera_data()
+    camera_model = CameraModel(camera, image_id=1, images_data=images_data)
+
+    proj_matrix = camera_model.get_projection_matrix()
+    assert proj_matrix.shape == (3, 4)
+
+    # For identity rotation and zero translation, P should be [K|0]
+    expected_proj = np.hstack((camera_model.K, np.zeros((3, 1))))
+    np.testing.assert_allclose(proj_matrix, expected_proj)
+
+
+def test_undistort_points():
+    """Test undistortion of image points."""
+    camera, images_data = create_test_camera_data()
+    camera_model = CameraModel(camera, image_id=1, images_data=images_data)
+
+    points = np.array(
+        [[500.0, 500.0], [600.0, 600.0], [400.0, 400.0]], dtype=np.float64
+    )
+    undistorted_points = camera_model.undistort_points(points)
+    assert undistorted_points.shape == (3, 2)
+
+
+def test_distort_points():
+    """Test distortion of image points."""
+    camera, images_data = create_test_camera_data()
+    camera_model = CameraModel(camera, image_id=1, images_data=images_data)
+
+    points = np.array(
+        [[500.0, 500.0], [600.0, 600.0], [400.0, 400.0]], dtype=np.float64
+    )
+    distorted_points = camera_model.distort_points(points)
+    assert distorted_points.shape == (3, 2)
