@@ -71,7 +71,7 @@ def test_optimal_transport_solver():
         device=device
     )
 
-    assert solver.F is None
+    assert solver.H is None
     assert solver.epsilon == 0.1
     assert solver.lambda_mean == 0.3
     assert solver.lambda_color == 1.0
@@ -119,7 +119,7 @@ def test_cost_matrix_computation():
         device=device
     )
 
-    F = torch.eye(3, device=device)
+    H = torch.eye(3, device=device)
     cost_matrix = solver.compute_cost_matrix(F)
 
     assert cost_matrix.shape == (2, 2)
@@ -168,8 +168,8 @@ def test_homography_optimization():
 
     solver.optimize_with_homography(max_iter=10)
 
-    assert solver.F is not None
-    assert torch.is_tensor(solver.F)
-    assert solver.F.shape == (3, 3)
-    assert solver.F.device == device
-    assert solver.F.requires_grad == False  # After optimization, F should be detached
+    assert solver.H is not None
+    assert torch.is_tensor(solver.H)
+    assert solver.H.shape == (3, 3)
+    assert solver.H.device == device
+    assert solver.H.requires_grad == False  # After optimization, F should be detached
