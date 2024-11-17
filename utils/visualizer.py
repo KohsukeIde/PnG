@@ -1,4 +1,3 @@
-import pickle
 import sys
 import numpy as np
 import cv2
@@ -11,25 +10,9 @@ from src.optimizer.optimal_transport_solver_rs import OptimalTransportSolver
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
-from twodgs import TwoDGaussians  # Ensure this is correctly mapped
+from src.primitive.twod_gaussians import TwoDGaussians  # Ensure this is correctly mapped
+from utils.gs_pkl_loader import load_gaussians
 
-def load_gaussians(pickle_path: str) -> tuple:
-    """
-    Load Gaussian data, view matrix, and camera intrinsic matrix from a pickle file.
-
-    Args:
-        pickle_path (str): Path to the pickle file
-
-    Returns:
-        tuple: (original_gaussians, projected_gaussians, viewmat, K)
-    """
-    with open(pickle_path, 'rb') as f:
-        data = pickle.load(f)
-        original_gaussians = data["original_gaussians"]
-        projected_gaussians = data["projected_gaussians"]
-        viewmat = data["viewmat"]
-        K = data["K"]
-    return original_gaussians, projected_gaussians, viewmat, K
 
 def load_images(img1_path: str, img2_path: str) -> tuple:
     """
@@ -112,6 +95,86 @@ def draw_epilines(img, lines, pts, colors, point_radius=5):
             print(f"Warning: Feature point {pt} is out of image bounds and will not be drawn.")
 
     return img_copy
+
+def draw_epipolar_lines(img, lines, colors):
+    """
+    画像にエピポーラ線を描画する関数。
+
+    Args:
+        img (np.ndarray): エピポーラ線を描画する画像。
+        lines (np.ndarray): エピポーラ線のパラメータ (N, 3)。
+        colors (list): エピポーラ線の色リスト。
+
+    Returns:
+        np.ndarray: エピポーラ線が描画された画像。
+    """
+    img_with_lines = img.copy()
+    r, c, _ = img.shape
+    for r_line, color in zip(lines, colors):
+        a, b, c_line = r_line
+        if b != 0:
+            x0, x1 = 0, c
+            y0 = int(- (a * x0 + c_line) / b)
+            y1 = int(- (a * x1 + c_line) / b)
+        else:
+            x0 = x1 = int(- c_line / a)
+            y0, y1 = 0, r
+        img_with_lines = cv2.line(img_with_lines, (x0, y0), (x1, y1), color.tolist(), 1)
+    return img_with_lines
+
+def draw_matching_points(img, pts, colors, point_radius=5):
+    """
+    画像にマッチング点を描画する関数。
+
+    Args:
+        img (np.ndarray): マッチング点を描画する画像。
+        pts (np.ndarray): マッチング点の座標 (N, 2)。
+        colors (list): マッチング点の色リスト。
+        point_radius (int): マッチング点の描画半径。
+
+    Returns:
+        np.ndarray: マッチング点が描画された画像。
+    """
+    img_with_points = img.copy()
+    for pt, color in zip(pts, colors):
+        pt_int = tuple(pt.astype(int))
+        img_with_points = cv2.circle(img_with_points, pt_int, point_radius, color.tolist(), -1)
+    return img_with_points
+
+def visualize_epilines_on_images(img1, img2, pts1, pts2, F):
+    """
+    エピポーラ線とマッチング点をそれぞれの画像に描画する関数。
+
+    Args:
+        img1 (np.ndarray): 画像1。
+        img2 (np.ndarray): 画像2。
+        pts1 (np.ndarray): 画像1の特徴点 (N, 2)。
+        pts2 (np.ndarray): 画像2の特徴点 (N, 2)。
+        F (np.ndarray): 基本行列。
+
+    Returns:
+        tuple: (画像1にエピポーラ線とマッチング点を描画した画像, 画像2にエピポーラ線とマッチング点を描画した画像)
+    """
+    # エピポーラ線の計算
+    lines1 = cv2.computeCorrespondEpilines(pts2.reshape(-1,1,2), 2, F).reshape(-1,3)
+    lines2 = cv2.computeCorrespondEpilines(pts1.reshape(-1,1,2), 1, F).reshape(-1,3)
+
+    # カラーの設定
+    np.random.seed(42)  # 再現性のため
+    colors = np.random.randint(0, 255, (len(pts1), 3))
+
+    # 画像にエピポーラ線を描画
+    img1_with_lines = draw_epipolar_lines(img1, lines1, colors)
+    img2_with_lines = draw_epipolar_lines(img2, lines2, colors)
+
+    # 画像にマッチング点を描画
+    img1_result = draw_matching_points(img1_with_lines, pts1, colors)
+    img2_result = draw_matching_points(img2_with_lines, pts2, colors)
+
+    return img1_result, img2_result
+
+
+
 
 def visualize_epilines_on_images(img, img2, pts1_inliers, pts2_inliers, F, output_path=None):
     """
