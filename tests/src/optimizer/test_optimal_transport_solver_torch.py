@@ -120,7 +120,7 @@ def test_cost_matrix_computation():
     )
 
     H = torch.eye(3, device=device)
-    cost_matrix = solver.compute_cost_matrix(F)
+    cost_matrix = solver.compute_cost_matrix(H)
 
     assert cost_matrix.shape == (2, 2)
     assert cost_matrix.device == device
