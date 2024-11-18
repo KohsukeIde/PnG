@@ -25,7 +25,7 @@ def load_gaussians(pickle_path: str) -> tuple:
     return original_gaussians, projected_gaussians, viewmat, K
 
 def main():
-    data_dir = '/Users/kohsukeide/dev/perspective-n-gaus　sian/data/DTU/scan63'
+    data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63'
     data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs'
     gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
     gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
