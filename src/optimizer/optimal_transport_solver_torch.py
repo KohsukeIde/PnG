@@ -360,23 +360,23 @@ class OptimalTransportSolver:
             # Update h
             optimizer.step()
 
-            # Projection step
-            with torch.no_grad():
-                print(f"Before normalization, H[2,2]: {self.h[2,2].item()}")
-
-                if self.h[2, 2] != 0:
-                    h_norm = self.h / self.h[2, 2]
-                else:
-                    h_norm = self.h / torch.max(torch.abs(self.h))
-                self.h.copy_(h_norm)
-
-                print(f"After normalization, H[2,2]: {self.h[2,2].item()}")
 
             # Check for convergence
             if abs(prev_loss.item() - loss.item()) < tol:
                 print(f"Converged at iteration {iteration}")
                 break
             prev_loss = loss
+
+        with torch.no_grad():
+            print(f"Before normalization, H[2,2]: {self.h[2,2].item()}")
+
+            if self.h[2, 2] != 0:
+                h_norm = self.h / self.h[2, 2].clone()
+            else:
+                h_norm = self.h / torch.max(torch.abs(self.h)).clone()
+            self.h.copy_(h_norm)
+
+            print(f"After normalization, H[2,2]: {self.h[2,2].item()}")
 
         # Detach h from computation graph
         self.h = self.h.detach()
