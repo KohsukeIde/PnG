@@ -31,15 +31,15 @@ def generate_covariances_from_rotations_and_scales(rotations, scales):
 def test_optimal_transport_solver():
     """Test OptimalTransportSolver functionality including initialization, cost computation, and optimization."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Create test data with smaller values and simpler configuration
     means1 = torch.tensor([[0.0, 0.0], [0.5, 0.5]], device=device)
     means2 = means1 + 0.1  # Small translation
-    
+
     # Use smaller scales to prevent numerical issues
     scales = 0.1 * torch.ones((2, 2), device=device)
     rotations = torch.zeros(2, device=device)
-    
+
     # Simpler RGB values
     rgb = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], device=device)
     alpha = torch.ones(2, device=device)
@@ -48,12 +48,20 @@ def test_optimal_transport_solver():
     covs2 = generate_covariances_from_rotations_and_scales(rotations, scales)
 
     gaussians1 = TwoDGaussians(
-        means=means1, covs=covs1, scales=scales,
-        rotations=rotations, rgb=rgb, alpha=alpha
+        means=means1,
+        covs=covs1,
+        scales=scales,
+        rotations=rotations,
+        rgb=rgb,
+        alpha=alpha,
     )
     gaussians2 = TwoDGaussians(
-        means=means2, covs=covs2, scales=scales,
-        rotations=rotations, rgb=rgb, alpha=alpha
+        means=means2,
+        covs=covs2,
+        scales=scales,
+        rotations=rotations,
+        rgb=rgb,
+        alpha=alpha,
     )
 
     # Initialize solver with adjusted parameters
@@ -62,26 +70,26 @@ def test_optimal_transport_solver():
         gaussians2=gaussians2,
         epsilon=1.0,  # Increased epsilon for better numerical stability
         lambda_mean=0.3,
-        lambda_color=0.3,  
-        lambda_cov=0.3,    
-        device=device
+        lambda_color=0.3,
+        lambda_cov=0.3,
+        device=device,
     )
 
     # Test initialization
-    assert solver.H is None
+    assert solver.h is None
     assert solver.epsilon == 1.0
     assert solver.device == device
 
     # Test cost matrix computation
-    H = torch.eye(3, device=device)
-    cost_matrix = solver.compute_cost_matrix(H)
+    h = torch.eye(3, device=device)
+    cost_matrix = solver.compute_cost_matrix(h)
     assert cost_matrix.shape == (2, 2)
     assert cost_matrix.device == device
     assert not torch.isnan(cost_matrix).any()  # Check for NaN values
 
     # Test optimization with more iterations but smaller learning rate
     solver.optimize_with_homography(max_iter=20, tol=1e-4)
-    assert solver.H is not None
-    assert solver.H.shape == (3, 3)
-    assert not solver.H.requires_grad
-    assert not torch.isnan(solver.H).any()  # Check for NaN values
+    assert solver.h is not None
+    assert solver.h.shape == (3, 3)
+    assert not solver.h.requires_grad
+    assert not torch.isnan(solver.h).any()  # Check for NaN values
