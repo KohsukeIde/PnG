@@ -1,15 +1,10 @@
 import copy
 from typing import Optional, Tuple
-import sys
-
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from src.primitive.twod_gaussians import TwoDGaussians
-# from utils.adopt import ADOPT
-
-
 
 class OptimalTransportSolver:
     """Optimal Transport Solver for 2D Gaussians with Homography Optimization."""
@@ -34,7 +29,7 @@ class OptimalTransportSolver:
             K1 (Optional[np.ndarray]): Intrinsic parameters of the first camera (3x3).
             K2 (Optional[np.ndarray]): Intrinsic parameters of the second camera (3x3).
             epsilon (float): Entropy regularization parameter. Defaults to 0.1.
-            lambda_mean (float): Weight for mean difference term. Defaults to 0.3.
+            lambda_mean (float): Weight for mean difference term. Defaults to 1.0.
             lambda_cov (float): Weight for covariance difference term. Defaults to 1.0.
             lambda_color (float): Weight for color difference. Defaults to 1.0.
             device (torch.device): Device to perform computations on.
@@ -52,8 +47,6 @@ class OptimalTransportSolver:
         self.lambda_color = lambda_color
 
         self.device = device
-        # print(f"Using {device} device")
-
 
         # Convert Gaussian parameters to torch tensors
         self._prepare_gaussians()
@@ -105,12 +98,12 @@ class OptimalTransportSolver:
 
         # Compute color differences
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)
-        D_color = torch.sum(color_diff ** 2, dim=2)
+        D_color = torch.sum(color_diff ** 2, dim=2)  # Shape: (K1, K2)
 
         # Normalize components before combining
-        mean_term = mean_term / mean_term.max()
-        cov_term = cov_term / cov_term.max()
-        D_color = D_color / D_color.max()
+        mean_term = mean_term / (mean_term.max() + 1e-8)
+        cov_term = cov_term / (cov_term.max() + 1e-8)
+        D_color = D_color / (D_color.max() + 1e-8)
 
         # Combine with weights
         cost_matrix = (
@@ -165,19 +158,19 @@ class OptimalTransportSolver:
         
         # Compute eigenvalues and eigenvectors for all matrices
         eigenvalues, eigenvectors = torch.linalg.eigh(matrices_2d)
-        
+
         # Ensure non-negative eigenvalues and compute sqrt
         sqrt_eigenvalues = torch.sqrt(torch.clamp(eigenvalues, min=1e-10))
-        
+
         # Create diagonal matrices for each sqrt eigenvalue
         sqrt_eigenvalues = torch.diag_embed(sqrt_eigenvalues)
-        
+
         # Compute square root for all matrices
         sqrt_matrices = eigenvectors @ sqrt_eigenvalues @ eigenvectors.transpose(-2, -1)
-        
+
         # Reshape back to original batch shape
         sqrt_matrices = sqrt_matrices.reshape(*batch_shape, 2, 2)
-        
+
         return sqrt_matrices
 
     def _wasserstein_distance(
@@ -210,11 +203,11 @@ class OptimalTransportSolver:
 
         # Compute the square roots
         sqrt_sigma1 = self._matrix_sqrt(sigma1)  # Shape: (K1, 2, 2)
-        sqrt_sigma1_exp = sqrt_sigma1.unsqueeze(1).expand(-1, K2, -1, -1)
+        sqrt_sigma1_exp = sqrt_sigma1.unsqueeze(1).expand(-1, K2, -1, -1)  # Shape: (K1, K2, 2, 2)
 
         # Compute the intermediate matrices
-        intermediate = sqrt_sigma1_exp @ sigma2_exp @ sqrt_sigma1_exp
-        sqrt_intermediate = self._matrix_sqrt(intermediate)
+        intermediate = sqrt_sigma1_exp @ sigma2_exp @ sqrt_sigma1_exp  # Shape: (K1, K2, 2, 2)
+        sqrt_intermediate = self._matrix_sqrt(intermediate)  # Shape: (K1, K2, 2, 2)
 
         # Compute the trace term
         trace_term = torch.diagonal(
@@ -234,7 +227,7 @@ class OptimalTransportSolver:
 
         Args:
             cost_matrix (torch.Tensor): The cost matrix (K1, K2).
-            max_iter (int): Maximum number of iterations. Defaults to 100.
+            max_iter (int): Maximum number of iterations. Defaults to 1000.
             tol (float): Convergence tolerance. Defaults to 1e-6.
 
         Returns:
@@ -242,25 +235,16 @@ class OptimalTransportSolver:
         """
         K1, K2 = cost_matrix.shape
 
-        # Normalize cost matrix to prevent numerical issues
-        # cost_max = torch.max(cost_matrix)
-        # cost_matrix = cost_matrix / cost_max
-
-        # Initialize the Gibbs kernel with numerical stability
+        # Compute the Gibbs kernel
         K = torch.exp(-cost_matrix / self.epsilon)  # Shape: (K1, K2)
-        
-        # Check if K has any valid values
-        if torch.any(torch.isnan(K)) or torch.all(K == 0):
-            print("Warning: Numerical issues in kernel computation")
-            print(f"Cost matrix stats - Min: {cost_matrix.min()}, Max: {cost_matrix.max()}, Mean: {cost_matrix.mean()}")
-        
-        # Initialize scaling vectors
-        u = torch.ones(K1, dtype=torch.float32, device=self.device)
-        v = torch.ones(K2, dtype=torch.float32, device=self.device)
 
         # Normalize alpha and beta
         alpha = self.alpha1 / self.alpha1.sum()
         beta = self.alpha2 / self.alpha2.sum()
+
+        # Initialize scaling vectors
+        u = torch.ones(K1, dtype=torch.float32, device=self.device)
+        v = torch.ones(K2, dtype=torch.float32, device=self.device)
 
         for i in range(max_iter):
             # Update u
@@ -274,23 +258,22 @@ class OptimalTransportSolver:
             # Check for convergence
             if (torch.max(torch.abs(u_new - u)) < tol and 
                 torch.max(torch.abs(v_new - v)) < tol):
+                print(f"Sinkhorn converged at iteration {i}")
                 break
 
             u, v = u_new, v_new
 
-            # Add debugging information
-            # if i % 10 == 0:
-            #     current_sum = (torch.diag(u) @ K @ torch.diag(v)).sum().item()
-            #     print(f"Iteration {i}, Transport sum: {current_sum}")
+            # Optional: Add debugging information
+            if i % 100 == 0:
+                current_sum = (u.unsqueeze(1) * K * v.unsqueeze(0)).sum().item()
+                print(f"Sinkhorn Iteration {i}, Transport sum: {current_sum}")
 
-        # Compute the transport plan
-        T = torch.diag(u) @ K @ torch.diag(v)
+        # Compute the transport plan using broadcasting
+        T = u.unsqueeze(1) * K * v.unsqueeze(0)  # Shape: (K1, K2)
 
-        # Rescale back
-        # T = T / T.sum() 
         return T
 
-    def optimize_with_homography(self, max_iter: int = 100, tol: float = 1e-6) -> None:
+    def optimize_with_homography(self, max_iter: int = 1000, tol: float = 1e-6) -> None:
         """Optimize the homography matrix H.
 
         Args:
@@ -303,11 +286,10 @@ class OptimalTransportSolver:
         else:
             self.H = torch.tensor(self.H, dtype=torch.float32, device=self.device, requires_grad=True)
 
-        optimizer = torch.optim.Adam([self.H], lr=1e-3)
+        optimizer = torch.optim.Adam([self.H], lr=1e-4)
         # optimizer = ADOPT([self.H], lr=1e-3)
 
-
-        prev_loss = torch.tensor(float('inf'), device=self.device)
+        prev_loss = float('inf')
 
         for iteration in tqdm(range(max_iter), desc="Optimization with Homography"):
             optimizer.zero_grad()
@@ -315,31 +297,44 @@ class OptimalTransportSolver:
             # Compute cost matrix with current H
             cost_matrix = self.compute_cost_matrix(self.H)  # Shape: (K1, K2)
 
-            # Compute transport plan
-            T = self.sinkhorn_algorithm(cost_matrix)
+            # Compute transport plan using Sinkhorn
+            T = self.sinkhorn_algorithm(cost_matrix, max_iter=1000, tol=1e-6)  # Shape: (K1, K2)
 
             # Compute objective function (total cost)
             loss = torch.sum(T * cost_matrix)
-            print(f"Iteration {iteration}, Loss: {loss}")
 
             # Backpropagation
             loss.backward()
 
+            # Debug prints
+            if iteration % 5 == 0 or iteration == max_iter - 1:
+                grad_norm = self.H.grad.norm().item() if self.H.grad is not None else 0.0
+                print(f"Iteration {iteration}, Loss: {loss.item():.6f}, H.grad norm: {grad_norm:.6f}")
+
             # Update H
             optimizer.step()
 
-            # Projection step (if necessary)
-            # For homography, we can normalize H to prevent scaling issues
+            # Projection step: Normalize H to prevent scaling issues
             with torch.no_grad():
-                self.H /= self.H.norm()
+                # Debug print H before normalization
+                print(f"Before normalization, H[2,2]: {self.H[2,2].item()}")
 
-            # Check for convergence using torch.abs()
-            if torch.abs(prev_loss - loss) < tol:
+                if self.H[2, 2] != 0:
+                    H_norm = self.H / self.H[2, 2]
+                else:
+                    H_norm = self.H / torch.max(torch.abs(self.H))
+                self.H.copy_(H_norm)
+
+                # Debug print H after normalization
+                print(f"After normalization, H[2,2]: {self.H[2,2].item()}")
+
+            # Check for convergence
+            print(f"{loss.item()=}")
+            if abs(prev_loss - loss.item()) < tol:
                 print(f"Converged at iteration {iteration}")
                 break
 
-            prev_loss = loss
+            prev_loss = loss.item()
 
         # Detach H from the computation graph
         self.H = self.H.detach()
-
