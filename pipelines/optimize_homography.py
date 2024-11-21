@@ -19,7 +19,7 @@ from utils.gs_pkl_loader import load_gaussians_torch
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
 def get_top_correspondences(solver, num_points=100):
-    """Get top correspondences based on transport matrix T.
+    """Get top 1:1 correspondences based on transport matrix T.
 
     Args:
         solver (OptimalTransportSolver): Solver instance.
@@ -33,25 +33,36 @@ def get_top_correspondences(solver, num_points=100):
         cost_matrix = solver.compute_cost_matrix(solver.h)
         transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
     
-    # Convert transport matrix to numpy array
     T_np = transport_matrix.cpu().numpy()
-    
-    # Get indices of top correspondences
-    indices = np.unravel_index(np.argsort(-T_np, axis=None), T_np.shape)
-    idx_pairs = list(zip(indices[0], indices[1]))
-    
-    # Select top N correspondences
-    top_pairs = idx_pairs[:num_points]
-    
-    # Prepare points
     points1 = solver.means1.cpu().numpy()
     points2 = solver.means2.cpu().numpy()
     
-    pts1 = points1[[i for i, _ in top_pairs]]
-    pts2 = points2[[j for _, j in top_pairs]]
+    print(f"Transport matrix shape: {T_np.shape}")
+    print(f"Transport matrix min value: {T_np.min()}")
+    print(f"Transport matrix max value: {T_np.max()}")
+
+    # For each point in image1, find the strongest correspondence in image2
+    row_to_col = np.argmax(T_np, axis=1)  # For each row, get the column with max value
+    row_max_values = T_np[np.arange(len(T_np)), row_to_col]  # Get the max values
     
-    print(f"len of pts1: {len(pts1)}")
-    print(f"len of pts2: {len(pts2)}")
+    # Sort by correspondence strength and take top num_points
+    top_row_indices = np.argsort(-row_max_values)[:num_points]
+    selected_col_indices = row_to_col[top_row_indices]
+    
+    # Get the corresponding points
+    pts1 = points1[top_row_indices]
+    pts2 = points2[selected_col_indices]
+    
+    # Verify uniqueness
+    unique_pts1 = np.unique(pts1, axis=0)
+    unique_pts2 = np.unique(pts2, axis=0)
+    print(f"\nUniqueness verification:")
+    print(f"Points in image 1: {len(unique_pts1)} / {len(pts1)} unique")
+    print(f"Points in image 2: {len(unique_pts2)} / {len(pts2)} unique")
+    
+    # Print top 5 transport values for selected pairs
+    selected_values = row_max_values[top_row_indices][:5]
+    print(f"\nTop 5 transport values for selected pairs: {selected_values}")
     
     return pts1, pts2
 
@@ -120,49 +131,73 @@ def evaluate_homography_matrix(H):
     else:
         print("Homography matrix is singular and not invertible.")
 
-def visualize_homography_on_images(img1, img2, pts1, pts2, H_np, output_dir='results'):
-    """Visualize homography effect and save results.
+def visualize_point_matches(img1, img2, pts1, pts2, output_dir='results'):
+    """Visualize point matches between original images.
 
     Args:
         img1 (np.ndarray): First image.
         img2 (np.ndarray): Second image.
         pts1 (np.ndarray): Points from first image.
         pts2 (np.ndarray): Points from second image.
-        H_np (np.ndarray): Homography matrix.
         output_dir (str): Path to output directory.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Warp img1 using homography
-    img1_warped = cv2.warpPerspective(img1, H_np, (img2.shape[1], img2.shape[0]))
-
     # Stack images horizontally
-    combined_img = np.hstack((img2, img1_warped))
+    combined_img = np.hstack((img1, img2))
 
-    # Define colors
+    # Debug information
+    print(f"\nPoint matching visualization:")
+    print(f"Image shapes - img1: {img1.shape}, img2: {img2.shape}")
+    print(f"Points to draw - pts1: {len(pts1)}, pts2: {len(pts2)}")
+
+    # Draw correspondences
     color_pt1 = (0, 0, 255)    # Red
     color_pt2 = (255, 0, 0)    # Blue
     color_line = (0, 255, 0)   # Green
+    point_size = 3
+    line_thickness = 1
 
-    # Draw correspondences
+    valid_points = 0
     for pt1, pt2 in zip(pts1, pts2):
-        # Point in img2
-        pt2_int = (int(pt2[0]), int(pt2[1]))
-        # Point in img1_warped (add img2 width to x-coordinate)
-        pt1_int = (int(pt1[0] + img2.shape[1]), int(pt1[1]))
+        x1, y1 = int(pt1[0]), int(pt1[1])
+        x2, y2 = int(pt2[0]), int(pt2[1])
         
-        # Draw green line connecting correspondences
-        cv2.line(combined_img, pt2_int, pt1_int, color_line, 1)
-        
-        # Draw points
-        cv2.circle(combined_img, pt2_int, 5, color_pt2, -1)  # Blue point in img2
-        cv2.circle(combined_img, pt1_int, 5, color_pt1, -1)  # Red point in img1_warped
+        if (0 <= x1 < img1.shape[1] and 0 <= y1 < img1.shape[0] and
+            0 <= x2 < img2.shape[1] and 0 <= y2 < img2.shape[0]):
+            
+            pt1_int = (x1, y1)
+            pt2_int = (x2 + img1.shape[1], y2)
+            
+            cv2.circle(combined_img, pt1_int, point_size, color_pt1, -1)
+            cv2.circle(combined_img, pt2_int, point_size, color_pt2, -1)
+            cv2.line(combined_img, pt1_int, pt2_int, color_line, line_thickness)
+            
+            valid_points += 1
 
-    # Save image
-    combined_image_path = os.path.join(output_dir, 'combined_correspondences.png')
-    cv2.imwrite(combined_image_path, combined_img)
+    print(f"Valid points drawn: {valid_points} / {len(pts1)}")
+    matches_path = os.path.join(output_dir, 'point_matches.png')
+    cv2.imwrite(matches_path, combined_img)
+    print(f"Point matches saved to '{matches_path}'")
 
-    print(f"Visualization image saved to '{combined_image_path}'.")
+def save_warped_image(img1, img2, H_np, output_dir='results'):
+    """Save warped image using homography.
+
+    Args:
+        img1 (np.ndarray): First image to be warped.
+        img2 (np.ndarray): Second (target) image.
+        H_np (np.ndarray): Homography matrix.
+        output_dir (str): Path to output directory.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Warp img1 using homography
+    img1_warped = cv2.warpPerspective(img1, H_np, (img2.shape[1], img2.shape[0]))
+    
+    # Save warped image
+    warped_path = os.path.join(output_dir, 'warped_image.png')
+    cv2.imwrite(warped_path, img1_warped)
+    print(f"Warped image saved to '{warped_path}'")
 
 def main():
     # Set device
@@ -256,15 +291,17 @@ def main():
     img1 = cv2.imread(image1_path)
     img2 = cv2.imread(image2_path)
     
-    # Extract correspondences (using top N correspondences)
-    num_points = 100
-    pts1, pts2 = get_top_correspondences(solver, num_points)
+    # Extract correspondences
+    pts1, pts2 = get_top_correspondences(solver, num_points=100)
 
     # Get homography matrix
     H_np = solver.h.detach().cpu().numpy()
 
-    # Visualize homography effect on images and save results
-    visualize_homography_on_images(img1, img2, pts1, pts2, H_np, output_dir='results')
+    # Visualize point matches
+    visualize_point_matches(img1, img2, pts1, pts2, output_dir='results')
+    
+    # Save warped image separately
+    save_warped_image(img1, img2, H_np, output_dir='results')
 
     # Save results
     results = {
