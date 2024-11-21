@@ -19,5 +19,6 @@ __pycache__
 /gaussian_mixture_results
 /debug_output
 /data/*
+/pipelines/results/*
 
 
