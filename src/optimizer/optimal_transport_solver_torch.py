@@ -1,9 +1,10 @@
 import copy
 from typing import Optional, Tuple
-
+import os
 import numpy as np
 import torch
 from tqdm import tqdm
+from matplotlib import pyplot as plt
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 
@@ -330,6 +331,8 @@ class OptimalTransportSolver:
 
         optimizer = torch.optim.Adam([self.h], lr=1e-4)
         prev_loss = torch.tensor(float("inf"), device=self.device)
+        
+        loss_history = []
 
         for iteration in tqdm(range(max_iter), desc="Optimization with Homography"):
             optimizer.zero_grad()
@@ -359,6 +362,8 @@ class OptimalTransportSolver:
 
             # Update h
             optimizer.step()
+            
+            loss_history.append(loss.item())
 
 
             # Check for convergence
@@ -380,3 +385,17 @@ class OptimalTransportSolver:
 
         # Detach h from computation graph
         self.h = self.h.detach()
+        
+        # visualize loss
+        plt.figure(figsize=(10, 6))
+        plt.plot(loss_history, label='Loss')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.title('Optimization Loss over Iterations')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt_path = os.path.join('results', 'optimization_loss.png')
+        plt.savefig(plt_path)
+        plt.close()
+        print(f"Optimization loss plot saved to '{plt_path}'")
