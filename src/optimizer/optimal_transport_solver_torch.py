@@ -1,10 +1,11 @@
 import copy
-from typing import Optional, Tuple
 import os
+from typing import Optional, Tuple
+
 import numpy as np
 import torch
-from tqdm import tqdm
 from matplotlib import pyplot as plt
+from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 
@@ -324,16 +325,16 @@ class OptimalTransportSolver:
             max_iter (int): Maximum number of iterations.
             tol (float): Convergence tolerance.
         """
-        transport_dir = os.path.join('results', 'transport')
+        transport_dir = os.path.join("results", "transport")
         os.makedirs(transport_dir, exist_ok=True)
-        
+
         self.h = torch.eye(
             3, dtype=torch.float32, device=self.device, requires_grad=True
         )
 
         optimizer = torch.optim.Adam([self.h], lr=1e-4)
         prev_loss = torch.tensor(float("inf"), device=self.device)
-        
+
         loss_history = []
 
         for iteration in tqdm(range(max_iter), desc="Optimization with Homography"):
@@ -364,24 +365,25 @@ class OptimalTransportSolver:
 
             # Update h
             optimizer.step()
-            
+
             loss_history.append(loss.item())
-            
+
             if iteration % 10 == 0 or iteration == max_iter - 1:
                 with torch.no_grad():
-                    T_np = transport.cpu().numpy()
+                    t_np = transport.cpu().numpy()
                     plt.figure(figsize=(8, 6))
-                    plt.imshow(T_np, cmap='hot', interpolation='nearest')
-                    plt.colorbar(label='Transport Plan Value')
-                    plt.title(f'Transport Plan at Iteration {iteration}')
-                    plt.xlabel('Image 2 Gaussians')
-                    plt.ylabel('Image 1 Gaussians')
+                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
+                    plt.colorbar(label="Transport Plan Value")
+                    plt.title(f"Transport Plan at Iteration {iteration}")
+                    plt.xlabel("Image 2 Gaussians")
+                    plt.ylabel("Image 1 Gaussians")
                     plt.tight_layout()
-                    plt_path = os.path.join(transport_dir, f'transport_iter_{iteration}.png')
+                    plt_path = os.path.join(
+                        transport_dir, f"transport_iter_{iteration}.png"
+                    )
                     plt.savefig(plt_path)
                     plt.close()
                     print(f"Transport matrix heatmap saved to '{plt_path}'")
-
 
             # Check for convergence
             if abs(prev_loss.item() - loss.item()) < tol:
@@ -402,17 +404,17 @@ class OptimalTransportSolver:
 
         # Detach h from computation graph
         self.h = self.h.detach()
-        
+
         # visualize loss
         plt.figure(figsize=(10, 6))
-        plt.plot(loss_history, label='Loss')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.title('Optimization Loss over Iterations')
+        plt.plot(loss_history, label="Loss")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title("Optimization Loss over Iterations")
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt_path = os.path.join('results', 'optimization_loss.png')
+        plt_path = os.path.join("results", "optimization_loss.png")
         plt.savefig(plt_path)
         plt.close()
         print(f"Optimization loss plot saved to '{plt_path}'")

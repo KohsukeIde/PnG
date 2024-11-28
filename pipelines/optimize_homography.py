@@ -18,8 +18,16 @@ from utils.gs_pkl_loader import load_gaussians_torch
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
+# Import visualization functions from visualize_tools.py
+from utils.homography_pipeline_visualization import (
+    visualize_point_matches,
+    visualize_epipolar_lines,
+    plot_epipolar_cost_change,
+    save_warped_image
+)
+
 def get_top_correspondences(solver, num_points=100):
-    """Get top 1:1 correspondences based on transport matrix T.
+    """Get top 1:1 correspondences based on transport matrix T using greedy matching.
 
     Args:
         solver (OptimalTransportSolver): Solver instance.
@@ -41,30 +49,67 @@ def get_top_correspondences(solver, num_points=100):
     print(f"Transport matrix min value: {T_np.min()}")
     print(f"Transport matrix max value: {T_np.max()}")
 
-    # For each point in image1, find the strongest correspondence in image2
-    row_to_col = np.argmax(T_np, axis=1)  # For each row, get the column with max value
-    row_max_values = T_np[np.arange(len(T_np)), row_to_col]  # Get the max values
+    # Greedy 1:1 matching based on transport values
+    used_rows = set()
+    used_cols = set()
+    matches = []
     
-    # Sort by correspondence strength and take top num_points
-    top_row_indices = np.argsort(-row_max_values)[:num_points]
-    selected_col_indices = row_to_col[top_row_indices]
+    # Get all values and their indices sorted by transport value
+    flat_indices = np.argsort(-T_np.flatten())
+    rows, cols = np.unravel_index(flat_indices, T_np.shape)
     
-    # Get the corresponding points
-    pts1 = points1[top_row_indices]
-    pts2 = points2[selected_col_indices]
+    # Find matches greedily
+    for row, col in zip(rows, cols):
+        if len(matches) >= num_points:
+            break
+        if row not in used_rows and col not in used_cols:
+            matches.append((row, col))
+            used_rows.add(row)
+            used_cols.add(col)
     
-    # Verify uniqueness
-    unique_pts1 = np.unique(pts1, axis=0)
-    unique_pts2 = np.unique(pts2, axis=0)
-    print(f"\nUniqueness verification:")
-    print(f"Points in image 1: {len(unique_pts1)} / {len(pts1)} unique")
-    print(f"Points in image 2: {len(unique_pts2)} / {len(pts2)} unique")
-    
-    # Print top 5 transport values for selected pairs
-    selected_values = row_max_values[top_row_indices][:5]
-    print(f"\nTop 5 transport values for selected pairs: {selected_values}")
+    # Convert matches to arrays
+    matched_rows, matched_cols = zip(*matches)
+    matched_rows = np.array(matched_rows)
+    matched_cols = np.array(matched_cols)
+
+    pts1 = points1[matched_rows]
+    pts2 = points2[matched_cols]
+
+    # Print matching statistics
+    print(f"\nMatching statistics:")
+    print(f"Number of matches found: {len(matches)}")
+    print(f"Top 5 transport values for matches:")
+    for i in range(min(5, len(matches))):
+        row, col = matches[i]
+        print(f"Match {i+1}: T[{row},{col}] = {T_np[row,col]}")
     
     return pts1, pts2
+
+def compute_epipolar_cost_cv2(F, pts1, pts2):
+    """Compute the average epipolar constraint residuals for given correspondences.
+
+    Args:
+        F (np.ndarray): Fundamental matrix (3x3).
+        pts1 (np.ndarray): Points from image 1 (N x 2).
+        pts2 (np.ndarray): Points from image 2 (N x 2).
+
+    Returns:
+        float: Average epipolar cost.
+    """
+    # Convert points to homogeneous coordinates
+    pts1_h = np.hstack([pts1, np.ones((pts1.shape[0], 1))])  # (N, 3)
+    pts2_h = np.hstack([pts2, np.ones((pts2.shape[0], 1))])  # (N, 3)
+
+    # Compute epipolar constraint residuals
+    Fx1 = F @ pts1_h.T  # (3, N)
+    x2Fx1 = np.sum(pts2_h * Fx1.T, axis=1)  # (N,)
+
+    residuals = np.abs(x2Fx1)  # (N,)
+
+    # Average residual as epipolar cost
+    epipolar_cost = np.mean(residuals)
+
+    return epipolar_cost
 
 def evaluate_homography_residuals(solver, num_points=100):
     """Evaluate residuals between transformed points and their correspondences using optimized homography.
@@ -131,74 +176,6 @@ def evaluate_homography_matrix(H):
     else:
         print("Homography matrix is singular and not invertible.")
 
-def visualize_point_matches(img1, img2, pts1, pts2, output_dir='results'):
-    """Visualize point matches between original images.
-
-    Args:
-        img1 (np.ndarray): First image.
-        img2 (np.ndarray): Second image.
-        pts1 (np.ndarray): Points from first image.
-        pts2 (np.ndarray): Points from second image.
-        output_dir (str): Path to output directory.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Stack images horizontally
-    combined_img = np.hstack((img1, img2))
-
-    # Debug information
-    print(f"\nPoint matching visualization:")
-    print(f"Image shapes - img1: {img1.shape}, img2: {img2.shape}")
-    print(f"Points to draw - pts1: {len(pts1)}, pts2: {len(pts2)}")
-
-    # Draw correspondences
-    color_pt1 = (0, 0, 255)    # Red
-    color_pt2 = (255, 0, 0)    # Blue
-    color_line = (0, 255, 0)   # Green
-    point_size = 3
-    line_thickness = 1
-
-    valid_points = 0
-    for pt1, pt2 in zip(pts1, pts2):
-        x1, y1 = int(pt1[0]), int(pt1[1])
-        x2, y2 = int(pt2[0]), int(pt2[1])
-        
-        if (0 <= x1 < img1.shape[1] and 0 <= y1 < img1.shape[0] and
-            0 <= x2 < img2.shape[1] and 0 <= y2 < img2.shape[0]):
-            
-            pt1_int = (x1, y1)
-            pt2_int = (x2 + img1.shape[1], y2)
-            
-            cv2.circle(combined_img, pt1_int, point_size, color_pt1, -1)
-            cv2.circle(combined_img, pt2_int, point_size, color_pt2, -1)
-            cv2.line(combined_img, pt1_int, pt2_int, color_line, line_thickness)
-            
-            valid_points += 1
-
-    print(f"Valid points drawn: {valid_points} / {len(pts1)}")
-    matches_path = os.path.join(output_dir, 'point_matches.png')
-    cv2.imwrite(matches_path, combined_img)
-    print(f"Point matches saved to '{matches_path}'")
-
-def save_warped_image(img1, img2, H_np, output_dir='results'):
-    """Save warped image using homography.
-
-    Args:
-        img1 (np.ndarray): First image to be warped.
-        img2 (np.ndarray): Second (target) image.
-        H_np (np.ndarray): Homography matrix.
-        output_dir (str): Path to output directory.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Warp img1 using homography
-    img1_warped = cv2.warpPerspective(img1, H_np, (img2.shape[1], img2.shape[0]))
-    
-    # Save warped image
-    warped_path = os.path.join(output_dir, 'warped_image.png')
-    cv2.imwrite(warped_path, img1_warped)
-    print(f"Warped image saved to '{warped_path}'")
-
 def main():
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,6 +227,9 @@ def main():
         device=device
     )
 
+    # Initialize homography before optimization (for visualization purpose)
+    solver.h = torch.eye(3, device=device, dtype=torch.float32)
+
     # Debug information function
     def print_stats(tensor, name):
         print(f"\n{name} statistics:")
@@ -259,7 +239,35 @@ def main():
         print(f"Has NaN: {torch.isnan(tensor).any().item()}")
         print(f"Has Inf: {torch.isinf(tensor).any().item()}")
 
+    # --- Before Optimization ---
+    
+    print("\n--- Optimization Before ---")
+    
+    # Get top correspondences before optimization
+    pts1_before, pts2_before = get_top_correspondences(solver, num_points=1000)
+    
+    # Estimate Fundamental Matrix before optimization
+    F_before, mask_before = cv2.findFundamentalMat(
+        pts1_before.astype(np.float32), 
+        pts2_before.astype(np.float32), 
+        cv2.FM_RANSAC
+    )
+    
+    if F_before is not None and F_before.shape == (3, 3):
+        print("\nEstimated Fundamental Matrix Before Optimization:")
+        print(F_before)
+    else:
+        print("Failed to estimate Fundamental Matrix before optimization.")
+        sys.exit(1)
+    
+    # Compute epipolar cost before optimization
+    epipolar_cost_before = compute_epipolar_cost_cv2(F_before, pts1_before, pts2_before)
+    print(f"Epipolar Cost Before Optimization: {epipolar_cost_before:.6f}")
+    
+    # --- Optimizing Homography ---
+    
     # Optimize homography
+    print("\n--- Optimizing Homography ---")
     solver.optimize_with_homography(max_iter=1000, tol=1e-6)
 
     # Get optimized homography matrix
@@ -279,33 +287,86 @@ def main():
         cost_matrix = cost_matrix.cpu().numpy()
         transport_matrix = transport_matrix.cpu().numpy()
 
-    # Evaluation
-    evaluate_homography_matrix(solver.h)
+    # --- Post-optimization Processing ---
     
-    evaluate_homography_residuals(solver, num_points=100)
+    print("\n--- Optimization After ---")
     
+    # Get top correspondences after optimization
+    pts1_after, pts2_after = get_top_correspondences(solver, num_points=1000)
+
+    # Estimate Fundamental Matrix after optimization
+    F_cv2, mask_cv2 = cv2.findFundamentalMat(
+        pts1_after.astype(np.float32), 
+        pts2_after.astype(np.float32), 
+        cv2.FM_RANSAC
+    )
+
+    if F_cv2 is not None and F_cv2.shape == (3, 3):
+        print("\nEstimated Fundamental Matrix After Optimization:")
+        print(F_cv2)
+    else:
+        print("Failed to estimate Fundamental Matrix after optimization.")
+        F_cv2 = np.eye(3, dtype=np.float32)  # デフォルト値
+
+    # Compute epipolar cost after optimization
+    epipolar_cost_after = compute_epipolar_cost_cv2(F_cv2, pts1_after, pts2_after)
+    print(f"Epipolar Cost After Optimization: {epipolar_cost_after:.6f}")
+
+    # --- plot epipolar cost ---
+    
+    # Plot epipolar cost change
+    plot_epipolar_cost_change(epipolar_cost_before, epipolar_cost_after, output_dir='results')
+
+    # --- Visualize epipolar lines and corresponding points ---
+    
+    # Load images
     image1_path = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/images/0022.png'
     image2_path = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/images/0023.png'
     
-    # Load images
     img1 = cv2.imread(image1_path)
     img2 = cv2.imread(image2_path)
     
-    # Extract correspondences
-    pts1, pts2 = get_top_correspondences(solver, num_points=100)
+    if img1 is None:
+        print(f"Failed to load image from {image1_path}")
+        sys.exit(1)
+    if img2 is None:
+        print(f"Failed to load image from {image2_path}")
+        sys.exit(1)
 
-    # Get homography matrix
-    H_np = solver.h.detach().cpu().numpy()
-
-    # Visualize point matches
-    visualize_point_matches(img1, img2, pts1, pts2, output_dir='results')
+    # Visualize epipolar lines before optimization
+    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_before, output_dir='results/epilines_before')
     
-    # Save warped image separately
-    save_warped_image(img1, img2, H_np, output_dir='results')
+    # Visualize epipolar lines after optimization
+    visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_cv2, output_dir='results/epilines_after')
 
+    # --- other evaluations ---
+    
+    # Evaluate homography matrix
+    evaluate_homography_matrix(solver.h)
+    
+    # Evaluate homography residuals
+    evaluate_homography_residuals(solver, num_points=100)
+    
+    # --- save visualizations ---
+    
+    # Visualize point matches before optimization
+    visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir='results/matches_before')
+    
+    # Visualize point matches after optimization
+    visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after')
+
+    # Save warped image after optimization
+    save_warped_image(img1, img2, H_optimized, output_dir='results')
+
+    # --- save results as pickle (Just in case) ---
+    
     # Save results
     results = {
         'homography_matrix': H_optimized,
+        'fundamental_matrix_before': F_before,
+        'fundamental_matrix_after': F_cv2,
+        'epipolar_cost_before': epipolar_cost_before,
+        'epipolar_cost_after': epipolar_cost_after,
         'cost_matrix': cost_matrix,
         'transport_matrix': transport_matrix,
         'camera1_K': K1,
