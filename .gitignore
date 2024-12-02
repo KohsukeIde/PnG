@@ -1,4 +1,5 @@
-# data/*
+# Ignore general data, models, outputs, and caches
+data/*
 models/*
 outputs/*
 __pycache__
@@ -8,6 +9,8 @@ __pycache__
 .pytest_cache
 .venv
 *.env
+
+# Exceptions for specific README and environment files
 !data/README.md
 !models/README.md
 !outputs/README.md
@@ -15,11 +18,12 @@ __pycache__
 !environments/cpu/.env
 !environments/gpu/.env
 !data/tsukuba/*
+
+# System and debug files
 .DS_Store
 /gaussian_mixture_results
 /debug_output
-/data/*
+
+# Specific files added by the feature branch
 /pipelines/results/*
-
-
 utils/test.py
