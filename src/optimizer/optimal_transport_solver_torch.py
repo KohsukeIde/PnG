@@ -21,7 +21,7 @@ class OptimalTransportSolver:
         k2: Optional[np.ndarray] = None,
         epsilon: float = 0.1,
         lambda_mean: float = 1.0,
-        lambda_cov: float = 1.0,
+        lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
         device: Optional[torch.device] = None,
     ):
@@ -100,30 +100,67 @@ class OptimalTransportSolver:
             self.gaussians2.alpha, dtype=torch.float32, device=self.device
         )  # Shape: (K2,)
 
+    # def compute_cost_matrix(self, h: torch.Tensor) -> torch.Tensor:
+    #     """Compute the cost matrix between two sets of 2D Gaussians using homography.
+
+    #     Args:
+    #         h (torch.Tensor): The homography transformation matrix (3x3).
+
+    #     Returns:
+    #         torch.Tensor: Cost matrix of shape (K1, K2).
+    #     """
+    #     k1 = self.means1.shape[0]
+
+    #     # Prepare homogeneous coordinates for means1
+    #     ones = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
+    #     means1_h = torch.cat([self.means1, ones], dim=1)  # Shape: (K1, 3)
+
+    #     # Apply homography h to means1
+    #     transformed_means1_h = (h @ means1_h.T).T  # Shape: (K1, 3)
+
+    #     # Convert back to inhomogeneous coordinates
+    #     transformed_means1 = transformed_means1_h[:, :2] / transformed_means1_h[
+    #         :, 2
+    #     ].unsqueeze(1)  # Shape: (K1, 2)
+
+    #     # Get separate Wasserstein distance components
+    #     mean_term, cov_term = self._wasserstein_distance(
+    #         transformed_means1,
+    #         self.scales1,
+    #         self.rotations1,
+    #         self.means2,
+    #         self.scales2,
+    #         self.rotations2,
+    #     )  # Each shape: (K1, K2)
+
+    #     # Compute color differences
+    #     color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)
+    #     d_color = torch.sum(color_diff**2, dim=2)  # Shape: (K1, K2)
+
+    #     # Normalize components before combining
+    #     mean_term = mean_term / (mean_term.max() + 1e-8)
+    #     cov_term = cov_term / (cov_term.max() + 1e-8)
+    #     d_color = d_color / (d_color.max() + 1e-8)
+
+    #     # Combine with weights
+    #     cost_matrix = (
+    #         self.lambda_mean * mean_term
+    #         + self.lambda_cov * cov_term
+    #         + self.lambda_color * d_color
+    #     )
+
+    #     return cost_matrix
+    
     def compute_cost_matrix(self, h: torch.Tensor) -> torch.Tensor:
-        """Compute the cost matrix between two sets of 2D Gaussians using homography.
-
-        Args:
-            h (torch.Tensor): The homography transformation matrix (3x3).
-
-        Returns:
-            torch.Tensor: Cost matrix of shape (K1, K2).
-        """
         k1 = self.means1.shape[0]
 
-        # Prepare homogeneous coordinates for means1
+        # Prepare homogeneous coordinates
         ones = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
-        means1_h = torch.cat([self.means1, ones], dim=1)  # Shape: (K1, 3)
+        means1_h = torch.cat([self.means1, ones], dim=1)  # (K1, 3)
+        transformed_means1_h = (h @ means1_h.T).T
+        transformed_means1 = transformed_means1_h[:, :2] / transformed_means1_h[:, 2].unsqueeze(1)
 
-        # Apply homography h to means1
-        transformed_means1_h = (h @ means1_h.T).T  # Shape: (K1, 3)
-
-        # Convert back to inhomogeneous coordinates
-        transformed_means1 = transformed_means1_h[:, :2] / transformed_means1_h[
-            :, 2
-        ].unsqueeze(1)  # Shape: (K1, 2)
-
-        # Get separate Wasserstein distance components
+        # Compute Wasserstein components
         mean_term, cov_term = self._wasserstein_distance(
             transformed_means1,
             self.scales1,
@@ -131,16 +168,29 @@ class OptimalTransportSolver:
             self.means2,
             self.scales2,
             self.rotations2,
-        )  # Each shape: (K1, K2)
+        )
 
         # Compute color differences
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)
-        d_color = torch.sum(color_diff**2, dim=2)  # Shape: (K1, K2)
+        d_color = torch.sum(color_diff**2, dim=2)
 
-        # Normalize components before combining
-        mean_term = mean_term / (mean_term.max() + 1e-8)
-        cov_term = cov_term / (cov_term.max() + 1e-8)
-        d_color = d_color / (d_color.max() + 1e-8)
+        # Print stats before scaling
+        print("=== Before Scaling ===")
+        print(f"mean_term: min={mean_term.min().item():.4f}, max={mean_term.max().item():.4f}, mean={mean_term.mean().item():.4f}")
+        print(f"cov_term: min={cov_term.min().item():.4f}, max={cov_term.max().item():.4f}, mean={cov_term.mean().item():.4f}")
+        print(f"d_color: min={d_color.min().item():.4f}, max={d_color.max().item():.4f}, mean={d_color.mean().item():.4f}")
+
+        # Fixed scaling factors based on known image size and color range
+        max_dim = 1554  # largest image dimension you decided
+        mean_term = mean_term / (max_dim**2)
+        cov_term = cov_term / (max_dim**2 / 100000)
+        d_color = d_color / 3.0
+
+        # Print stats after scaling
+        print("=== After Scaling ===")
+        print(f"mean_term: min={mean_term.min().item():.6f}, max={mean_term.max().item():.6f}, mean={mean_term.mean().item():.6f}")
+        print(f"cov_term: min={cov_term.min().item():.6f}, max={cov_term.max().item():.6f}, mean={cov_term.mean().item():.6f}")
+        print(f"d_color: min={d_color.min().item():.6f}, max={d_color.max().item():.6f}, mean={d_color.mean().item():.6f}")
 
         # Combine with weights
         cost_matrix = (
@@ -149,7 +199,12 @@ class OptimalTransportSolver:
             + self.lambda_color * d_color
         )
 
+        # Check final cost matrix stats
+        print("=== Final Cost Matrix ===")
+        print(f"cost_matrix: min={cost_matrix.min().item():.6f}, max={cost_matrix.max().item():.6f}, mean={cost_matrix.mean().item():.6f}")
         return cost_matrix
+
+
 
     def _construct_covariance(
         self, scales: torch.Tensor, rotations: torch.Tensor
@@ -345,7 +400,7 @@ class OptimalTransportSolver:
 
             # Compute transport plan using Sinkhorn
             transport = self.sinkhorn_algorithm(
-                cost_matrix, max_iter=1000, tol=1e-6
+                cost_matrix, max_iter=100000, tol=1e-6
             )  # Shape: (K1, K2)
 
             # Compute objective function (total cost)
