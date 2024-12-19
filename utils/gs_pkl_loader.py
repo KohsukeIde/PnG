@@ -36,5 +36,21 @@ def load_gaussians_torch(pickle_path: str, device: torch.device) -> tuple:
     projected_gaussians.alpha = torch.tensor(projected_gaussians.alpha, dtype=torch.float32, device=device)
     if hasattr(projected_gaussians, 'covs'):
         projected_gaussians.covs = torch.tensor(projected_gaussians.covs, dtype=torch.float32, device=device)
+        
+    # print("=== Projected Gaussians Statistics ===")
+    # print(f"means: min={projected_gaussians.means.min().item()}, max={projected_gaussians.means.max().item()}, "
+    #       f"mean={projected_gaussians.means.mean().item()}, std={projected_gaussians.means.std().item()}")
+    # print(f"scales: min={projected_gaussians.scales.min().item()}, max={projected_gaussians.scales.max().item()}, "
+    #       f"mean={projected_gaussians.scales.mean().item()}, std={projected_gaussians.scales.std().item()}")
+    # print(f"rotations: min={projected_gaussians.rotations.min().item()}, max={projected_gaussians.rotations.max().item()}, "
+    #       f"mean={projected_gaussians.rotations.mean().item()}, std={projected_gaussians.rotations.std().item()}")
+    # print(f"rgb: min={projected_gaussians.rgb.min().item()}, max={projected_gaussians.rgb.max().item()}, "
+    #       f"mean={projected_gaussians.rgb.mean().item()}, std={projected_gaussians.rgb.std().item()}")
+    # print(f"alpha: min={projected_gaussians.alpha.min().item()}, max={projected_gaussians.alpha.max().item()}, "
+    #       f"mean={projected_gaussians.alpha.mean().item()}, std={projected_gaussians.alpha.std().item()}")
+    # if hasattr(projected_gaussians, 'covs'):
+    #     print(f"covs: min={projected_gaussians.covs.min().item()}, max={projected_gaussians.covs.max().item()}, "
+    #           f"mean={projected_gaussians.covs.mean().item()}, std={projected_gaussians.covs.std().item()}")
+    # print("======================================")
 
     return original_gaussians, projected_gaussians, viewmat, K

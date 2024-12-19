@@ -231,7 +231,8 @@ def test_compute_3d_gaussian_covariances():
 
     for i in range(k):
         Sigma_3D = reconstructor.covariances_3d[i]
-
+        #check if Sigma_3D is positive definite
         assert np.all(np.linalg.eigvalsh(Sigma_3D) >= -1e-5)
+        #check if Sigma_3D is symmetric
         assert np.allclose(Sigma_3D, Sigma_3D.T, atol=1e-5)
 
