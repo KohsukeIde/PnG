@@ -17,7 +17,7 @@ from utils.gs_pkl_loader import load_gaussians_torch
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
-# Import Initial3DReconstructor
+
 from src.reconstructor.initial_3d_reconstructor import Initial3DReconstructor
 
 def save_point_cloud_as_ply(points, filename):
@@ -121,7 +121,7 @@ def main():
     reconstructor.compute_camera_matrices_from_homography()
 
     # Define transport_matrix threshold
-    threshold = 1e-6  # 適宜調整してください
+    threshold = 1e-6  # 適宜調整
 
     # Triangulate points using the transport_matrix and threshold
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold)
