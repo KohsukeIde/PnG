@@ -186,6 +186,9 @@ def main():
     data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs'
     gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
     gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
+    
+    # gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted1_500_10k.pkl')
+    # gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted2_500_10k.pkl')
     colmap_dir = os.path.join(data_dir, 'sparse/0')
     
     image1_name = '0022.png'
@@ -221,9 +224,10 @@ def main():
         k1=K1,
         k2=K2,
         epsilon=0.1,
-        lambda_mean=0.4,
-        lambda_cov=0.2,
-        lambda_color=0.4,
+        lambda_mean=1,
+        lambda_cov=1,
+        lambda_color=1,
+        lambda_alpha=1,
         device=device
     )
 
@@ -322,6 +326,9 @@ def main():
     # Load images
     image1_path = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/images/0022.png'
     image2_path = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/images/0023.png'
+    
+    # image1_path = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/images/0022_shifted.png'
+    # image2_path = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/images/0022_shifted2.png'
     
     img1 = cv2.imread(image1_path)
     img2 = cv2.imread(image2_path)
