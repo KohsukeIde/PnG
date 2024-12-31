@@ -339,11 +339,11 @@ class Initial3DReconstructor:
             s = final_params[4:]
 
             if result.status == 1:
-                print("最適化が収束しました。")
+                print("Optimization converged.")
             elif result.status == 2:
-                print("関数評価回数の上限に達しました。")
+                print("Maximum number of function evaluations reached.")
             else:
-                print("最適化が失敗しました。")
+                print("Optimization failed.")
 
             Sigma_3 = build_covariance_3d(q, s)
             self.covariances_3d[idx] = Sigma_3
