@@ -316,6 +316,75 @@ class OptimalTransportSolver:
 
         transport = u.unsqueeze(1) * kernel * v.unsqueeze(0) # Shape: (K1, K2)
         return transport
+    
+    def unbalanced_sinkhorn_algorithm(
+        self,
+        cost_matrix: torch.Tensor,
+        rho: float = 1.0,
+        max_iter: int = 1000,
+        tol: float = 1e-6
+    ) -> torch.Tensor:
+        """
+        不均衡最適輸送 (Unbalanced OT) Sinkhorn の実装 (微分可能)。
+        
+        Args:
+            cost_matrix (torch.Tensor): shape (K1, K2), 各Gaussians同士のコスト。
+            rho (float): 質量不一致を許容する度合い (小さいほど自由に消せる/増やせる)。
+            max_iter (int): 最大反復回数。
+            tol (float): 収束判定用の閾値。
+
+        Returns:
+            transport (torch.Tensor): shape (K1, K2), 不均衡OTで求まった輸送計画。
+        """
+        device = cost_matrix.device
+
+        # alpha, beta は各 2D Gaussian の総重量（あるいはピクセル近似質量など）
+        alpha = self.alpha1  # shape (K1,)
+        beta  = self.alpha2  # shape (K2,)
+
+        # エントロピー正則化と同様に Gibbs カーネルを作成
+        kernel = torch.exp(-cost_matrix / self.epsilon)  # shape (K1, K2)
+
+        # u, v を 1 で初期化
+        u = torch.ones_like(alpha)  # (K1,)
+        v = torch.ones_like(beta)   # (K2,)
+
+        # 不均衡OTでのアップデート式
+        # exponent = rho / (rho + epsilon)
+        exponent = rho / (rho + self.epsilon)
+
+        for iteration in range(max_iter):
+            # 1) Kv = kernel @ v
+            Kv = kernel @ v
+            Kv = Kv + 1e-16  # 数値安定のため
+
+            # 2) u_new
+            #   unbalancedの場合は (alpha / Kv)^(rho/(rho+epsilon)) のようなアップデート
+            u_new = (alpha / Kv).pow(exponent)
+
+            # 3) KtU = kernel.t() @ u_new
+            KtU = kernel.t() @ u_new
+            KtU = KtU + 1e-16
+
+            v_new = (beta / KtU).pow(exponent)
+
+            # 収束判定
+            if (
+                torch.max(torch.abs(u_new - u)) < tol
+                and torch.max(torch.abs(v_new - v)) < tol
+            ):
+                print(f"[Unbalanced] iteration {iteration} -> converged.")
+                break
+
+            u, v = u_new, v_new
+
+        # 輸送計画を計算
+        # transport = diag(u) * kernel * diag(v) 
+        # ただし ブロードキャストで = u.unsqueeze(1) * kernel * v.unsqueeze(0)
+        transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
+        return transport
+
+
 
     def optimize_with_homography(self, max_iter: int = 1000, tol: float = 1e-6) -> None:
         """Optimize the homography matrix H.
@@ -340,6 +409,13 @@ class OptimalTransportSolver:
             cost_matrix = self.compute_cost_matrix(self.h)  # (K1, K2)
             # Compute transport plan using Sinkhorn
             transport = self.sinkhorn_algorithm(cost_matrix, max_iter=100000, tol=1e-6) # Shape: (K1, K2)
+            # transport = self.unbalanced_sinkhorn_algorithm(
+            #     cost_matrix, 
+            #     rho=1.0,         
+            #     max_iter=100000,   
+            #     tol=1e-6
+            # )
+            
             # Compute objective function (total cost)
             loss = torch.sum(transport * cost_matrix)
 
@@ -360,12 +436,6 @@ class OptimalTransportSolver:
 
             if iteration % 5 == 0 or iteration == max_iter - 1:
                 print(f"Iteration {iteration}, Loss={loss.item():.6f}, GradNorm={grad_norm:.6f}")
-
-            # check for converge
-            if abs(prev_loss.item() - loss.item()) < tol:
-                print(f"Converged at iteration {iteration}")
-                break
-            prev_loss = loss
 
             if iteration % 10 == 0 or iteration == max_iter - 1:
                 with torch.no_grad():
