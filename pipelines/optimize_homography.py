@@ -184,11 +184,11 @@ def main():
     # Data paths
     data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63'
     data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs'
-    gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
-    gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
+    # gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
+    # gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
     
-    # gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted1_500_10k.pkl')
-    # gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted2_500_10k.pkl')
+    gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted1_500_10k.pkl')
+    gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted2_500_10k.pkl')
     colmap_dir = os.path.join(data_dir, 'sparse/0')
     
     image1_name = '0022.png'
@@ -284,7 +284,8 @@ def main():
         cost_matrix = solver.compute_cost_matrix(solver.h)
         print_stats(cost_matrix, "Cost Matrix")
         
-        transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
+        # transport_matrix = solver.sinkhorn_algorithm(cost_matrix)
+        transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         print_stats(transport_matrix, "Transport Matrix")
         
         # Convert to numpy arrays for saving
