@@ -7,8 +7,16 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 import argparse
 
+# Add parent directory to Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
 from src.optimizer.single_image_gaussian_mixture_em import SingleImageGaussianMixtureEM
 from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
 
 def visualize_gaussians(image, gaussians, iteration, output_dir):
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -80,6 +88,10 @@ def visualize_log_likelihood(log_likelihood, iteration, output_dir):
     print(f"Saved: {output_path}")
 
 def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
+    # Convert relative path to absolute path
+    if not os.path.isabs(image_path):
+        image_path = os.path.join(project_root, image_path)
+    
     gmm = SingleImageGaussianMixtureEM(image_path)
     
     base_output_dir = "gaussian_mixture_results"
@@ -177,8 +189,9 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Gaussian Mixture Model EM algorithm on an image")
-    parser.add_argument("--image_path", type=str, default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
-                        help="Path to the input image")
+    parser.add_argument("--image_path", type=str, 
+                       default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
+                       help="Path to the input image")
     parser.add_argument("--n_gaussians", type=int, default=5000, help="Number of Gaussians")
     parser.add_argument("--n_iterations", type=int, default=8, help="Number of EM iterations")
     args = parser.parse_args()
