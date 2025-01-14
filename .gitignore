@@ -26,4 +26,5 @@ __pycache__
 
 # Specific files added by the feature branch
 /pipelines/results/*
+/results/*
 utils/test.py
