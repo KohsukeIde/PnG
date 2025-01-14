@@ -4,6 +4,7 @@ import pickle
 import torch
 import numpy as np
 import cv2
+from tqdm import tqdm
 
 # Add parent directory to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,7 +79,7 @@ def sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta=12, n_phi=12):
 ########################
 # 2) Helper function: Save ellipsoids as PLY (with color, alpha optional)
 ########################
-def save_ellipsoids_as_ply(all_vertices, all_faces, filename, use_alpha=False):
+def save_ellipsoids_as_ply(all_vertices, all_faces, filename, use_alpha=True):
     """
     Merge all ellipsoids' geometry and save as a single PLY.
 
@@ -194,7 +195,7 @@ def render_gaussians_to_2d_splat(
     fx, fy = K[0,0], K[1,1]
     cx, cy = K[0,2], K[1,2]
 
-    for i in range(points_3d.shape[0]):
+    for i in tqdm(range(points_3d.shape[0]), desc="Rendering Gaussians"):
         X_w = points_3d[i]
         Sigma_3 = covariances_3d[i]
         rgb = color_3d[i]     # e.g. [r, g, b]
@@ -378,6 +379,7 @@ def main():
     ##############################
     print("\n--- Computing 3D Gaussian Covariances with Volume Prior ---")
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
+    # reconstructor.compute_3d_gaussian_covariances()
 
     ply_points_out = os.path.join('results', 'triangulated_points.ply')
     os.makedirs('results', exist_ok=True)
