@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
