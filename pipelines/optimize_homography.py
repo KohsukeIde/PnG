@@ -187,8 +187,8 @@ def main():
     # gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
     # gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
     
-    gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted1_500_10k.pkl')
-    gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_shifted2_500_10k.pkl')
+    gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_16.pkl')
+    gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_16.pkl')
     colmap_dir = os.path.join(data_dir, 'sparse/0')
     
     image1_name = '0022.png'
@@ -248,7 +248,7 @@ def main():
     print("\n--- Optimization Before ---")
     
     # Get top correspondences before optimization
-    pts1_before, pts2_before = get_top_correspondences(solver, num_points=1000)
+    pts1_before, pts2_before = get_top_correspondences(solver, num_points=16)
     
     # Estimate Fundamental Matrix before optimization
     F_before, mask_before = cv2.findFundamentalMat(
@@ -272,7 +272,7 @@ def main():
     
     # Optimize homography
     print("\n--- Optimizing Homography ---")
-    solver.optimize_with_homography(max_iter=1000, tol=1e-6)
+    solver.optimize_with_homography(max_iter=1000, tol=1e-2)
 
     # Get optimized homography matrix
     H_optimized = solver.h.detach().cpu().numpy()
@@ -297,7 +297,7 @@ def main():
     print("\n--- Optimization After ---")
     
     # Get top correspondences after optimization
-    pts1_after, pts2_after = get_top_correspondences(solver, num_points=1000)
+    pts1_after, pts2_after = get_top_correspondences(solver, num_points=10000)
 
     # Estimate Fundamental Matrix after optimization
     F_cv2, mask_cv2 = cv2.findFundamentalMat(
