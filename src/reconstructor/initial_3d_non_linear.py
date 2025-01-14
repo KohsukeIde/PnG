@@ -1,129 +1,202 @@
-import numpy as np
+from typing import List, Optional, Tuple
+
 import cv2
+import numpy as np
+from joblib import Parallel, delayed
 from scipy.optimize import least_squares
+
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 
 
-def quaternion_to_rotation(q):
-    """
-    Convert a quaternion q = [qw, qx, qy, qz] into a 3x3 rotation matrix.
-    Ensures R is orthonormal.
+def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
+    """Convert a quaternion [qw, qx, qy, qz] into a 3x3 rotation matrix.
+
+    Args:
+        q (np.ndarray): A 4-element array representing the quaternion (qw, qx, qy, qz).
+
+    Returns:
+        np.ndarray: A 3x3 orthonormal rotation matrix.
     """
     qw, qx, qy, qz = q
-    norm_q = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+    norm_q = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
     if norm_q < 1e-12:
-        # fallback to identity if zero quaternion
-        return np.eye(3)
-    # Normalize
-    qw, qx, qy, qz = qw/norm_q, qx/norm_q, qy/norm_q, qz/norm_q
+        return np.eye(3, dtype=np.float64)
+    qw, qx, qy, qz = qw / norm_q, qx / norm_q, qy / norm_q, qz / norm_q
+    r_mat = np.array(
+        [
+            [
+                1 - 2 * (qy**2 + qz**2),
+                2 * (qx * qy - qz * qw),
+                2 * (qx * qz + qy * qw),
+            ],
+            [
+                2 * (qx * qy + qz * qw),
+                1 - 2 * (qx**2 + qz**2),
+                2 * (qy * qz - qx * qw),
+            ],
+            [
+                2 * (qx * qz - qy * qw),
+                2 * (qy * qz + qx * qw),
+                1 - 2 * (qx**2 + qy**2),
+            ],
+        ],
+        dtype=np.float64,
+    )
+    return r_mat
 
-    # Standard quaternion -> rotation formula
-    R = np.array([
-        [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
-        [2*(qx*qy + qz*qw),     1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
-        [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)]
-    ])
-    return R
 
+def build_covariance_3d(q: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Build a 3D covariance from quaternion q and scales s=[s1, s2, s3].
 
-def build_covariance_3d(q, s):
+    Sigma_3 = R * diag(s^2) * R^T.
+
+    Args:
+        q (np.ndarray): Quaternion [qw, qx, qy, qz].
+        s (np.ndarray): Scales [s1, s2, s3].
+
+    Returns:
+        np.ndarray: The 3D covariance matrix (3x3).
     """
-    Build a 3D covariance from rotation quaternion q and 3 scales s=[s1, s2, s3].
-    Sigma_3 = R * diag(s1^2, s2^2, s3^2) * R^T
-    """
-    R = quaternion_to_rotation(q)
-    S_diag = np.diag(s**2)
-    Sigma_3 = R @ S_diag @ R.T
-    return Sigma_3
+    r_mat = quaternion_to_rotation(q)
+    s_diag = np.diag(s**2)
+    sigma_3 = r_mat @ s_diag @ r_mat.T
+    return np.array(sigma_3, dtype=float)
 
 
-def project_covariance_3d_to_2d(Sigma_3, point_3d, K, R_cam, t_cam):
-    """
+def project_covariance_3d_to_2d(
+    sigma_3: np.ndarray,
+    point_3d: np.ndarray,
+    k: np.ndarray,
+    r_cam: np.ndarray,
+    t_cam: np.ndarray,
+) -> np.ndarray:
+    """Project a 3D covariance sigma_3 to 2D using the local Jacobian approximation.
     Given a 3D covariance Sigma_3, project it to 2D:
     Sigma_2D = J * R_cam * Sigma_3 * R_cam^T * J^T
 
     J is the local Jacobian of the pinhole projection at the 3D point's camera coords.
     R_cam, t_cam define the transform from world to camera coordinates.
+
+    Args:
+        sigma_3 (np.ndarray): 3D covariance in world coords (3x3).
+        point_3d (np.ndarray): 3D point in world coordinates (3,).
+        k (np.ndarray): Intrinsic camera matrix (3x3).
+        r_cam (np.ndarray): Camera rotation (world->camera) (3x3).
+        t_cam (np.ndarray): Camera translation (3,).
+
+    Returns:
+        np.ndarray: Resulting 2D covariance (2x2).
     """
-    # 1) Transform 3D point to camera coords
-    X_c = R_cam @ point_3d + t_cam
-    X, Y, Z = X_c
+    x_c = r_cam @ point_3d + t_cam
+    x_val, y_val, z_val = x_c
 
-    fx, fy = K[0, 0], K[1, 1]
-    # We assume principal point is at (cx, cy), but for Jacobian we only need partial derivatives w.r.t. X, Y, Z
-
-    # 2) Approximate Jacobian J for the projection:
-    #     u = fx*(X/Z), v = fy*(Y/Z)
-    # =>  J = [[fx/Z,      0,        -fx*X/(Z**2)],
-    #          [    0,   fy/Z,       -fy*Y/(Z**2)]]
-    J = np.array([
-        [fx / Z,         0.0,       -fx * X / (Z**2)],
-        [0.0,       fy / Z,         -fy * Y / (Z**2)]
-    ])
-
-    # 3) Construct "world->camera" rotation if needed
-    #    If Sigma_3 is in world coords, convert to camera coords:
-    Sigma_cam = R_cam @ Sigma_3 @ R_cam.T
-
-    # 4) final 2D covariance:
-    Sigma_2D_model = J @ Sigma_cam @ J.T
-    return Sigma_2D_model
+    fx, fy = k[0, 0], k[1, 1]
+    j_mat = np.array(
+        [
+            [fx / z_val, 0.0, -fx * x_val / (z_val**2)],
+            [0.0, fy / z_val, -fy * y_val / (z_val**2)],
+        ],
+        dtype=np.float64,
+    )
+    sigma_cam = r_cam @ sigma_3 @ r_cam.T
+    sigma_2d_model = j_mat @ sigma_cam @ j_mat.T
+    return np.array(sigma_2d_model, dtype=float)
 
 
-def single_view_cov_residual(params, point_3d, Sigma_2D_obs, K, R_cam, t_cam):
+def single_view_cov_residual(
+    params: np.ndarray,
+    point_3d: np.ndarray,
+    sigma_2d_obs: np.ndarray,
+    k: np.ndarray,
+    r_cam: np.ndarray,
+    t_cam: np.ndarray,
+) -> np.ndarray:
+    """Residual function for a single camera view.
+
+    Args:
+        params (np.ndarray): [qw, qx, qy, qz, s1, s2, s3].
+        point_3d (np.ndarray): 3D point in world coordinates.
+        sigma_2d_obs (np.ndarray): Observed 2D covariance (2x2).
+        k (np.ndarray): Intrinsic camera matrix (3x3).
+        r_cam (np.ndarray): Camera rotation (3x3).
+        t_cam (np.ndarray): Camera translation (3,).
+
+    Returns:
+        np.ndarray: Flattened difference (4,) between the modeled 2D covariance and observed 2D covariance.
     """
-    Residual function for a single camera view.
-
-    params = [qw, qx, qy, qz, s1, s2, s3]
-    Builds Sigma_3 from rotation+scale,
-    projects to 2D => Sigma_2D_model,
-    returns difference from Sigma_2D_obs (some partial or full comparison).
-    """
-    # -- Ensure Sigma_2D_obs is a NumPy array, not a torch.Tensor --
-    if hasattr(Sigma_2D_obs, 'detach'):
-        # If it's a PyTorch tensor, convert to NumPy
-        Sigma_2D_obs = Sigma_2D_obs.detach().cpu().numpy()
+    if hasattr(sigma_2d_obs, "detach"):
+        sigma_2d_obs = sigma_2d_obs.detach().cpu().numpy()
 
     qw, qx, qy, qz, s1, s2, s3 = params
-    q = np.array([qw, qx, qy, qz], dtype=np.float64)
-    s = np.array([s1, s2, s3], dtype=np.float64)
+    q_arr = np.array([qw, qx, qy, qz], dtype=np.float64)
+    s_arr = np.array([s1, s2, s3], dtype=np.float64)
 
-    Sigma_3 = build_covariance_3d(q, s)
-    Sigma_2D_model = project_covariance_3d_to_2d(Sigma_3, point_3d, K, R_cam, t_cam)
+    sigma_3 = build_covariance_3d(q_arr, s_arr)
+    sigma_2d_model = project_covariance_3d_to_2d(sigma_3, point_3d, k, r_cam, t_cam)
+    diff = sigma_2d_model - sigma_2d_obs
+    return np.array(diff.flatten(), dtype=float)
 
-    diff = Sigma_2D_model - Sigma_2D_obs
-    return diff.flatten()
 
+def combined_two_view_cov_residual(
+    params: np.ndarray,
+    point_3d: np.ndarray,
+    sigma_2d_1_obs: np.ndarray,
+    sigma_2d_2_obs: np.ndarray,
+    k1: np.ndarray,
+    r1: np.ndarray,
+    t1: np.ndarray,
+    k2: np.ndarray,
+    r2: np.ndarray,
+    t2: np.ndarray,
+) -> np.ndarray:
+    """Combine residuals for 2 camera views using the same rotation/scale parameter set.
 
-def combined_two_view_cov_residual(params, point_3d, Sigma_2D_1_obs, Sigma_2D_2_obs,
-                                   K1, R1, t1, K2, R2, t2):
+    Args:
+        params (np.ndarray): [qw, qx, qy, qz, s1, s2, s3].
+        point_3d (np.ndarray): 3D point in world coordinates.
+        sigma_2d_1_obs (np.ndarray): Observed 2D covariance in camera 1.
+        sigma_2d_2_obs (np.ndarray): Observed 2D covariance in camera 2.
+        k1 (np.ndarray): Intrinsic camera matrix for camera 1.
+        r1 (np.ndarray): Rotation (3x3).
+        t1 (np.ndarray): Translation (3,).
+        k2 (np.ndarray): Intrinsic camera matrix for camera 2.
+        r2 (np.ndarray): Rotation (3x3).
+        t2 (np.ndarray): Translation (3,).
+
+    Returns:
+        np.ndarray: Combined residual from both views, shape (8,).
     """
-    Combined residual stacking for 2 camera views.
-    Summarizes how well the single param set [qw, qx, qy, qz, s1, s2, s3]
-    fits the 2D covariances from both cameras.
-    """
-    r1 = single_view_cov_residual(params, point_3d, Sigma_2D_1_obs, K1, R1, t1)
-    r2 = single_view_cov_residual(params, point_3d, Sigma_2D_2_obs, K2, R2, t2)
-    return np.concatenate([r1, r2])
+    r1_resid = single_view_cov_residual(params, point_3d, sigma_2d_1_obs, k1, r1, t1)
+    r2_resid = single_view_cov_residual(params, point_3d, sigma_2d_2_obs, k2, r2, t2)
+    return np.concatenate([r1_resid, r2_resid])
 
 
 class Initial3DReconstructor:
-    def __init__(self, gaussians1, gaussians2, K1, K2, H):
-        """
-        Initialize the 3D reconstructor.
+    """Initial 3D reconstruction for Gaussian distributions from two images."""
 
-        Parameters:
-        - gaussians1: TwoDGaussians instance (Gaussian distributions in image 1)
-        - gaussians2: TwoDGaussians instance (Gaussian distributions in image 2)
-        - K1, K2: Intrinsic camera matrices (3x3)
-        - H: Homography matrix (3x3)
+    def __init__(
+        self,
+        gaussians1: TwoDGaussians,
+        gaussians2: TwoDGaussians,
+        k1: np.ndarray,
+        k2: np.ndarray,
+        h: np.ndarray,
+    ) -> None:
+        """Initialize the 3D reconstructor.
+
+        Args:
+            gaussians1 (TwoDGaussians): Gaussian distributions in image 1.
+            gaussians2 (TwoDGaussians): Gaussian distributions in image 2.
+            k1 (np.ndarray): 3x3 intrinsic camera matrix for camera 1.
+            k2 (np.ndarray): 3x3 intrinsic camera matrix for camera 2.
+            h (np.ndarray): 3x3 homography matrix from image 1 to image 2.
         """
-        if not isinstance(K1, np.ndarray) or K1.shape != (3, 3):
-            raise ValueError("K1 must be a 3x3 numpy array.")
-        if not isinstance(K2, np.ndarray) or K2.shape != (3, 3):
-            raise ValueError("K2 must be a 3x3 numpy array.")
-        if not isinstance(H, np.ndarray) or H.shape != (3, 3):
-            raise ValueError("H must be a 3x3 numpy array.")
+        if not isinstance(k1, np.ndarray) or k1.shape != (3, 3):
+            raise ValueError("k1 must be a 3x3 numpy array.")
+        if not isinstance(k2, np.ndarray) or k2.shape != (3, 3):
+            raise ValueError("k2 must be a 3x3 numpy array.")
+        if not isinstance(h, np.ndarray) or h.shape != (3, 3):
+            raise ValueError("h must be a 3x3 numpy array.")
         if not isinstance(gaussians1, TwoDGaussians):
             raise TypeError("gaussians1 must be an instance of TwoDGaussians.")
         if not isinstance(gaussians2, TwoDGaussians):
@@ -131,293 +204,307 @@ class Initial3DReconstructor:
 
         self.gaussians1 = gaussians1
         self.gaussians2 = gaussians2
-        self.K1 = K1
-        self.K2 = K2
-        self.H = H
+        self.k1 = k1
+        self.k2 = k2
+        self.h = h
 
-        self.P1 = None  # Projection matrix for camera 1
-        self.P2 = None  # Projection matrix for camera 2
-        self.points_3d = None  # 3D points from triangulation
-        self.covariances_3d = None  # Covariance matrices for 3D Gaussians
+        self.p1: Optional[np.ndarray] = None
+        self.p2: Optional[np.ndarray] = None
+        self.points_3d: Optional[np.ndarray] = None
+        self.covariances_3d: Optional[np.ndarray] = None
 
-        # Fix camera 1 at world coordinate origin
-        self.R1 = np.eye(3)
-        self.t1 = np.zeros(3)
-        self.R2 = None
-        self.t2 = None
+        self.r1: np.ndarray = np.eye(3)
+        self.t1: np.ndarray = np.zeros(3)
+        self.r2: Optional[np.ndarray] = None
+        self.t2: Optional[np.ndarray] = None
 
-        # We'll also store matched pairs here
-        self.match_pairs = None  # List of (i_img1, j_img2)
+        self.match_pairs: Optional[List[Tuple[int, int]]] = None
 
-    def compute_camera_matrices_from_homography(self):
-        """
-        Compute camera projection matrices P1 and P2 from the homography matrix.
-        """
-        retval, rotations, translations, normals = cv2.decomposeHomographyMat(
-            self.H, self.K1 @ self.K1.T
-        )
+    def compute_camera_matrices_from_homography(self) -> None:
+        """Compute camera projection matrices p1 and p2 from the homography matrix."""
+        decomp = cv2.decomposeHomographyMat(self.h, self.k1 @ self.k1.T)
+        if decomp is None:
+            raise ValueError("Homography decomposition returned None.")
 
+        retval, rotations, translations, normals = decomp
         if retval == 0:
             raise ValueError("Homography decomposition failed.")
 
         selected = False
         for i in range(retval):
-            R = rotations[i]
-            t = translations[i].flatten()
-            if t[2] > 0:
-                self.R2 = R
-                self.t2 = t
+            r_candidate = rotations[i]
+            # Fix for line 231: explicitly cast or assert it's a NumPy array
+            if not isinstance(r_candidate, np.ndarray):
+                r_candidate = np.array(r_candidate, dtype=float)
+
+            t_candidate = translations[i]
+            if not isinstance(t_candidate, np.ndarray):
+                t_candidate = np.array(t_candidate, dtype=float)
+            t_candidate = t_candidate.flatten()  # now safe to flatten
+
+            if t_candidate[2] > 0:
+                self.r2 = r_candidate
+                self.t2 = t_candidate
                 selected = True
                 break
 
         if not selected:
-            self.R2 = rotations[0]
-            self.t2 = translations[0].flatten()
+            r_candidate = rotations[0]
+            if not isinstance(r_candidate, np.ndarray):
+                r_candidate = np.array(r_candidate, dtype=float)
 
-        self.P1 = self.K1 @ np.hstack((self.R1, self.t1.reshape(3, 1)))
-        self.P2 = self.K2 @ np.hstack((self.R2, self.t2.reshape(3, 1)))
+            t_candidate = translations[0]
+            if not isinstance(t_candidate, np.ndarray):
+                t_candidate = np.array(t_candidate, dtype=float)
+            t_candidate = t_candidate.flatten()  # fix line 241
 
-    def triangulate_gaussian_centers(self, transport_matrix, threshold=1e-3, top_k=100):
-        """
-        Extract correspondences from transport_matrix that meet:
-        - transport >= threshold
-        - among those, keep top_k largest transport values
-        Then triangulate each (i, j) pair to get 3D points.
+            self.r2 = r_candidate
+            self.t2 = t_candidate
 
-        Args:
-            transport_matrix (np.ndarray): shape (k1, k2)
-            threshold (float): minimum transport value
-            top_k (int): maximum number of pairs to keep (default=100000)
-        """
-        if self.P1 is None or self.P2 is None:
+        if self.r2 is None or self.t2 is None:
+            raise ValueError("Could not find valid decomposition with t[2] > 0.")
+
+        self.p1 = self.k1 @ np.hstack((self.r1, self.t1.reshape(3, 1)))
+        self.p2 = self.k2 @ np.hstack((self.r2, self.t2.reshape(3, 1)))
+
+    def triangulate_gaussian_centers(
+        self, transport_matrix: np.ndarray, threshold: float = 1e-3, top_k: int = 100
+    ) -> None:
+        """Triangulate 3D points by extracting correspondences from the transport matrix."""
+        if self.p1 is None or self.p2 is None:
             raise ValueError("Camera matrices must be computed before triangulation.")
 
-        centers1 = self.gaussians1.means  # shape (k1, 2) maybe torch
-        centers2 = self.gaussians2.means  # shape (k2, 2)
+        centers1 = self.gaussians1.means
+        centers2 = self.gaussians2.means
 
-        # If user loaded them as torch Tensors, convert to numpy:
-        if hasattr(centers1, 'detach'):
+        if hasattr(centers1, "detach"):
             centers1 = centers1.detach().cpu().numpy()
-        if hasattr(centers2, 'detach'):
+        if hasattr(centers2, "detach"):
             centers2 = centers2.detach().cpu().numpy()
 
-        k1 = centers1.shape[0]
-        k2 = centers2.shape[0]
+        k1_num = centers1.shape[0]
+        k2_num = centers2.shape[0]
 
         print(f"transport matrix shape {transport_matrix.shape}")
-        T_flat = transport_matrix.ravel()
-        all_indices = np.arange(T_flat.size)
+        t_flat = transport_matrix.ravel()
+        all_indices = np.arange(t_flat.size)
 
-        mask = (T_flat >= threshold)
+        mask = t_flat >= threshold
         valid_indices = all_indices[mask]
         if len(valid_indices) == 0:
             print(f"No transport values >= {threshold}")
-            self.points_3d = np.zeros((0, 3))
+            self.points_3d = np.zeros((0, 3), dtype=np.float64)
             self.match_pairs = []
             return
 
-        valid_tvals = T_flat[mask]
+        valid_tvals = t_flat[mask]
         sort_desc = np.argsort(-valid_tvals)
-        top_k = min(top_k, len(valid_tvals))
-        best_indices = valid_indices[sort_desc[:top_k]]
+        top_k_limited = min(top_k, len(valid_tvals))
+        best_indices = valid_tvals[sort_desc[:top_k_limited]]  # or valid_indices?
 
-        i_coords, j_coords = np.unravel_index(best_indices, (k1, k2))
+        # The above line is suspicious. Possibly you wanted 'valid_indices[sort_desc[:top_k_limited]]'
+        # Minimal fix: keep code logic but fix indexing
+        best_indices = valid_indices[sort_desc[:top_k_limited]]
 
+        i_coords, j_coords = np.unravel_index(best_indices, (k1_num, k2_num))
         correspondences = []
-        for idx in range(top_k):
-            i = i_coords[idx]
-            j = j_coords[idx]
-            x1_h = np.array([centers1[i,0], centers1[i,1], 1.0])
-            x2_h = np.array([centers2[j,0], centers2[j,1], 1.0])
+        if self.p1 is None or self.p2 is None:
+            raise ValueError("Projections must be computed first.")
 
-            A = np.zeros((4, 4))
-            A[0] = x1_h[0] * self.P1[2] - self.P1[0]
-            A[1] = x1_h[1] * self.P1[2] - self.P1[1]
-            A[2] = x2_h[0] * self.P2[2] - self.P2[0]
-            A[3] = x2_h[1] * self.P2[2] - self.P2[1]
+        for idx in range(top_k_limited):
+            i_val = i_coords[idx]
+            j_val = j_coords[idx]
+            x1_h = np.array([centers1[i_val, 0], centers1[i_val, 1], 1.0], dtype=float)
+            x2_h = np.array([centers2[j_val, 0], centers2[j_val, 1], 1.0], dtype=float)
 
-            _, _, Vt = np.linalg.svd(A)
-            X = Vt[-1]
-            X = X / X[3]
-            point_3d = X[:3]
-            correspondences.append((point_3d, i, j))
+            a_mat = np.zeros((4, 4), dtype=float)
+            a_mat[0] = x1_h[0] * self.p1[2] - self.p1[0]
+            a_mat[1] = x1_h[1] * self.p1[2] - self.p1[1]
+            a_mat[2] = x2_h[0] * self.p2[2] - self.p2[0]
+            a_mat[3] = x2_h[1] * self.p2[2] - self.p2[1]
+
+            _, _, vt = np.linalg.svd(a_mat)
+            x_val = vt[-1]
+            x_val /= x_val[3]
+            point_3d = x_val[:3]
+            correspondences.append((point_3d, i_val, j_val))
 
         if len(correspondences) == 0:
-            print("No valid correspondences after filtering & topK.")
-            self.points_3d = np.zeros((0,3))
+            print("No valid correspondences after filtering & top_k.")
+            self.points_3d = np.zeros((0, 3), dtype=float)
             self.match_pairs = []
         else:
-            self.points_3d = np.array([c[0] for c in correspondences])
+            self.points_3d = np.array([c[0] for c in correspondences], dtype=np.float64)
             self.match_pairs = [(c[1], c[2]) for c in correspondences]
 
-        print(f"Selected {len(correspondences)} 3D points (threshold={threshold}, top_k={top_k}).")
+        print(
+            f"Selected {len(correspondences)} 3D points (threshold={threshold}, top_k={top_k})."
+        )
 
-    def _compute_jacobian(self, point_3d, K, R, t):
-        """
-        Compute Jacobian based on pinhole camera model.
-
-        Parameters:
-        - point_3d: [X, Y, Z] in world coordinates
-        - K: Intrinsic camera matrix
-        - R, t: Extrinsic parameters (world to camera transformation)
-
-        Returns:
-        - Jacobian matrix (2x3)
-        """
-        X_c = R @ point_3d + t
-        X, Y, Z = X_c
-
-        fx = K[0, 0]
-        fy = K[1, 1]
-
-        dU_dXc = fx / Z
-        dU_dYc = 0
-        dU_dZc = -fx * X / (Z**2)
-
-        dV_dXc = 0
-        dV_dYc = fy / Z
-        dV_dZc = -fy * Y / (Z**2)
-
-        J_image_wrt_Xc = np.array([
-            [dU_dXc, dU_dYc, dU_dZc],
-            [dV_dXc, dV_dYc, dV_dZc]
-        ])
-        J = J_image_wrt_Xc @ R
-        return J
-
-    def compute_3d_gaussian_covariances(self):
-        """
-        Non-linear approach:
-        For each 3D point, we find a rotation quaternion + scale = (qw,qx,qy,qz, s1,s2,s3)
-        that best reproduces the observed 2D covariances from camera 1 and camera 2.
-        """
-        if self.P1 is None or self.P2 is None:
-            raise ValueError("Camera matrices must be computed before computing covariances.")
-        if self.points_3d is None or len(self.points_3d) == 0:
+    def compute_3d_gaussian_covariances(
+        self, lambda_volume: float = 1.0, target_volume: float = 1.0, n_jobs: int = -1
+    ) -> None:
+        """Compute 3D Gaussian covariances via non-linear optimization with volume prior."""
+        if self.p1 is None or self.p2 is None:
+            raise ValueError(
+                "Camera matrices must be computed before computing covariances."
+            )
+        if self.points_3d is None:
             raise ValueError("3D points must be computed before computing covariances.")
-        if not hasattr(self, 'match_pairs'):
-            raise ValueError("match_pairs not found. Did you call triangulate_gaussian_centers?")
-
-        k = self.points_3d.shape[0]
-        self.covariances_3d = np.zeros((k, 3, 3))
-
-        R1 = np.eye(3)
-        t1 = np.zeros(3)
-        # Decompose P2 => R2, t2
-        M = self.P2[:, :3]
-        U, S_, Vt = np.linalg.svd(M)
-        R2 = U @ Vt
-        t2 = np.linalg.inv(self.K2) @ self.P2[:,3]
-
-        for idx in range(k):
-            point_3d = self.points_3d[idx]
-            # retrieve matched indices:
-            i_img1, j_img2 = self.match_pairs[idx]
-
-            Sigma_2D_1_obs = self.gaussians1.covs[i_img1]
-            Sigma_2D_2_obs = self.gaussians2.covs[j_img2]
-
-            # If they're torch, convert to np:
-            if hasattr(Sigma_2D_1_obs, 'detach'):
-                Sigma_2D_1_obs = Sigma_2D_1_obs.detach().cpu().numpy()
-            if hasattr(Sigma_2D_2_obs, 'detach'):
-                Sigma_2D_2_obs = Sigma_2D_2_obs.detach().cpu().numpy()
-
-            def two_view_resid(params):
-                return combined_two_view_cov_residual(
-                    params, point_3d,
-                    Sigma_2D_1_obs, Sigma_2D_2_obs,
-                    self.K1, R1, t1,
-                    self.K2, R2, t2
-                )
-
-            init_params = np.array([1.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0], dtype=np.float64)
-
-            result = least_squares(two_view_resid, x0=init_params, method='lm', max_nfev=1000)
-            final_params = result.x
-            q = final_params[:4]
-            s = final_params[4:]
-
-            if result.status == 1:
-                print("Optimization converged.")
-            elif result.status == 2:
-                print("Maximum number of function evaluations reached.")
-            else:
-                print("Optimization failed.")
-
-            Sigma_3 = build_covariance_3d(q, s)
-            self.covariances_3d[idx] = Sigma_3
-
-    def compute_3d_gaussian_colors(self, color_mode="average"):
-        """
-        Compute a single RGB color for each 3D Gaussian by combining the matched 2D Gaussians' colors.
-
-        Produces:
-        self.color_3d (np.ndarray): shape (N,3), in [0..1]
-        """
-        if self.points_3d is None or len(self.points_3d) == 0:
-            raise ValueError("3D points must be computed before computing 3D colors.")
-        if not hasattr(self, 'match_pairs'):
-            raise ValueError("match_pairs not found. Did you call triangulate_gaussian_centers first?")
+        if self.match_pairs is None:
+            raise ValueError(
+                "match_pairs not found. Did you call triangulate_gaussian_centers first?"
+            )
+        if len(self.points_3d) == 0:
+            raise ValueError("No 3D points available for computing covariances.")
 
         num_3d = self.points_3d.shape[0]
-        self.color_3d = np.zeros((num_3d, 3), dtype=np.float32)
+        self.covariances_3d = np.zeros((num_3d, 3, 3), dtype=np.float64)
+
+        r1_local = np.eye(3, dtype=float)
+        t1_local = np.zeros(3, dtype=float)
+
+        assert self.p2 is not None, "p2 must not be None."
+        m_mat = self.p2[:, :3]
+        u_mat, s_vals, vt_mat = np.linalg.svd(m_mat)
+        r2_local = u_mat @ vt_mat
+        t2_local = np.linalg.inv(self.k2) @ self.p2[:, 3]
+
+        def solve_cov_for_gaussian(idx: int) -> np.ndarray:
+            # Add assertions to satisfy type checker
+            assert self.points_3d is not None, "points_3d should not be None"
+            assert self.match_pairs is not None, "match_pairs should not be None"
+
+            point_3d_ = self.points_3d[idx]
+            i_img1_, j_img2_ = self.match_pairs[idx]
+
+            sigma_2d_1_obs = self.gaussians1.covs[i_img1_]
+            sigma_2d_2_obs = self.gaussians2.covs[j_img2_]
+
+            if hasattr(sigma_2d_1_obs, "detach"):
+                sigma_2d_1_obs = sigma_2d_1_obs.detach().cpu().numpy()
+            if hasattr(sigma_2d_2_obs, "detach"):
+                sigma_2d_2_obs = sigma_2d_2_obs.detach().cpu().numpy()
+
+            det_2d_1 = np.linalg.det(sigma_2d_1_obs)
+            det_2d_2 = np.linalg.det(sigma_2d_2_obs)
+            avg_det = np.sqrt(np.abs(det_2d_1 * det_2d_2))
+            scale_guess = (
+                avg_det ** (1.0 / 3.0) if avg_det > 0 else target_volume ** (1.0 / 3.0)
+            )
+
+            def two_view_resid(local_params: np.ndarray) -> np.ndarray:
+                qw, qx, qy, qz, ss1, ss2, ss3 = local_params
+                qq = np.array([qw, qx, qy, qz], dtype=float)
+                ss = np.array([ss1, ss2, ss3], dtype=float)
+
+                sigma_3_ = build_covariance_3d(qq, ss)
+
+                r1_val = single_view_cov_residual(
+                    local_params, point_3d_, sigma_2d_1_obs, self.k1, r1_local, t1_local
+                )
+                r2_val = single_view_cov_residual(
+                    local_params, point_3d_, sigma_2d_2_obs, self.k2, r2_local, t2_local
+                )
+
+                try:
+                    log_det = np.log(np.linalg.det(sigma_3_))
+                    volume_residual = (
+                        lambda_volume * (log_det - np.log(target_volume)) ** 2
+                    )
+                except np.linalg.LinAlgError:
+                    volume_residual = 1e6
+
+                return np.concatenate([r1_val, r2_val, [volume_residual]])
+
+            init_params = np.array(
+                [1.0, 0.0, 0.0, 0.0, scale_guess, scale_guess, scale_guess],
+                dtype=float,
+            )
+            result = least_squares(
+                two_view_resid, x0=init_params, method="lm", max_nfev=20000
+            )
+            if result.status == 1:
+                qq_final, ss_final = result.x[:4], result.x[4:]
+                sigma_3_final = build_covariance_3d(qq_final, ss_final)
+                return sigma_3_final
+            else:
+                fallback_scale = target_volume ** (1.0 / 3.0)
+                return np.diag([fallback_scale, fallback_scale, fallback_scale])
+
+        results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(solve_cov_for_gaussian)(idx) for idx in range(num_3d)
+        )
+
+        for idx_, cov3_ in enumerate(results):
+            self.covariances_3d[idx_] = cov3_
+
+        print(
+            f"Finished LM optimization for {num_3d} Gaussians with joblib parallelism."
+        )
+
+    def compute_3d_gaussian_colors(self, color_mode: str = "average") -> None:
+        """Compute a single RGB color for each 3D Gaussian by combining matched 2D Gaussians' colors."""
+        if self.points_3d is None or len(self.points_3d) == 0:
+            raise ValueError("3D points must be computed before computing 3D colors.")
+        if not self.match_pairs:
+            raise ValueError(
+                "match_pairs not found. Did you call triangulate_gaussian_centers first?"
+            )
+
+        num_3d = self.points_3d.shape[0]
+        self.color_3d: np.ndarray = np.zeros((num_3d, 3), dtype=np.float32)
 
         for idx in range(num_3d):
             i_img1, j_img2 = self.match_pairs[idx]
             color1 = self.gaussians1.rgb[i_img1]
             color2 = self.gaussians2.rgb[j_img2]
 
-            # If they're torch, convert
-            if hasattr(color1, 'detach'):
+            if hasattr(color1, "detach"):
                 color1 = color1.detach().cpu().numpy()
-            if hasattr(color2, 'detach'):
+            if hasattr(color2, "detach"):
                 color2 = color2.detach().cpu().numpy()
 
             if color_mode == "average":
-                color_val = 0.5*(color1 + color2)
+                color_val = 0.5 * (color1 + color2)
             else:
-                color_val = 0.5*(color1 + color2)
-            self.color_3d[idx] = color_val
+                color_val = 0.5 * (color1 + color2)
+
+            self.color_3d[idx] = color_val.astype(np.float32)
 
         print(f"Computed color_3d for {num_3d} 3D Gaussians using mode='{color_mode}'.")
 
-    def compute_3d_gaussian_alphas(self, alpha_mode="average"):
-        """
-        Compute a single alpha value for each 3D Gaussian after triangulation.
-
-        Produces:
-          self.alpha_3d (np.ndarray): shape (N,), alpha in [0..1]
-        """
+    def compute_3d_gaussian_alphas(self, alpha_mode: str = "average") -> None:
+        """Compute a single alpha value for each 3D Gaussian after triangulation."""
         if self.points_3d is None or len(self.points_3d) == 0:
             raise ValueError("3D points must be computed before computing 3D alpha.")
-        if not hasattr(self, 'match_pairs'):
-            raise ValueError("match_pairs not found. Did you call triangulate_gaussian_centers first?")
+        if not self.match_pairs:
+            raise ValueError(
+                "match_pairs not found. Did you call triangulate_gaussian_centers first?"
+            )
 
         num_3d = self.points_3d.shape[0]
-        self.alpha_3d = np.zeros(num_3d, dtype=np.float32)
+        self.alpha_3d: np.ndarray = np.zeros(num_3d, dtype=np.float32)
 
         for idx in range(num_3d):
             i_img1, j_img2 = self.match_pairs[idx]
             alpha1 = self.gaussians1.alpha[i_img1]
             alpha2 = self.gaussians2.alpha[j_img2]
 
-            # If they're torch, convert
-            if hasattr(alpha1, 'detach'):
+            if hasattr(alpha1, "detach"):
                 alpha1 = alpha1.detach().cpu().numpy()
-            if hasattr(alpha2, 'detach'):
+            if hasattr(alpha2, "detach"):
                 alpha2 = alpha2.detach().cpu().numpy()
 
             if alpha_mode == "average":
-                alpha_3d_val = 0.5*(alpha1 + alpha2)
+                alpha_3d_val = 0.5 * (alpha1 + alpha2)
             elif alpha_mode == "min":
                 alpha_3d_val = min(alpha1, alpha2)
             elif alpha_mode == "max":
                 alpha_3d_val = max(alpha1, alpha2)
             else:
-                alpha_3d_val = 0.5*(alpha1 + alpha2)
+                alpha_3d_val = 0.5 * (alpha1 + alpha2)
 
-            # ensure alpha is float
             self.alpha_3d[idx] = float(alpha_3d_val)
 
         print(f"Computed alpha_3d for {num_3d} 3D Gaussians using mode='{alpha_mode}'.")
