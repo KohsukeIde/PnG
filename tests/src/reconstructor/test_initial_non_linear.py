@@ -320,34 +320,51 @@ def project_covariance_3d_to_2d(sigma_3, point_3d, k_val, r_cam, t_cam):
 
 
 def test_3d_to_2d_and_back_non_linear():
-    """Check that if we start with a known 3D Gaussian, project it into 2D for two cameras,
-    and run the inverse approach, we can recover a 3D Gaussian close to the original.
-    """
+    """Test the complete pipeline of projecting a 3D Gaussian to 2D views and reconstructing back to 3D."""
     rng = np.random.default_rng(seed=42)
-    random_quat = Rotation.random(random_state=rng).as_quat()  # [qx, qy, qz, qw]
+
+    # Generate a random rotation using quaternions
+    # scipy.spatial.transform.Rotation.random() returns [qx, qy, qz, qw]
+    random_quat = Rotation.random(random_state=rng).as_quat()
     qx, qy, qz, qw = random_quat
+
+    # Reorder quaternion components to [qw, qx, qy, qz] format for our quaternion_to_rotation function
     q_val = np.array([qw, qx, qy, qz])
+
+    # Generate random scale values between 1.0 and 4.0 for X, Y, Z dimensions
     s_val = rng.uniform(1.0, 4.0, size=3)
+
+    # Build the true 3D covariance matrix using rotation and scale
     sigma_3_true = build_covariance_3d(q_val, s_val)
 
-    r1 = np.eye(3)
-    t1 = np.zeros(3)
-    angle = np.radians(50.0)
+    # Set up first camera (camera 1) at origin
+    r1 = np.eye(3)  # Identity rotation matrix (no rotation)
+    t1 = np.zeros(3)  # No translation (at origin)
+
+    # Set up second camera (camera 2) with rotation and translation
+    angle = np.radians(50.0)  # Convert 50 degrees to radians
+    # Create rotation matrix for camera 2 (rotation around Y axis)
     r2 = np.array(
         [
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)],
+            [np.cos(angle), 0, np.sin(angle)],  # First row
+            [0, 1, 0],  # Second row (Y axis unchanged)
+            [-np.sin(angle), 0, np.cos(angle)],  # Third row
         ]
     )
+    # Translate camera 2 along X axis
     t2 = np.array([2.0, 0.0, 0.0])
 
-    fx = 800.0
-    fy = 800.0
+    # Set up camera intrinsic parameters
+    fx = 800.0  # Focal length in x direction
+    fy = 800.0  # Focal length in y direction
+    # Create camera calibration matrices (same for both cameras)
     k1 = np.array([[fx, 0, 0], [0, fy, 0], [0, 0, 1]])
     k2 = np.array([[fx, 0, 0], [0, fy, 0], [0, 0, 1]])
 
-    point_3d = np.array([3.0, 0.0, 8.0])
+    # Define 3D point location
+    point_3d = np.array([3.0, 0.0, 8.0])  # Point is 3 units right, 8 units forward
+
+    # Project 3D covariance to 2D in both camera views
     sigma_2d_1_obs = project_covariance_3d_to_2d(sigma_3_true, point_3d, k1, r1, t1)
     sigma_2d_2_obs = project_covariance_3d_to_2d(sigma_3_true, point_3d, k2, r2, t2)
 
@@ -361,34 +378,53 @@ def test_3d_to_2d_and_back_non_linear():
     mean2d_1 = project_point(point_3d, k1, r1, t1)
     mean2d_2 = project_point(point_3d, k2, r2, t2)
 
+    # Create 2D Gaussian for first camera view (red color)
     gaussians1 = TwoDGaussians(
-        means=np.array([mean2d_1]),
-        covs=np.array([sigma_2d_1_obs]),
-        rgb=np.array([[1.0, 0.0, 0.0]]),
-        alpha=np.array([1.0]),
-        rotations=np.array([0.0]),
-        scales=np.array([[1.0, 1.0]]),
-    )
-    gaussians2 = TwoDGaussians(
-        means=np.array([mean2d_2]),
-        covs=np.array([sigma_2d_2_obs]),
-        rgb=np.array([[0.0, 1.0, 0.0]]),
-        alpha=np.array([1.0]),
-        rotations=np.array([0.0]),
-        scales=np.array([[1.0, 1.0]]),
+        means=np.array([mean2d_1]),  # 2D projected point
+        covs=np.array([sigma_2d_1_obs]),  # 2D projected covariance
+        rgb=np.array([[1.0, 0.0, 0.0]]),  # Red color
+        alpha=np.array([1.0]),  # Full opacity
+        rotations=np.array([0.0]),  # No additional rotation
+        scales=np.array([[1.0, 1.0]]),  # Unit scale
     )
 
+    # Create 2D Gaussian for second camera view (green color)
+    gaussians2 = TwoDGaussians(
+        means=np.array([mean2d_2]),  # 2D projected point
+        covs=np.array([sigma_2d_2_obs]),  # 2D projected covariance
+        rgb=np.array([[1.0, 0.0, 0.0]]),  # Green color
+        alpha=np.array([1.0]),  # Full opacity
+        rotations=np.array([0.0]),  # No additional rotation
+        scales=np.array([[1.0, 1.0]]),  # Unit scale
+    )
+
+    # Create identity homography (not used in this test)
     h_fake = np.eye(3)
+
+    # Initialize the 3D reconstructor with our 2D Gaussians
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, k1, k2, h_fake)
 
+    # Set the camera projection matrices
+    # Format is K[R|t] for each camera
     reconstructor.p1 = k1 @ np.hstack((r1, t1.reshape(3, 1)))
     reconstructor.p2 = k2 @ np.hstack((r2, t2.reshape(3, 1)))
 
+    # Set the known 3D point (in real use, this would be computed via triangulation)
     reconstructor.points_3d = np.array([point_3d])
+
+    # Set matching pairs between views (in this case, just one pair: point 0 matches point 0)
     reconstructor.match_pairs = [(0, 0)]
 
+    # Compute 3D Gaussian covariances
+    # lambda_volume=0.0: no volume regularization
+    # target_volume=1.0: target volume constraint (not used when lambda=0)
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=0.0, target_volume=1.0)
+
+    # Get the reconstructed 3D covariance
     sigma_3_reconstructed = reconstructor.covariances_3d[0]
+
+    # Verify that reconstructed covariance matches the original
+    # Allow for small numerical differences (atol=1e-2)
     assert np.allclose(
         sigma_3_reconstructed, sigma_3_true, atol=1e-2
     ), "Reconstructed covariance does not match true covariance."
