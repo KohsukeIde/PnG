@@ -71,8 +71,7 @@ def project_covariance_3d_to_2d(
     t_cam: np.ndarray,
 ) -> np.ndarray:
     """Project a 3D covariance sigma_3 to 2D using the local Jacobian approximation.
-    Given a 3D covariance Sigma_3, project it to 2D:
-    Sigma_2D = J * R_cam * Sigma_3 * R_cam^T * J^T
+    Given a 3D covariance Sigma_3, project it to 2D: Sigma_2D = J * R_cam * Sigma_3 * R_cam^T * J^T.
 
     J is the local Jacobian of the pinhole projection at the 3D point's camera coords.
     R_cam, t_cam define the transform from world to camera coordinates.
