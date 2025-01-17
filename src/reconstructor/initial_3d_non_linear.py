@@ -428,6 +428,9 @@ class Initial3DReconstructor:
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
                 return sigma_3_final
             else:
+                print(
+                    f"Failed to optimize covariance for Gaussian {idx}, using fallback scale."
+                )
                 fallback_scale = target_volume ** (1.0 / 3.0)
                 return np.diag([fallback_scale, fallback_scale, fallback_scale])
 
