@@ -29,7 +29,7 @@ def generate_covariances_from_rotations_and_scales(rotations, scales):
 
 
 ########################################
-# Existing Tests
+# Tests excluding 3D->2D->3D round-trip
 ########################################
 
 
@@ -188,19 +188,35 @@ def test_triangulate_gaussian_centers():
 
     transport_matrix = np.eye(k_val)
     reconstructor.triangulate_gaussian_centers(transport_matrix)
-    reconstructor.compute_3d_gaussian_covariances()
 
+    # Assert that the shape of the reconstructed 3D points array is (k_val, 3),
+    # meaning there are k_val points, each with 3 coordinates (x, y, z).
     assert reconstructor.points_3d.shape == (k_val, 3)
 
+    # Loop over each Gaussian center to verify the triangulation results.
     for i in range(k_val):
+        # Get the i-th 3D point from the reconstructed points.
         point_3d = reconstructor.points_3d[i]
+
+        # Convert the 3D point to homogeneous coordinates by appending a 1.
         x_hom = np.hstack((point_3d, 1))
+
+        # Project the 3D point into the first camera's 2D image plane using the camera matrix p1.
         x1_proj = reconstructor.p1 @ x_hom
+
+        # Normalize the projected point by dividing by the third (homogeneous) coordinate.
         x1_proj /= x1_proj[2]
+
+        # Project the 3D point into the second camera's 2D image plane using the camera matrix p2.
         x2_proj = reconstructor.p2 @ x_hom
+
+        # Normalize the projected point by dividing by the third (homogeneous) coordinate.
         x2_proj /= x2_proj[2]
 
+        # Assert that the projected 2D point in the first camera matches the original 2D Gaussian mean.
         np.testing.assert_allclose(x1_proj[:2], gaussians1.means[i], atol=1e-5)
+
+        # Assert that the projected 2D point in the second camera matches the original 2D Gaussian mean.
         np.testing.assert_allclose(x2_proj[:2], gaussians2.means[i], atol=1e-5)
 
 
@@ -392,7 +408,7 @@ def test_3d_to_2d_and_back_non_linear():
     gaussians2 = TwoDGaussians(
         means=np.array([mean2d_2]),  # 2D projected point
         covs=np.array([sigma_2d_2_obs]),  # 2D projected covariance
-        rgb=np.array([[1.0, 0.0, 0.0]]),  # Green color
+        rgb=np.array([[1.0, 0.0, 0.0]]),  # Red color
         alpha=np.array([1.0]),  # Full opacity
         rotations=np.array([0.0]),  # No additional rotation
         scales=np.array([[1.0, 1.0]]),  # Unit scale
