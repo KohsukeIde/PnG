@@ -222,6 +222,8 @@ class Initial3DReconstructor:
     def compute_camera_matrices_from_homography(self) -> None:
         """Compute camera projection matrices p1 and p2 from the homography matrix."""
         decomp = cv2.decomposeHomographyMat(self.h, self.k1 @ self.k1.T)
+        # decomp = cv2.decomposeHomographyMat(self.h, self.k1)
+
         if decomp is None:
             raise ValueError("Homography decomposition returned None.")
 
@@ -232,14 +234,13 @@ class Initial3DReconstructor:
         selected = False
         for i in range(retval):
             r_candidate = rotations[i]
-            # Fix for line 231: explicitly cast or assert it's a NumPy array
             if not isinstance(r_candidate, np.ndarray):
                 r_candidate = np.array(r_candidate, dtype=float)
 
             t_candidate = translations[i]
             if not isinstance(t_candidate, np.ndarray):
                 t_candidate = np.array(t_candidate, dtype=float)
-            t_candidate = t_candidate.flatten()  # now safe to flatten
+            t_candidate = t_candidate.flatten()
 
             if t_candidate[2] > 0:
                 self.r2 = r_candidate
@@ -255,7 +256,7 @@ class Initial3DReconstructor:
             t_candidate = translations[0]
             if not isinstance(t_candidate, np.ndarray):
                 t_candidate = np.array(t_candidate, dtype=float)
-            t_candidate = t_candidate.flatten()  # fix line 241
+            t_candidate = t_candidate.flatten()
 
             self.r2 = r_candidate
             self.t2 = t_candidate
@@ -299,10 +300,7 @@ class Initial3DReconstructor:
         valid_tvals = t_flat[mask]
         sort_desc = np.argsort(-valid_tvals)
         top_k_limited = min(top_k, len(valid_tvals))
-        best_indices = valid_tvals[sort_desc[:top_k_limited]]  # or valid_indices?
 
-        # The above line is suspicious. Possibly you wanted 'valid_indices[sort_desc[:top_k_limited]]'
-        # Minimal fix: keep code logic but fix indexing
         best_indices = valid_indices[sort_desc[:top_k_limited]]
 
         i_coords, j_coords = np.unravel_index(best_indices, (k1_num, k2_num))
@@ -344,6 +342,7 @@ class Initial3DReconstructor:
         self, lambda_volume: float = 1.0, target_volume: float = 1.0, n_jobs: int = -1
     ) -> None:
         """Compute 3D Gaussian covariances via non-linear optimization with volume prior."""
+        # Ensure that camera matrices and 3D points are available before proceeding
         if self.p1 is None or self.p2 is None:
             raise ValueError(
                 "Camera matrices must be computed before computing covariances."
@@ -357,13 +356,18 @@ class Initial3DReconstructor:
         if len(self.points_3d) == 0:
             raise ValueError("No 3D points available for computing covariances.")
 
+        # Initialize an array to store the 3D covariance matrices for each point
         num_3d = self.points_3d.shape[0]
         self.covariances_3d = np.zeros((num_3d, 3, 3), dtype=np.float64)
 
+        # Set up local camera parameters for the first camera (identity rotation and zero translation)
         r1_local = np.eye(3, dtype=float)
         t1_local = np.zeros(3, dtype=float)
 
+        # Ensure the second camera matrix is not None
         assert self.p2 is not None, "p2 must not be None."
+
+        # Decompose the second camera matrix to extract rotation and translation
         m_mat = self.p2[:, :3]
         u_mat, s_vals, vt_mat = np.linalg.svd(m_mat)
         r2_local = u_mat @ vt_mat
@@ -374,17 +378,21 @@ class Initial3DReconstructor:
             assert self.points_3d is not None, "points_3d should not be None"
             assert self.match_pairs is not None, "match_pairs should not be None"
 
+            # Get the 3D point and corresponding 2D Gaussian indices
             point_3d_ = self.points_3d[idx]
             i_img1_, j_img2_ = self.match_pairs[idx]
 
+            # Retrieve observed 2D covariance matrices for the Gaussian
             sigma_2d_1_obs = self.gaussians1.covs[i_img1_]
             sigma_2d_2_obs = self.gaussians2.covs[j_img2_]
 
+            # Convert PyTorch tensors to NumPy arrays if necessary
             if hasattr(sigma_2d_1_obs, "detach"):
                 sigma_2d_1_obs = sigma_2d_1_obs.detach().cpu().numpy()
             if hasattr(sigma_2d_2_obs, "detach"):
                 sigma_2d_2_obs = sigma_2d_2_obs.detach().cpu().numpy()
 
+            # Compute the determinant of the 2D covariances and estimate a scale guess
             det_2d_1 = np.linalg.det(sigma_2d_1_obs)
             det_2d_2 = np.linalg.det(sigma_2d_2_obs)
             avg_det = np.sqrt(np.abs(det_2d_1 * det_2d_2))
@@ -393,12 +401,15 @@ class Initial3DReconstructor:
             )
 
             def two_view_resid(local_params: np.ndarray) -> np.ndarray:
+                # Extract quaternion and scale parameters
                 qw, qx, qy, qz, ss1, ss2, ss3 = local_params
                 qq = np.array([qw, qx, qy, qz], dtype=float)
                 ss = np.array([ss1, ss2, ss3], dtype=float)
 
+                # Build the 3D covariance matrix from the parameters
                 sigma_3_ = build_covariance_3d(qq, ss)
 
+                # Compute residuals for each camera view
                 r1_val = single_view_cov_residual(
                     local_params, point_3d_, sigma_2d_1_obs, self.k1, r1_local, t1_local
                 )
@@ -406,23 +417,31 @@ class Initial3DReconstructor:
                     local_params, point_3d_, sigma_2d_2_obs, self.k2, r2_local, t2_local
                 )
 
+                # Compute volume residual using the log determinant of the 3D covariance
                 try:
                     log_det = np.log(np.linalg.det(sigma_3_))
                     volume_residual = (
                         lambda_volume * (log_det - np.log(target_volume)) ** 2
                     )
                 except np.linalg.LinAlgError:
-                    volume_residual = 1e6
+                    print("Singular matrix")
+                    volume_residual = 1e-6
 
+                # Return concatenated residuals for optimization
                 return np.concatenate([r1_val, r2_val, [volume_residual]])
 
+            # Initialize parameters for optimization
             init_params = np.array(
                 [1.0, 0.0, 0.0, 0.0, scale_guess, scale_guess, scale_guess],
                 dtype=float,
             )
+
+            # Perform non-linear least squares optimization
             result = least_squares(
                 two_view_resid, x0=init_params, method="lm", max_nfev=20000
             )
+
+            # Check optimization result and return the final 3D covariance
             if result.status == 1:
                 qq_final, ss_final = result.x[:4], result.x[4:]
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
@@ -431,13 +450,15 @@ class Initial3DReconstructor:
                 print(
                     f"Failed to optimize covariance for Gaussian {idx}, using fallback scale."
                 )
-                fallback_scale = target_volume ** (1.0 / 3.0)
+                fallback_scale = target_volume
                 return np.diag([fallback_scale, fallback_scale, fallback_scale])
 
+        # Use joblib to parallelize the optimization across multiple Gaussians
         results = Parallel(n_jobs=n_jobs, verbose=10)(
             delayed(solve_cov_for_gaussian)(idx) for idx in range(num_3d)
         )
 
+        # Store the optimized 3D covariances
         for idx_, cov3_ in enumerate(results):
             self.covariances_3d[idx_] = cov3_
 
