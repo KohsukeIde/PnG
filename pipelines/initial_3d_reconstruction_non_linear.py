@@ -163,7 +163,8 @@ def save_point_cloud_as_ply(points, filename):
 ########################
 # 4) OPTIONAL: Project 3D Gaussians back to 2D
 ########################
-def render_gaussians_to_2d_splat(
+
+def render_gaussians_pure_mixture(
     points_3d,
     covariances_3d,
     color_3d,
@@ -176,67 +177,71 @@ def render_gaussians_to_2d_splat(
     splat_radius_factor=3.0
 ):
     """
-    Render 3D Gaussians into a 2D image with alpha blending (splatting).
-    - points_3d (N,3): 3D means in world coords
-    - covariances_3d (N,3,3): 3D cov in world coords
-    - color_3d (N,3): color in [0..1]
-    - alpha_3d (N,): alpha in [0..1]
-    - R_cam, t_cam: extrinsic transform from world->camera
-    - K (3,3): intrinsics
-    - out_width, out_height: size of output image
-    - splat_radius_factor: #std dev radii in 2D bounding region
-
+    Render 3D Gaussians into a 2D image with a 'pure mixture' approach.
+    Instead of alpha compositing, we accumulate:
+       weight_buffer[py, px] += gauss_val
+       color_buffer[py, px] += gauss_val * color_i
+    Then final_pixel_color = color_buffer / weight_buffer (if weight_buffer>0).
+    
+    Args:
+        points_3d      : shape (N,3)
+        covariances_3d: shape (N,3,3)
+        color_3d       : shape (N,3) in [0..1]
+        alpha_3d       : shape (N,) in [0..1] – you can also incorporate alpha if desired
+        R_cam, t_cam   : extrinsic transform from world->camera
+        K             : intrinsics
+        out_width, out_height: image size
+        splat_radius_factor  : # std dev radius for bounding region
     Returns:
-        A float32 RGBA image (H,W,4) in [0..1].
+        mixture_img (H,W,3) float32 in [0..1]  # pure mixture of colors
+        coverage_img (H,W)  float32 in [0..something]  # sum of Gauss weights
     """
-    # Create an RGBA buffer: shape (H, W, 4)
-    rendered_rgba = np.zeros((out_height, out_width, 4), dtype=np.float32)
+
+    # Buffers for accumulation
+    weight_buffer = np.zeros((out_height, out_width), dtype=np.float32)
+    color_buffer  = np.zeros((out_height, out_width, 3), dtype=np.float32)
 
     fx, fy = K[0,0], K[1,1]
     cx, cy = K[0,2], K[1,2]
 
-    for i in tqdm(range(points_3d.shape[0]), desc="Rendering Gaussians"):
+    for i in tqdm(range(points_3d.shape[0]), desc="Rendering Gaussians (pure mixture)"):
         X_w = points_3d[i]
         Sigma_3 = covariances_3d[i]
-        rgb = color_3d[i]     # e.g. [r, g, b]
-        a3 = alpha_3d[i]      # single alpha
+        rgb = color_3d[i]  # [r,g,b] in [0..1]
+        # alpha can be used if you want to scale the amplitude or ignore it.
 
-        # World->camera
+        # Transform to camera coords
         X_c = R_cam @ X_w + t_cam
-        if X_c[2] < 1e-6:
-            continue  # behind camera or degenerate
+        if X_c[2] <= 1e-6:
+            continue
 
-        # Project to 2D
-        u = fx * (X_c[0]/X_c[2]) + cx
-        v = fy * (X_c[1]/X_c[2]) + cy
+        # Project center
+        u = fx*(X_c[0]/X_c[2]) + cx
+        v = fy*(X_c[1]/X_c[2]) + cy
 
         px_center = int(np.round(u))
         py_center = int(np.round(v))
-
-        # Skip if center is fully out of the image
         if px_center<0 or px_center>=out_width or py_center<0 or py_center>=out_height:
             continue
 
-        # Cov in camera coords => Sigma_cam = R_cam * Sigma_3 * R_cam^T
+        # Sigma_3 -> Sigma_cam
         Sigma_cam = R_cam @ Sigma_3 @ R_cam.T
 
-        # Local Jacobian J (2x3)
+        # local Jacobian
         X, Y, Z = X_c
         J = np.array([
-            [fx/Z,    0.0,  -fx*X/(Z**2)],
-            [0.0,    fy/Z,  -fy*Y/(Z**2)]
+            [fx/Z,     0.0,   -fx*X/(Z**2)],
+            [0.0,     fy/Z,   -fy*Y/(Z**2)]
         ], dtype=np.float32)
 
-        # 2D covariance
         Sigma_2D = J @ Sigma_cam @ J.T
         e_vals, e_vecs = np.linalg.eig(Sigma_2D)
         e_vals = np.clip(e_vals, 1e-12, None)
         std_x = np.sqrt(e_vals[0])
         std_y = np.sqrt(e_vals[1])
 
-        # bounding region in pixel coords
-        radius_x = int(np.ceil(std_x*splat_radius_factor))
-        radius_y = int(np.ceil(std_y*splat_radius_factor))
+        radius_x = int(np.ceil(std_x * splat_radius_factor))
+        radius_y = int(np.ceil(std_y * splat_radius_factor))
 
         min_x = max(px_center - radius_x, 0)
         max_x = min(px_center + radius_x, out_width-1)
@@ -251,27 +256,141 @@ def render_gaussians_to_2d_splat(
                 dy = py - v
                 disp = np.array([dx, dy], dtype=np.float32)
                 val = disp @ inv_Sigma_2D @ disp
-                gauss_val = np.exp(-0.5*val)  # unnormalized, but good enough for alpha splat
+                gauss_val = np.exp(-0.5*val)
+                # If you'd like to incorporate alpha as amplitude, do gauss_val *= alpha_3d[i]
 
-                alpha_local = gauss_val * a3  # alpha coverage
+                # Accumulate in the mixture sense
+                weight_buffer[py, px] += gauss_val
+                color_buffer[py, px]  += (gauss_val * rgb)
 
-                old_rgba = rendered_rgba[py, px]
-                old_rgb = old_rgba[:3]
-                old_a   = old_rgba[3]
+    # finalize
+    mixture_img = np.zeros((out_height, out_width, 3), dtype=np.float32)
+    mask = (weight_buffer > 1e-12)
+    mixture_img[mask] = color_buffer[mask] / weight_buffer[mask][...,None]  # broadcast
 
-                new_rgb = rgb * gauss_val
-                new_a   = alpha_local
+    return mixture_img, weight_buffer
 
-                out_a = new_a + old_a*(1.0 - new_a)
-                if out_a < 1e-8:
-                    continue
+# === ADDED for camera frustum ===
+def create_camera_frustum_mesh(
+    K,
+    R_world2cam,
+    t_world2cam,
+    color=(1.0, 0.0, 0.0),
+    alpha=1.0,
+    near_z=0.1,
+    far_z=0.5,
+    scale_fov=1.0
+):
+    """
+    Create a simple triangular mesh representing the camera frustum (pyramid).
+    - K: Intrinsic (3x3), typically [fx, 0, cx; 0, fy, cy; 0,0,1]
+    - R_world2cam, t_world2cam: The extrinsic that maps world->camera. 
+      If you have camera1.R, camera1.t as world->cam, 
+      then the camera center in world coords is C = -R^T * t.
+    - color, alpha: color in [0..1], alpha in [0..1]
+    - near_z, far_z: position of near-plane and far-plane in camera coords (z>0)
+    - scale_fov: to scale the pyramid size if you want bigger/smaller frustum
 
-                out_rgb = (new_rgb*new_a + old_rgb*old_a*(1.0-new_a)) / out_a
+    Returns:
+        frustum_vertices: list of np.array([x,y,z,r,g,b,a]) shape=(N,)
+        frustum_faces   : list of [v1,v2,v3] index triplets
+    """
 
-                rendered_rgba[py, px, :3] = out_rgb
-                rendered_rgba[py, px, 3]  = out_a
+    # 1) Invert (R,t) to get camera pose as cam->world
+    #    Because R_world2cam * X_world + t_world2cam = X_cam
+    #    => X_world = R_cam2world * X_cam + t_cam2world
+    R_cam2world = R_world2cam.T
+    t_cam2world = -R_world2cam.T @ t_world2cam
 
-    return rendered_rgba
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+
+    # 2) Define corners in camera coords
+    #    near-plane corners (z=near_z), far-plane corners (z=far_z)
+    #    We assume image-plane corners are ~ (0..w, 0..h) in pixel,
+    #    but let's do it analytically from fx,fy,cx,cy.
+    #    x = (u - cx)/fx * z, y = (v - cy)/fy * z (assuming no skew).
+    #    For simplicity, define "image corners" as 0..(2*cx), 0..(2*cy) in pixel.
+    #    or we can pick e.g. [0, 2*cx] => that is effectively the width in pixel coords.
+
+    # near-plane
+    corners_cam = []
+    for zval in [near_z, far_z]:
+        # 4 corners in pixel coords (u,v)
+        uvs = [
+            (0, 0),
+            (2*cx, 0),
+            (2*cx, 2*cy),
+            (0, 2*cy),
+        ]
+        for (u,v) in uvs:
+            x = (u - cx)/fx * zval
+            y = (v - cy)/fy * zval
+            corners_cam.append(np.array([x, y, zval], dtype=np.float32))
+    # corners_cam[0..3] => near-plane corners
+    # corners_cam[4..7] => far-plane corners
+
+    corners_cam = np.array(corners_cam)
+    # optionally scale the FOV:
+    corners_cam[:, :2] *= scale_fov
+
+    # 3) Transform corners_cam to world coords
+    corners_world = []
+    for cc in corners_cam:
+        cw = R_cam2world @ cc + t_cam2world
+        corners_world.append(cw)
+
+    corners_world = np.array(corners_world)  # shape (8,3)
+
+    # Also define the camera center itself
+    camera_center = t_cam2world  # shape (3,)
+
+    # 4) Build vertices array (with color + alpha)
+    #    We will have 1 center + 8 corners = 9 points
+    #    (center) = index 0
+    #    near-plane corners = index 1..4
+    #    far-plane corners  = index 5..8
+    def make_vert_xyzrgba(xyz):
+        return np.array([xyz[0], xyz[1], xyz[2], color[0], color[1], color[2], alpha], dtype=np.float32)
+
+    frustum_vertices = []
+    frustum_vertices.append(make_vert_xyzrgba(camera_center))  # index 0
+    for i in range(8):
+        frustum_vertices.append(make_vert_xyzrgba(corners_world[i]))  # index i+1
+
+    # 5) Build faces
+    #    We'll connect camera_center -> near-plane edges
+    #                   camera_center -> far-plane edges
+    #    Then optionally connect near-plane + far-plane as "side" rectangles.
+    #    For simplicity, we can do a pyramid from center to the four corners of far-plane,
+    #    or connect near-plane edges as well.
+
+    # Here let's connect center -> near-plane corners => 4 triangles
+    # near-plane corners = 1..4
+    frustum_faces = []
+    for i in range(4):
+        i0 = 0          # camera center
+        i1 = 1 + i      # corner i
+        i2 = 1 + ((i+1) % 4)  # next corner (wrap around)
+        frustum_faces.append([i0, i1, i2])
+
+    # Similarly connect center -> far-plane corners => 4 triangles
+    for i in range(4):
+        i0 = 0
+        i1 = 5 + i
+        i2 = 5 + ((i+1) % 4)
+        frustum_faces.append([i0, i1, i2])
+
+    # Then optionally connect near-plane ring => 2 triangles
+    frustum_faces.append([1,2,3])
+    frustum_faces.append([1,3,4])
+
+    # connect far-plane ring => 2 triangles
+    frustum_faces.append([5,6,7])
+    frustum_faces.append([5,7,8])
+
+    return frustum_vertices, frustum_faces
+
 
 
 
@@ -339,7 +458,7 @@ def main():
         k1=K1,
         k2=K2,
         epsilon=0.1,
-        lambda_mean=1.0,
+        lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=1.0,
         lambda_alpha=1.0,
@@ -392,6 +511,35 @@ def main():
     reconstructor.compute_3d_gaussian_colors(color_mode="average")
     reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
 
+    # ##############################
+    # # 10) Build ellipsoids => PLY
+    # ##############################
+    # all_vertices = []
+    # all_faces = []
+    # n_theta, n_phi = 12, 12
+
+    # for i in range(points_3d.shape[0]):
+    #     center = points_3d[i]
+    #     Sigma_3 = reconstructor.covariances_3d[i]
+    #     c3 = reconstructor.color_3d[i]   # [r,g,b] in [0..1]
+    #     a3 = reconstructor.alpha_3d[i]   # alpha in [0..1]
+
+    #     raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
+    #     extended_vertices = []
+    #     for vert in raw_vertices:
+    #         # (x, y, z, r, g, b, a)
+    #         combo = np.concatenate([vert, c3, [a3]])
+    #         extended_vertices.append(combo)
+
+    #     all_vertices.append(extended_vertices)
+    #     all_faces.append(faces)
+
+    # # Save ellipsoids with alpha channel
+    # ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
+    # save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
+    
+    
+    
     ##############################
     # 10) Build ellipsoids => PLY
     ##############################
@@ -415,9 +563,47 @@ def main():
         all_vertices.append(extended_vertices)
         all_faces.append(faces)
 
-    # Save ellipsoids with alpha channel
-    ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
-    # save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
+    # === ADDED for camera frustum ===
+    # 10A) Camera1のR,t (world->cam) を取得
+    R1 = camera1.R_wc  # world->camera
+    t1 = camera1.t_wc  # shape (3,)
+
+    # カメラフラスタムを作成して追加
+    frustum_color = (0.0, 1.0, 0.0)  # 緑
+    frustum_alpha = 1.0
+    camera1_frustum_verts, camera1_frustum_faces = create_camera_frustum_mesh(
+        K=camera1.K,
+        R_world2cam=R1,
+        t_world2cam=t1,
+        color=frustum_color,
+        alpha=frustum_alpha,
+        near_z=0.1,
+        far_z=0.4,     # お好みで
+        scale_fov=1000.0  # お好みで
+    )
+    all_vertices.append(camera1_frustum_verts)
+    all_faces.append(camera1_frustum_faces)
+
+    # （camera2も表示したい場合は同様に作る）
+    R2 = camera2.R_wc
+    t2 = camera2.t_wc
+    frustum_color2 = (0.0, 0.0, 1.0)  # 青
+    camera2_frustum_verts, camera2_frustum_faces = create_camera_frustum_mesh(
+        K=camera2.K,
+        R_world2cam=R2,
+        t_world2cam=t2,
+        color=frustum_color2,
+        alpha=frustum_alpha,
+        near_z=100,
+        far_z=400,
+        scale_fov=1000.0
+    )
+    all_vertices.append(camera2_frustum_verts)
+    all_faces.append(camera2_frustum_faces)
+
+    # もしPLYに書き出すならここで:
+    ply_out = os.path.join('results', '3d_gaussians_ellipsoids_withCams.ply')
+    save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
 
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
@@ -427,13 +613,8 @@ def main():
         # 11) Optionally render 3D Gaussians to 2D
         print("\n--- Rendering 3D Gaussians back into camera1's 2D image (alpha-blend) ---")
 
-        # Suppose camera1 has R, t => If not, fallback to identity or from colmap extrinsics
-        if hasattr(camera1, 'R') and hasattr(camera1, 't'):
-            R_cam = camera1.R
-            t_cam = camera1.t
-        else:
-            R_cam = np.eye(3)
-            t_cam = np.zeros(3)
+        R_cam = np.eye(3)
+        t_cam = np.zeros(3)
 
         # Output image resolution => e.g. match camera1's size
         out_width  = int(camera1.K[0,2]*2)  # if center is at K[0,2]
@@ -441,24 +622,32 @@ def main():
 
         # Now call the splat function
 
-        rendered_rgba = render_gaussians_to_2d_splat(
-            points_3d     = reconstructor.points_3d,
-            covariances_3d= reconstructor.covariances_3d,
-            color_3d      = reconstructor.color_3d,
-            alpha_3d      = reconstructor.alpha_3d,
-            R_cam         = R_cam,
-            t_cam         = t_cam,
-            K             = camera1.K,
-            out_width     = out_width,
-            out_height    = out_height,
-            splat_radius_factor=3.0
+        mixture_img, coverage_img = render_gaussians_pure_mixture(
+            points_3d=reconstructor.points_3d,
+            covariances_3d=reconstructor.covariances_3d,
+            color_3d=reconstructor.color_3d,
+            alpha_3d=reconstructor.alpha_3d,
+            R_cam=R_cam,
+            t_cam=t_cam,
+            K=camera1.K,
+            out_width=out_width,
+            out_height=out_height,
         )
 
-        # Convert float RGBA [0..1] => 8-bit BGRA or RGBA
+        # # Convert float RGBA [0..1] => 8-bit BGRA or RGBA
+        # rendered_8u = np.clip(rendered_rgba*255.0, 0, 255).astype(np.uint8)
+        
+        
+        rendered_rgba = np.zeros((out_height, out_width, 4), dtype=np.float32)
+        rendered_rgba[..., :3] = mixture_img  # RGB channels
+        rendered_rgba[..., 3] = coverage_img  # Alpha channel
+
+        # 8ビット画像に変換
         rendered_8u = np.clip(rendered_rgba*255.0, 0, 255).astype(np.uint8)
-        # If using OpenCV, typically BGR or BGRA => let's do RGBA->BGRA for saving
-        # Make sure we have 4 channels => shape(H,W,4)
-        # Then convert RGBA->BGRA so cv2 will not mix color
+        
+        # # If using OpenCV, typically BGR or BGRA => let's do RGBA->BGRA for saving
+        # # Make sure we have 4 channels => shape(H,W,4)
+        # # Then convert RGBA->BGRA so cv2 will not mix color
         rendered_8u_bgra = rendered_8u.copy()
         rendered_8u_bgra[...,0] = rendered_8u[...,2]  # swap R,B
         rendered_8u_bgra[...,2] = rendered_8u[...,0]
