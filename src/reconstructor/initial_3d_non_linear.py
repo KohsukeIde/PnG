@@ -221,8 +221,8 @@ class Initial3DReconstructor:
 
     def compute_camera_matrices_from_homography(self) -> None:
         """Compute camera projection matrices p1 and p2 from the homography matrix."""
-        decomp = cv2.decomposeHomographyMat(self.h, self.k1 @ self.k1.T)
-        # decomp = cv2.decomposeHomographyMat(self.h, self.k1)
+        # decomp = cv2.decomposeHomographyMat(self.h, self.k1 @ self.k1.T)
+        decomp = cv2.decomposeHomographyMat(self.h, self.k1)
 
         if decomp is None:
             raise ValueError("Homography decomposition returned None.")
