@@ -161,7 +161,7 @@ def save_point_cloud_as_ply(points, filename):
 
 
 ########################
-# 4) OPTIONAL: Project 3D Gaussians back to 2D
+# 4) (WIP): Project 3D Gaussians back to 2D
 ########################
 
 def render_gaussians_pure_mixture(
@@ -270,7 +270,7 @@ def render_gaussians_pure_mixture(
 
     return mixture_img, weight_buffer
 
-# === ADDED for camera frustum ===
+# === (NEED FIX)ADDED for camera frustum visualization ===
 def create_camera_frustum_mesh(
     K,
     R_world2cam,
@@ -311,7 +311,6 @@ def create_camera_frustum_mesh(
     #    but let's do it analytically from fx,fy,cx,cy.
     #    x = (u - cx)/fx * z, y = (v - cy)/fy * z (assuming no skew).
     #    For simplicity, define "image corners" as 0..(2*cx), 0..(2*cy) in pixel.
-    #    or we can pick e.g. [0, 2*cx] => that is effectively the width in pixel coords.
 
     # near-plane
     corners_cam = []
@@ -359,7 +358,7 @@ def create_camera_frustum_mesh(
         frustum_vertices.append(make_vert_xyzrgba(corners_world[i]))  # index i+1
 
     # 5) Build faces
-    #    We'll connect camera_center -> near-plane edges
+    #    connect camera_center -> near-plane edges
     #                   camera_center -> far-plane edges
     #    Then optionally connect near-plane + far-plane as "side" rectangles.
     #    For simplicity, we can do a pyramid from center to the four corners of far-plane,
