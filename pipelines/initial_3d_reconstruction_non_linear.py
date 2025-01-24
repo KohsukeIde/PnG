@@ -12,7 +12,7 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 ########################
-# 0) Import your modules
+# 0) Import modules
 ########################
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
@@ -511,32 +511,32 @@ def main():
     reconstructor.compute_3d_gaussian_colors(color_mode="average")
     reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
 
-    # ##############################
-    # # 10) Build ellipsoids => PLY
-    # ##############################
-    # all_vertices = []
-    # all_faces = []
-    # n_theta, n_phi = 12, 12
+    ##############################
+    # 10) Build ellipsoids => PLY
+    ##############################
+    all_vertices = []
+    all_faces = []
+    n_theta, n_phi = 12, 12
 
-    # for i in range(points_3d.shape[0]):
-    #     center = points_3d[i]
-    #     Sigma_3 = reconstructor.covariances_3d[i]
-    #     c3 = reconstructor.color_3d[i]   # [r,g,b] in [0..1]
-    #     a3 = reconstructor.alpha_3d[i]   # alpha in [0..1]
+    for i in range(points_3d.shape[0]):
+        center = points_3d[i]
+        Sigma_3 = reconstructor.covariances_3d[i]
+        c3 = reconstructor.color_3d[i]   # [r,g,b] in [0..1]
+        a3 = reconstructor.alpha_3d[i]   # alpha in [0..1]
 
-    #     raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
-    #     extended_vertices = []
-    #     for vert in raw_vertices:
-    #         # (x, y, z, r, g, b, a)
-    #         combo = np.concatenate([vert, c3, [a3]])
-    #         extended_vertices.append(combo)
+        raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
+        extended_vertices = []
+        for vert in raw_vertices:
+            # (x, y, z, r, g, b, a)
+            combo = np.concatenate([vert, c3, [a3]])
+            extended_vertices.append(combo)
 
-    #     all_vertices.append(extended_vertices)
-    #     all_faces.append(faces)
+        all_vertices.append(extended_vertices)
+        all_faces.append(faces)
 
-    # # Save ellipsoids with alpha channel
-    # ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
-    # save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
+    # Save ellipsoids with alpha channel
+    ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
+    save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
     
     
     
@@ -578,8 +578,8 @@ def main():
         color=frustum_color,
         alpha=frustum_alpha,
         near_z=0.1,
-        far_z=0.4,     # お好みで
-        scale_fov=1000.0  # お好みで
+        far_z=0.4,     
+        scale_fov=100.0  
     )
     all_vertices.append(camera1_frustum_verts)
     all_faces.append(camera1_frustum_faces)
@@ -594,14 +594,13 @@ def main():
         t_world2cam=t2,
         color=frustum_color2,
         alpha=frustum_alpha,
-        near_z=100,
-        far_z=400,
-        scale_fov=1000.0
+        near_z=0.1,
+        far_z=0.4,
+        scale_fov=100.0
     )
     all_vertices.append(camera2_frustum_verts)
     all_faces.append(camera2_frustum_faces)
 
-    # もしPLYに書き出すならここで:
     ply_out = os.path.join('results', '3d_gaussians_ellipsoids_withCams.ply')
     save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
 
