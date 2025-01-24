@@ -335,6 +335,33 @@ def project_covariance_3d_to_2d(sigma_3, point_3d, k_val, r_cam, t_cam):
     return sigma_2d_model
 
 
+def project_point(x_val, k_val_local, r_cam_local, t_cam_local):
+    """Project a 3D point to 2D using camera parameters.
+
+    Args:
+        x_val: 3D point, shape (3,)
+        k_val_local: Camera intrinsic matrix, shape (3, 3)
+        r_cam_local: Camera rotation matrix, shape (3, 3)
+        t_cam_local: Camera translation vector, shape (3,)
+
+    Returns:
+        2D projected point, shape (2,)
+    """
+    # Transform to camera space: (3,3) @ (3,) + (3,) -> (3,)
+    x_c_local = r_cam_local @ x_val + t_cam_local
+
+    # Project to image plane: (3,3) @ (3,) -> (3,)
+    px_local = k_val_local @ x_c_local
+
+    # Perspective division if z != 0
+    # Convert from homogeneous to euclidean: (3,) -> (2,)
+    if px_local[2] != 0:
+        px_local[:2] /= px_local[2]
+
+    # Return x,y pixel coordinates: shape (2,)
+    return px_local[:2]
+
+
 def test_3d_to_2d_and_back_non_linear():
     """Test the complete pipeline of projecting a 3D Gaussian to 2D views and reconstructing back to 3D."""
     rng = np.random.default_rng(seed=42)
@@ -362,9 +389,9 @@ def test_3d_to_2d_and_back_non_linear():
     # Create rotation matrix for camera 2 (rotation around Y axis)
     r2 = np.array(
         [
-            [np.cos(angle), 0, np.sin(angle)],  # First row
-            [0, 1, 0],  # Second row (Y axis unchanged)
-            [-np.sin(angle), 0, np.cos(angle)],  # Third row
+            [np.cos(angle), 0, np.sin(angle)],
+            [0, 1, 0],
+            [-np.sin(angle), 0, np.cos(angle)],
         ]
     )
     # Translate camera 2 along X axis
@@ -378,18 +405,11 @@ def test_3d_to_2d_and_back_non_linear():
     k2 = np.array([[fx, 0, 0], [0, fy, 0], [0, 0, 1]])
 
     # Define 3D point location
-    point_3d = np.array([3.0, 0.0, 8.0])  # Point is 3 units right, 8 units forward
+    point_3d = np.array([3.0, 0.0, 30.0])  # Point is 3 units right, 30 units forward
 
     # Project 3D covariance to 2D in both camera views
     sigma_2d_1_obs = project_covariance_3d_to_2d(sigma_3_true, point_3d, k1, r1, t1)
     sigma_2d_2_obs = project_covariance_3d_to_2d(sigma_3_true, point_3d, k2, r2, t2)
-
-    def project_point(x_val, k_val_local, r_cam_local, t_cam_local):
-        x_c_local = r_cam_local @ x_val + t_cam_local
-        px_local = k_val_local @ x_c_local
-        if px_local[2] != 0:
-            px_local[:2] /= px_local[2]
-        return px_local[:2]
 
     mean2d_1 = project_point(point_3d, k1, r1, t1)
     mean2d_2 = project_point(point_3d, k2, r2, t2)
