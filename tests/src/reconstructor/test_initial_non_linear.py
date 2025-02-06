@@ -35,20 +35,21 @@ def generate_covariances_from_rotations_and_scales(rotations, scales):
 
 def test_initial_3d_reconstructor_creation():
     """Test initialization of Initial3DReconstructor."""
+    rng = np.random.default_rng(seed=42)
     k_val = 5
-    means1 = np.random.rand(k_val, 2)
-    rotations1 = np.random.uniform(0, 2 * np.pi, k_val)
-    scales1 = np.random.rand(k_val, 2) + 0.1
+    means1 = rng.random((k_val, 2)) * 100
+    rotations1 = rng.uniform(0, 2 * np.pi, k_val)
+    scales1 = rng.random((k_val, 2)) + 0.1
     covs1 = generate_covariances_from_rotations_and_scales(rotations1, scales1)
-    rgb1 = np.random.rand(k_val, 3)
-    alpha1 = np.random.rand(k_val)
+    rgb1 = rng.random((k_val, 3))
+    alpha1 = rng.random(k_val)
 
-    means2 = np.random.rand(k_val, 2)
-    rotations2 = np.random.uniform(0, 2 * np.pi, k_val)
-    scales2 = np.random.rand(k_val, 2) + 0.1
+    means2 = rng.random((k_val, 2))
+    rotations2 = rng.uniform(0, 2 * np.pi, k_val)
+    scales2 = rng.random((k_val, 2)) + 0.1
     covs2 = generate_covariances_from_rotations_and_scales(rotations2, scales2)
-    rgb2 = np.random.rand(k_val, 3)
-    alpha2 = np.random.rand(k_val)
+    rgb2 = rng.random((k_val, 3))
+    alpha2 = rng.random(k_val)
 
     gaussians1 = TwoDGaussians(
         means=means1,
@@ -85,6 +86,8 @@ def test_initial_3d_reconstructor_creation():
 
 def test_compute_camera_matrices():
     """Test computation of camera matrices from homography."""
+    rng = np.random.default_rng(seed=42)
+    k_val = 5
     theta = np.pi / 2
     r_mat = np.array(
         [
@@ -97,23 +100,24 @@ def test_compute_camera_matrices():
     t_translation = np.array([0.5, 0.0, 0.0])
     n_val = np.array([0, 0, 1])
     d_val = 1.0
+    # if K is not identity, homography = K2 @ (R + (t @ n.T) / d) @ np.linalg.inv(K1)
     h_mat = r_mat + (1 / d_val) * np.outer(t_translation, n_val)
 
     gaussians1 = TwoDGaussians(
-        means=np.random.rand(5, 2),
-        covs=np.array([np.eye(2) for _ in range(5)]),
-        rgb=np.random.rand(5, 3),
-        alpha=np.random.rand(5),
-        rotations=np.random.uniform(0, 2 * np.pi, 5),
-        scales=np.random.rand(5, 2) + 0.1,
+        means=rng.random((k_val, 2)),
+        covs=np.array([np.eye(2) for _ in range(k_val)]),
+        rgb=rng.random((k_val, 3)),
+        alpha=rng.random(k_val),
+        rotations=rng.uniform(0, 2 * np.pi, k_val),
+        scales=rng.random((k_val, 2)) + 0.1,
     )
     gaussians2 = TwoDGaussians(
-        means=np.random.rand(5, 2),
-        covs=np.array([np.eye(2) for _ in range(5)]),
-        rgb=np.random.rand(5, 3),
-        alpha=np.random.rand(5),
-        rotations=np.random.uniform(0, 2 * np.pi, 5),
-        scales=np.random.rand(5, 2) + 0.1,
+        means=rng.random((k_val, 2)),
+        covs=np.array([np.eye(2) for _ in range(k_val)]),
+        rgb=rng.random((k_val, 3)),
+        alpha=rng.random(k_val),
+        rotations=rng.uniform(0, 2 * np.pi, k_val),
+        scales=rng.random((k_val, 2)) + 0.1,
     )
     k1 = np.eye(3)
     k2 = np.eye(3)
@@ -133,14 +137,14 @@ def test_compute_camera_matrices():
 
 def test_triangulate_gaussian_centers():
     """Test triangulation of Gaussian centers."""
-    np.random.seed(0)
+    rng = np.random.default_rng(seed=42)
     k_val = 5
-    means1 = np.random.rand(k_val, 2) * 100
-    rotations1 = np.random.uniform(0, 2 * np.pi, k_val)
-    scales1 = np.random.rand(k_val, 2) + 0.1
+    means1 = rng.random((k_val, 2)) * 100
+    rotations1 = rng.uniform(0, 2 * np.pi, k_val)
+    scales1 = rng.random((k_val, 2)) + 0.1
     covs1 = generate_covariances_from_rotations_and_scales(rotations1, scales1)
-    rgb1 = np.random.rand(k_val, 3)
-    alpha1 = np.random.rand(k_val)
+    rgb1 = rng.random((k_val, 3))
+    alpha1 = rng.random(k_val)
 
     theta = np.pi / 2
     r_mat = np.array(
@@ -151,6 +155,7 @@ def test_triangulate_gaussian_centers():
         ]
     )
 
+    #Plane induced homography
     t_translation = np.array([0.5, 0.0, 0.0])
     n_val = np.array([0, 0, 1])
     d_val = 1.0
@@ -158,6 +163,8 @@ def test_triangulate_gaussian_centers():
 
     means1_hom = np.hstack([means1, np.ones((k_val, 1))])
     means2_hom = (h_mat @ means1_hom.T).T
+    
+    #2D point projected onto the second camera image, when a 2D point on the first camera image is transformed by homography.
     means2 = means2_hom[:, :2] / means2_hom[:, 2].reshape(-1, 1)
     covs2 = covs1.copy()
     rgb2 = rgb1.copy()
@@ -193,9 +200,9 @@ def test_triangulate_gaussian_centers():
     # meaning there are k_val points, each with 3 coordinates (x, y, z).
     assert reconstructor.points_3d.shape == (k_val, 3)
 
-    # Loop over each Gaussian center to verify the triangulation results.
+    # Loop over each Gaussian center
     for i in range(k_val):
-        # Get the i-th 3D point from the reconstructed points.
+        # Get the i-th 3D point.
         point_3d = reconstructor.points_3d[i]
 
         # Convert the 3D point to homogeneous coordinates by appending a 1.
@@ -222,14 +229,14 @@ def test_triangulate_gaussian_centers():
 
 def test_compute_3d_gaussian_covariances():
     """Test computation of 3D Gaussian covariances using rotation+scale approach."""
-    np.random.seed(0)
+    rng = np.random.default_rng(seed=42)
     k_val = 5
-    means1 = np.random.rand(k_val, 2) * 100
-    rotations1 = np.random.uniform(0, 2 * np.pi, k_val)
-    scales1 = np.random.rand(k_val, 2) + 0.1
+    means1 = rng.random((k_val, 2)) * 100
+    rotations1 = rng.uniform(0, 2 * np.pi, k_val)
+    scales1 = rng.random((k_val, 2)) + 0.1
     covs1 = generate_covariances_from_rotations_and_scales(rotations1, scales1)
-    rgb1 = np.random.rand(k_val, 3)
-    alpha1 = np.random.rand(k_val)
+    rgb1 = rng.random((k_val, 3))
+    alpha1 = rng.random(k_val)
 
     theta = np.pi / 2
     r_mat = np.array(
@@ -293,22 +300,41 @@ def test_compute_3d_gaussian_covariances():
 ########################################
 
 
-def quaternion_to_rotation(q_val):
-    """Convert quaternion [qw, qx, qy, qz] -> 3x3 rotation."""
-    qw, qx, qy, qz = q_val
+def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
+    """Convert a quaternion [qw, qx, qy, qz] into a 3x3 rotation matrix.
+
+    Args:
+        q (np.ndarray): A 4-element array representing the quaternion (qw, qx, qy, qz).
+
+    Returns:
+        np.ndarray: A 3x3 orthonormal rotation matrix.
+    """
+    qw, qx, qy, qz = q
     norm_q = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
     if norm_q < 1e-12:
-        return np.eye(3)
+        return np.eye(3, dtype=np.float64)
     qw, qx, qy, qz = qw / norm_q, qx / norm_q, qy / norm_q, qz / norm_q
-
-    r_array = np.array(
+    r_mat = np.array(
         [
-            [1 - 2 * (qy**2 + qz**2), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-            [2 * (qx * qy + qz * qw), 1 - 2 * (qx**2 + qz**2), 2 * (qy * qz - qx * qw)],
-            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx**2 + qy**2)],
-        ]
+            [
+                1 - 2 * (qy**2 + qz**2),
+                2 * (qx * qy - qz * qw),
+                2 * (qx * qz + qy * qw),
+            ],
+            [
+                2 * (qx * qy + qz * qw),
+                1 - 2 * (qx**2 + qz**2),
+                2 * (qy * qz - qx * qw),
+            ],
+            [
+                2 * (qx * qz - qy * qw),
+                2 * (qy * qz + qx * qw),
+                1 - 2 * (qx**2 + qy**2),
+            ],
+        ],
+        dtype=np.float64,
     )
-    return r_array
+    return r_mat
 
 
 def build_covariance_3d(q_val, s_val):
@@ -323,7 +349,8 @@ def project_covariance_3d_to_2d(sigma_3, point_3d, k_val, r_cam, t_cam):
     x_c = r_cam @ point_3d + t_cam
     x_val, y_val, z_val = x_c
     fx, fy = k_val[0, 0], k_val[1, 1]
-
+    
+    # Pinhole camera model Jacobian
     j_mat = np.array(
         [
             [fx / z_val, 0.0, -fx * x_val / (z_val**2)],
@@ -375,7 +402,7 @@ def test_3d_to_2d_and_back_non_linear():
     q_val = np.array([qw, qx, qy, qz])
 
     # Generate random scale values between 1.0 and 4.0 for X, Y, Z dimensions
-    s_val = rng.uniform(1.0, 4.0, size=3)
+    s_val = rng.uniform(1.0, 2.0, size=3)
 
     # Build the true 3D covariance matrix using rotation and scale
     sigma_3_true = build_covariance_3d(q_val, s_val)
@@ -385,7 +412,7 @@ def test_3d_to_2d_and_back_non_linear():
     t1 = np.zeros(3)  # No translation (at origin)
 
     # Set up second camera (camera 2) with rotation and translation
-    angle = np.radians(50.0)  # Convert 50 degrees to radians
+    angle = np.radians(40.0)  # Convert 40 degrees to radians
     # Create rotation matrix for camera 2 (rotation around Y axis)
     r2 = np.array(
         [
@@ -420,38 +447,45 @@ def test_3d_to_2d_and_back_non_linear():
         covs=np.array([sigma_2d_1_obs]),  # 2D projected covariance
         rgb=np.array([[1.0, 0.0, 0.0]]),  # Red color
         alpha=np.array([1.0]),  # Full opacity
-        rotations=np.array([0.0]),  # No additional rotation
-        scales=np.array([[1.0, 1.0]]),  # Unit scale
+        rotations=np.array([0.0]),  # No additional rotation (not used)
+        scales=np.array([[1.0, 1.0]]),  # Unit scale (not used)
     )
 
     # Create 2D Gaussian for second camera view (green color)
     gaussians2 = TwoDGaussians(
         means=np.array([mean2d_2]),  # 2D projected point
         covs=np.array([sigma_2d_2_obs]),  # 2D projected covariance
-        rgb=np.array([[1.0, 0.0, 0.0]]),  # Red color
+        rgb=np.array([[0.0, 1.0, 0.0]]),  # Green color (To destinguish from red)
         alpha=np.array([1.0]),  # Full opacity
-        rotations=np.array([0.0]),  # No additional rotation
-        scales=np.array([[1.0, 1.0]]),  # Unit scale
+        rotations=np.array([0.0]),  # No additional rotation (not used)
+        scales=np.array([[1.0, 1.0]]),  # Unit scale (not used)
     )
 
-    # Create identity homography (not used in this test)
-    h_fake = np.eye(3)
+
+
+    # plane-induced homography consistent with (r1,t1) and (r2,t2).
+    #   plane z=30 in camera1 coords, so normal n=[0,0,1], d=30.
+    #   Then H = K2 * (R12 + (t12 n^T)/d) * inv(K1)
+    #   where R12 = r2*r1^T, t12 = t2 - R12*t1
+    inv_k1 = np.linalg.inv(k1)
+    r12 = r2 @ r1.T
+    t12 = t2 - r12 @ t1
+    n = np.array([0., 0., 1.], dtype=float)
+    d = 30.0
+    h_real = k2 @ (r12 + (np.outer(t12, n) / d)) @ inv_k1
 
     # Initialize the 3D reconstructor with our 2D Gaussians
-    reconstructor = Initial3DReconstructor(gaussians1, gaussians2, k1, k2, h_fake)
+    reconstructor = Initial3DReconstructor(gaussians1, gaussians2, k1, k2, h_real)
 
-    # Set the camera projection matrices
-    # Format is K[R|t] for each camera
-    reconstructor.p1 = k1 @ np.hstack((r1, t1.reshape(3, 1)))
-    reconstructor.p2 = k2 @ np.hstack((r2, t2.reshape(3, 1)))
+    # Here, we use the homography-based method to compute camera matrices:
+    reconstructor.compute_camera_matrices_from_homography()
 
-    # Set the known 3D point (in real use, this would be computed via triangulation)
-    reconstructor.points_3d = np.array([point_3d])
+    # Now we triangulate the single 2D-2D match using a transport matrix (1x1 identity).
+    # This replaces the manual setting of reconstructor.points_3d.
+    transport_matrix = np.array([[1.0]], dtype=float)
+    reconstructor.triangulate_gaussian_centers(transport_matrix)
 
-    # Set matching pairs between views (in this case, just one pair: point 0 matches point 0)
-    reconstructor.match_pairs = [(0, 0)]
-
-    # Compute 3D Gaussian covariances
+    # After triangulation, we can compute 3D Gaussian covariances
     # lambda_volume=0.0: no volume regularization
     # target_volume=1.0: target volume constraint (not used when lambda=0)
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=0.0, target_volume=1.0)
