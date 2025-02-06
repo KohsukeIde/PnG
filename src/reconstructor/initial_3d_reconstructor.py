@@ -65,20 +65,18 @@ class Initial3DReconstructor:
 
     def compute_camera_matrices_from_homography(self) -> None:
         """Compute camera projection matrices p1 and p2 from the homography matrix."""
-        # decomposeHomographyMat may return Union[None, int, Mat, ...], so we cast carefully.
+
         decomp_result = cv2.decomposeHomographyMat(self.h, self.k1 @ self.k1.T)
         if decomp_result is None:
             raise ValueError("Homography decomposition returned None.")
 
-        # We expect a tuple: (retval, rotations, translations, normals)
+
         retval, rotations, translations, normals = decomp_result
         if retval == 0:
             raise ValueError(
                 "Homography decomposition failed or found no valid solution."
             )
 
-        # rotations & translations are typically lists of OpenCV Mat or np.ndarray
-        # We convert or check to ensure they're NumPy arrays.
         selected = False
         for i in range(retval):
             r_candidate = rotations[i]
