@@ -7,6 +7,7 @@ from scipy.optimize import least_squares
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 
+import sys
 
 def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
     """Convert a quaternion [qw, qx, qy, qz] into a 3x3 rotation matrix.
@@ -19,7 +20,9 @@ def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
     """
     qw, qx, qy, qz = q
     norm_q = np.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    # If the quaternion is too small, return the identity matrix → to avoid rounding error/assume that there is no rotation.
     if norm_q < 1e-12:
+        print("Quaternion norm is too small ({}), returning identity matrix.".format(norm_q))
         return np.eye(3, dtype=np.float64)
     qw, qx, qy, qz = qw / norm_q, qx / norm_q, qy / norm_q, qz / norm_q
     r_mat = np.array(
@@ -45,22 +48,48 @@ def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
     return r_mat
 
 
+# def build_covariance_3d(q: np.ndarray, s: np.ndarray) -> np.ndarray:
+#     """Build a 3D covariance from quaternion q and scales s=[s1, s2, s3].
+
+#     Sigma_3 = R * diag(s^2) * R^T.
+
+#     Args:
+#         q (np.ndarray): Quaternion [qw, qx, qy, qz].
+#         s (np.ndarray): Scales [s1, s2, s3].
+
+#     Returns:
+#         np.ndarray: The 3D covariance matrix (3x3).
+#     """
+#     r_mat = quaternion_to_rotation(q)
+#     s_diag = np.diag(s**2)
+#     sigma_3 = r_mat @ s_diag @ r_mat.T
+#     return np.array(sigma_3, dtype=float)
+
 def build_covariance_3d(q: np.ndarray, s: np.ndarray) -> np.ndarray:
     """Build a 3D covariance from quaternion q and scales s=[s1, s2, s3].
 
-    Sigma_3 = R * diag(s^2) * R^T.
+    We now explicitly write Sigma as:
+        Sigma = R * S * S^T * R^T
+    where:
+        - R is the 3x3 rotation matrix converted from a quaternion [qw, qx, qy, qz].
+        - S = diag(s) is a 3x3 diagonal matrix with the scale factors s1, s2, s3.
+          (Hence, S * S^T = diag(s^2).)
 
     Args:
         q (np.ndarray): Quaternion [qw, qx, qy, qz].
-        s (np.ndarray): Scales [s1, s2, s3].
+        s (np.ndarray): Scales [s1, s2, s3], each s_i >= 0.
 
     Returns:
         np.ndarray: The 3D covariance matrix (3x3).
     """
     r_mat = quaternion_to_rotation(q)
-    s_diag = np.diag(s**2)
-    sigma_3 = r_mat @ s_diag @ r_mat.T
-    return np.array(sigma_3, dtype=float)
+
+    s_diag = np.diag(s)
+
+    # Sigma = R * S * S^T * R^T
+    sigma_3 = r_mat @ s_diag @ s_diag.T @ r_mat.T
+
+    return sigma_3
 
 
 def project_covariance_3d_to_2d(
@@ -86,10 +115,13 @@ def project_covariance_3d_to_2d(
     Returns:
         np.ndarray: Resulting 2D covariance (2x2).
     """
+    # Project the 3D point to camera coordinates.
     x_c = r_cam @ point_3d + t_cam
+    # Extract the x, y, z coordinates from the camera coordinates.
     x_val, y_val, z_val = x_c
 
     fx, fy = k[0, 0], k[1, 1]
+    # Compute the Jacobian for the pinhole projection.
     j_mat = np.array(
         [
             [fx / z_val, 0.0, -fx * x_val / (z_val**2)],
@@ -97,7 +129,9 @@ def project_covariance_3d_to_2d(
         ],
         dtype=np.float64,
     )
+    # Project the 3D covariance to camera coordinates.
     sigma_cam = r_cam @ sigma_3 @ r_cam.T
+    # Propagate 3D covariance to 2D using the local Jacobian approximation.
     sigma_2d_model = j_mat @ sigma_cam @ j_mat.T
     return np.array(sigma_2d_model, dtype=float)
 
@@ -134,40 +168,6 @@ def single_view_cov_residual(
     sigma_2d_model = project_covariance_3d_to_2d(sigma_3, point_3d, k, r_cam, t_cam)
     diff = sigma_2d_model - sigma_2d_obs
     return np.array(diff.flatten(), dtype=float)
-
-
-def combined_two_view_cov_residual(
-    params: np.ndarray,
-    point_3d: np.ndarray,
-    sigma_2d_1_obs: np.ndarray,
-    sigma_2d_2_obs: np.ndarray,
-    k1: np.ndarray,
-    r1: np.ndarray,
-    t1: np.ndarray,
-    k2: np.ndarray,
-    r2: np.ndarray,
-    t2: np.ndarray,
-) -> np.ndarray:
-    """Combine residuals for 2 camera views using the same rotation/scale parameter set.
-
-    Args:
-        params (np.ndarray): [qw, qx, qy, qz, s1, s2, s3].
-        point_3d (np.ndarray): 3D point in world coordinates.
-        sigma_2d_1_obs (np.ndarray): Observed 2D covariance in camera 1.
-        sigma_2d_2_obs (np.ndarray): Observed 2D covariance in camera 2.
-        k1 (np.ndarray): Intrinsic camera matrix for camera 1.
-        r1 (np.ndarray): Rotation (3x3).
-        t1 (np.ndarray): Translation (3,).
-        k2 (np.ndarray): Intrinsic camera matrix for camera 2.
-        r2 (np.ndarray): Rotation (3x3).
-        t2 (np.ndarray): Translation (3,).
-
-    Returns:
-        np.ndarray: Combined residual from both views, shape (8,).
-    """
-    r1_resid = single_view_cov_residual(params, point_3d, sigma_2d_1_obs, k1, r1, t1)
-    r2_resid = single_view_cov_residual(params, point_3d, sigma_2d_2_obs, k2, r2, t2)
-    return np.concatenate([r1_resid, r2_resid])
 
 
 class Initial3DReconstructor:
@@ -221,7 +221,6 @@ class Initial3DReconstructor:
 
     def compute_camera_matrices_from_homography(self) -> None:
         """Compute camera projection matrices p1 and p2 from the homography matrix."""
-        # decomp = cv2.decomposeHomographyMat(self.h, self.k1 @ self.k1.T)
         decomp = cv2.decomposeHomographyMat(self.h, self.k1)
 
         if decomp is None:
@@ -242,12 +241,14 @@ class Initial3DReconstructor:
                 t_candidate = np.array(t_candidate, dtype=float)
             t_candidate = t_candidate.flatten()
 
+            # Check if the translation is in front of the camera (z-coordinate is positive in camera coords).
             if t_candidate[2] > 0:
                 self.r2 = r_candidate
                 self.t2 = t_candidate
                 selected = True
                 break
-
+        
+        # If no valid translation is found, use the first solution.
         if not selected:
             r_candidate = rotations[0]
             if not isinstance(r_candidate, np.ndarray):
@@ -274,56 +275,83 @@ class Initial3DReconstructor:
         if self.p1 is None or self.p2 is None:
             raise ValueError("Camera matrices must be computed before triangulation.")
 
-        centers1 = self.gaussians1.means
-        centers2 = self.gaussians2.means
+        centers1 = self.gaussians1.means # (k1_num, 2)
+        centers2 = self.gaussians2.means # (k2_num, 2)
 
         if hasattr(centers1, "detach"):
             centers1 = centers1.detach().cpu().numpy()
         if hasattr(centers2, "detach"):
             centers2 = centers2.detach().cpu().numpy()
 
-        k1_num = centers1.shape[0]
+        k1_num = centers1.shape[0] 
         k2_num = centers2.shape[0]
 
         print(f"transport matrix shape {transport_matrix.shape}")
+        # Flatten the transport matrix.
         t_flat = transport_matrix.ravel()
+        # Get all indices.
         all_indices = np.arange(t_flat.size)
-
+        # Filter indices with values >= threshold.
         mask = t_flat >= threshold
         valid_indices = all_indices[mask]
+        # If no valid indices are found, return empty 3D points and match pairs.
         if len(valid_indices) == 0:
             print(f"No transport values >= {threshold}")
             self.points_3d = np.zeros((0, 3), dtype=np.float64)
             self.match_pairs = []
             return
 
+        # Get valid transport values.
         valid_tvals = t_flat[mask]
+        # Sort indices in descending (largest to smallest) order.
         sort_desc = np.argsort(-valid_tvals)
+        # Limit the number of top indices to top_k.
         top_k_limited = min(top_k, len(valid_tvals))
 
+        # best_indices are the indices of the top k transport values.
         best_indices = valid_indices[sort_desc[:top_k_limited]]
-
+        # Unravel the indices to get the corresponding 2D Gaussian indices.
         i_coords, j_coords = np.unravel_index(best_indices, (k1_num, k2_num))
+        
+        
         correspondences = []
-        if self.p1 is None or self.p2 is None:
-            raise ValueError("Projections must be computed first.")
 
         for idx in range(top_k_limited):
+            # (x,y) in image 1 and image 2.
             i_val = i_coords[idx]
             j_val = j_coords[idx]
+            
+            # Convert to homogeneous coordinates (x,y,1) in image 1 and image 2.
             x1_h = np.array([centers1[i_val, 0], centers1[i_val, 1], 1.0], dtype=float)
             x2_h = np.array([centers2[j_val, 0], centers2[j_val, 1], 1.0], dtype=float)
 
+            print(f"p1 {self.p1}")
+            print(f"p2 {self.p2}")
+
+            print(f"p1 shape {self.p1.shape}")
+            print(f"p2 shape {self.p2.shape}")
+            print(f"p1[2] {self.p1[2]}")
+            print(f"p2[2] {self.p2[2]}")
+        
+            # Direct linear triangulation.
             a_mat = np.zeros((4, 4), dtype=float)
-            a_mat[0] = x1_h[0] * self.p1[2] - self.p1[0]
-            a_mat[1] = x1_h[1] * self.p1[2] - self.p1[1]
-            a_mat[2] = x2_h[0] * self.p2[2] - self.p2[0]
-            a_mat[3] = x2_h[1] * self.p2[2] - self.p2[1]
+            a_mat[0, :] = x1_h[0] * self.p1[2, :] - self.p1[0, :]
+            a_mat[1, :] = x1_h[1] * self.p1[2, :] - self.p1[1, :]
+            a_mat[2, :] = x2_h[0] * self.p2[2, :] - self.p2[0, :]
+            a_mat[3, :] = x2_h[1] * self.p2[2, :] - self.p2[1, :]
+            
+            print(f"a_mat shape {a_mat.shape}")
+            # sys.exit()
+
 
             _, _, vt = np.linalg.svd(a_mat)
+            # Get the last singular vector.
             x_val = vt[-1]
+            # Homogeneous coordinates (X,Y,Z,W) -> (X/W, Y/W, Z/W).
             x_val /= x_val[3]
+            # Extract the 3D point (X/W, Y/W, Z/W).
             point_3d = x_val[:3]
+            # Append the correspondence.    
             correspondences.append((point_3d, i_val, j_val))
 
         if len(correspondences) == 0:
@@ -442,7 +470,7 @@ class Initial3DReconstructor:
             )
 
             # Check optimization result and return the final 3D covariance
-            if result.status == 1:
+            if result.success:
                 qq_final, ss_final = result.x[:4], result.x[4:]
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
                 return sigma_3_final
