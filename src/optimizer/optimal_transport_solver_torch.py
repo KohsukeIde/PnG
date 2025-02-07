@@ -135,10 +135,6 @@ class OptimalTransportSolver:
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
 
-        # 4) Compute alpha (opacity) differences
-        alpha_diff = self.alpha1.unsqueeze(1) - self.alpha2.unsqueeze(0)  # (K1,K2)
-        d_alpha = alpha_diff**2  # (K1,K2)
-
         # Debug prints (optional)
         print("=== Before Normalization ===")
         print(
@@ -150,16 +146,12 @@ class OptimalTransportSolver:
         print(
             f"d_color: min={d_color.min():.4f}, max={d_color.max():.4f}, mean={d_color.mean():.4f}"
         )
-        print(
-            f"d_alpha: min={d_alpha.min():.4f}, max={d_alpha.max():.4f}, mean={d_alpha.mean():.4f}"
-        )
 
         # 6) Normalize each component (example approach)
         max_dim = 1554  # largest image dimension
         mean_term = mean_term / (max_dim**2)
         cov_term = cov_term / (max_dim**2 / 100000)
         d_color = d_color / 3.0
-        d_alpha = d_alpha / 1.0
 
         print("=== After Normalization ===")
         print(
@@ -171,15 +163,12 @@ class OptimalTransportSolver:
         print(
             f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}"
         )
-        print(
-            f"d_alpha: min={d_alpha.min():.6f}, max={d_alpha.max():.6f}, mean={d_alpha.mean():.6f}"
-        )
+
 
         cost_matrix = (
             self.lambda_mean * mean_term
             + self.lambda_cov * cov_term
             + self.lambda_color * d_color
-            + self.lambda_alpha * d_alpha
         )
 
         print("=== Final Cost Matrix ===")
