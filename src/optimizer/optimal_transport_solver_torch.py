@@ -23,7 +23,6 @@ class OptimalTransportSolver:
         lambda_mean: float = 1.0,
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
-        lambda_alpha: float = 1.0,  # <--- NEW for alpha weighting
         device: Optional[torch.device] = None,
     ):
         """Initialize the OptimalTransportSolver.
@@ -58,12 +57,13 @@ class OptimalTransportSolver:
             else None
         )
         self.h: Optional[torch.Tensor] = None
+        # Added for Fundamental Matrix
+        self.f: Optional[torch.Tensor] = None
 
         self.epsilon = epsilon
         self.lambda_mean = lambda_mean
         self.lambda_cov = lambda_cov
         self.lambda_color = lambda_color
-        self.lambda_alpha = lambda_alpha
 
         # Convert Gaussian parameters to torch tensors
         self._prepare_gaussians()
@@ -469,3 +469,155 @@ class OptimalTransportSolver:
         plt.savefig(plt_path)
         plt.close()
         print(f"Optimization loss plot saved to '{plt_path}'")
+
+    # === Added below for Fundamental Matrix version ===
+    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+        """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
+
+        This replaces the Homography-based distance with an epipolar distance.
+        Also includes color difference term as an example.
+
+        Args:
+            f (torch.Tensor): The Fundamental matrix (3x3).
+
+        Returns:
+            torch.Tensor: Cost matrix of shape (K1, K2).
+        """
+        k1 = self.means1.shape[0]
+        k2 = self.means2.shape[0]
+
+        # Create homogeneous coords
+        ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
+        p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
+        ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
+        p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
+
+        # Compute epipolar lines
+        # line in image1 for each p2: l1 = F * p2
+        l1 = (f @ p2_homo.T).T  # (K2,3)
+        # line in image2 for each p1: l2 = F^T * p1
+        l2 = (f.t() @ p1_homo.T).T  # (K1,3)
+
+        # We define the distance p1-l1 + p2-l2 as a symmetrical epipolar cost
+        # Dist from p1[i] to line l1[j]: |p1[i].dot(l1[j])| / sqrt(a^2 + b^2)
+        # shape: (K1,K2)
+
+        # shape (K1,1,3) * (1,K2,3,1) => (K1,K2,1,1)
+        numerator_12 = torch.abs(
+            p1_homo.unsqueeze(1) @ l1.unsqueeze(2)
+        ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
+        denom_12 = denom_12.view(1, -1)  # (1,K2)
+        dist_12 = numerator_12 / denom_12  # (K1,K2)
+
+        numerator_21 = torch.abs(
+            p2_homo.unsqueeze(0) @ l2.unsqueeze(2)
+        ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
+        denom_21 = denom_21.view(-1, 1)  # (K1,1)
+        dist_21 = numerator_21 / denom_21  # (K1,K2)
+
+        epipolar_dist = dist_12 + dist_21
+
+        # color difference
+        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
+        d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
+
+        # combine with weights, epipolar_dist can be scaled if needed
+        cost_matrix = epipolar_dist + self.lambda_color * d_color
+
+        return cost_matrix
+
+    def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+        """Optimize the Fundamental matrix F using epipolar distance + color difference.
+
+        Args:
+            max_iter (int): Maximum number of iterations.
+            tol (float): Convergence tolerance.
+        """
+        transport_dir = os.path.join("results", "transport_fundamental")
+        os.makedirs(transport_dir, exist_ok=True)
+
+        # Initialize Fundamental matrix f with identity or some default
+        self.f = torch.eye(3, dtype=torch.float32, device=self.device, requires_grad=True)
+        optimizer = torch.optim.Adam([self.f], lr=1e-4)
+        prev_loss = torch.tensor(float("inf"), device=self.device)
+
+        loss_history = []
+
+        for iteration in tqdm(range(max_iter), desc="Optimization with Fundamental"):
+            optimizer.zero_grad()
+
+            # Compute cost matrix with current f
+            cost_matrix = self.compute_cost_matrix_fundamental(self.f)
+            # Compute transport plan using unbalanced sinkhorn
+            transport = self.unbalanced_sinkhorn_algorithm(
+                cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
+            )
+
+            # Compute objective function
+            loss = torch.sum(transport * cost_matrix)
+            loss.backward()
+
+            optimizer.step()
+
+            # Enforce rank-2 constraint (optional but common for F)
+            with torch.no_grad():
+                u, s, vt = torch.linalg.svd(self.f, full_matrices=False)
+                s[-1] = 0.0
+                self.f.copy_(u @ torch.diag(s) @ vt)
+
+            if iteration % 5 == 0 or iteration == max_iter - 1:
+                grad_norm = (
+                    self.f.grad.norm().item() if self.f.grad is not None else 0.0
+                )
+                print(
+                    f"Iteration {iteration}, Loss={loss.item():.6f}, F.grad norm={grad_norm:.6f}"
+                )
+
+            loss_history.append(loss.item())
+
+            if iteration % 10 == 0 or iteration == max_iter - 1:
+                with torch.no_grad():
+                    t_np = transport.cpu().numpy()
+                    plt.figure(figsize=(8, 6))
+                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
+                    plt.colorbar(label="Transport Plan Value")
+                    plt.title(f"Transport Plan at Iteration {iteration}")
+                    plt.xlabel("Image 2 Gaussians")
+                    plt.ylabel("Image 1 Gaussians")
+                    plt.tight_layout()
+                    plt_path = os.path.join(
+                        transport_dir, f"transport_iter_{iteration}.png"
+                    )
+                    plt.savefig(plt_path)
+                    plt.close()
+                    print(f"Transport matrix heatmap saved to '{plt_path}'")
+
+            if abs(prev_loss.item() - loss.item()) < tol:
+                print(f"Converged at iteration {iteration}")
+                break
+            prev_loss = loss
+
+        with torch.no_grad():
+            # final enforcement
+            u, s, vt = torch.linalg.svd(self.f, full_matrices=False)
+            s[-1] = 0.0
+            self.f.copy_(u @ torch.diag(s) @ vt)
+            print("Final rank-2 enforcement on fundamental matrix.")
+
+        self.f = self.f.detach()
+
+        # Visualize loss
+        plt.figure(figsize=(10, 6))
+        plt.plot(loss_history, label="Loss (Fundamental)")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title("Optimization Loss over Iterations (Fundamental)")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt_path = os.path.join("results", "fundamental_loss.png")
+        plt.savefig(plt_path)
+        plt.close()
+        print(f"Optimization loss plot (Fundamental) saved to '{plt_path}'")
