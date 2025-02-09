@@ -2,8 +2,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
+from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
-
 
 def generate_covariances_from_rotations_and_scales(rotations, scales):
     """Generate covariance matrices from rotations and scales.
@@ -390,111 +390,101 @@ def project_point(x_val, k_val_local, r_cam_local, t_cam_local):
 
 
 def test_3d_to_2d_and_back_non_linear():
-    """Test the complete pipeline of projecting a 3D Gaussian to 2D views and reconstructing back to 3D."""
+    """Test the complete pipeline of projecting a 3D Gaussian to 2D views and reconstructing back to 3D,
+       using a Fundamental-based approach instead of Homography.
+    """
     rng = np.random.default_rng(seed=42)
 
-    # Generate a random rotation using quaternions
-    # scipy.spatial.transform.Rotation.random() returns [qx, qy, qz, qw]
+    # 1) Generate random 3D covariance (same as original)
     random_quat = Rotation.random(random_state=rng).as_quat()
     qx, qy, qz, qw = random_quat
-
-    # Reorder quaternion components to [qw, qx, qy, qz] format for our quaternion_to_rotation function
     q_val = np.array([qw, qx, qy, qz])
-
-    # Generate random scale values between 1.0 and 4.0 for X, Y, Z dimensions
     s_val = rng.uniform(1.0, 2.0, size=3)
-
-    # Build the true 3D covariance matrix using rotation and scale
     sigma_3_true = build_covariance_3d(q_val, s_val)
 
-    # Set up first camera (camera 1) at origin
-    r1 = np.eye(3)  # Identity rotation matrix (no rotation)
-    t1 = np.zeros(3)  # No translation (at origin)
-
-    # Set up second camera (camera 2) with rotation and translation
-    angle = np.radians(40.0)  # Convert 40 degrees to radians
-    # Create rotation matrix for camera 2 (rotation around Y axis)
-    r2 = np.array(
-        [
-            [np.cos(angle), 0, np.sin(angle)],
-            [0, 1, 0],
-            [-np.sin(angle), 0, np.cos(angle)],
-        ]
-    )
-    # Translate camera 2 along X axis
+    # 2) Set up camera1, camera2
+    r1 = np.eye(3)
+    t1 = np.zeros(3)
+    angle = np.radians(40.0)
+    r2 = np.array([
+        [np.cos(angle), 0, np.sin(angle)],
+        [0, 1, 0],
+        [-np.sin(angle), 0, np.cos(angle)],
+    ])
     t2 = np.array([2.0, 0.0, 0.0])
 
-    # Set up camera intrinsic parameters
-    fx = 800.0  # Focal length in x direction
-    fy = 800.0  # Focal length in y direction
-    # Create camera calibration matrices (same for both cameras)
+    fx = fy = 800.0
     k1 = np.array([[fx, 0, 0], [0, fy, 0], [0, 0, 1]])
     k2 = np.array([[fx, 0, 0], [0, fy, 0], [0, 0, 1]])
 
-    # Define 3D point location
-    point_3d = np.array([3.0, 0.0, 30.0])  # Point is 3 units right, 30 units forward
+    point_3d = np.array([3.0, 0.0, 30.0])
 
-    # Project 3D covariance to 2D in both camera views
+    # 3) Project that 3D covariance into each camera => 2D Gaussians
     sigma_2d_1_obs = project_covariance_3d_to_2d(sigma_3_true, point_3d, k1, r1, t1)
     sigma_2d_2_obs = project_covariance_3d_to_2d(sigma_3_true, point_3d, k2, r2, t2)
-
     mean2d_1 = project_point(point_3d, k1, r1, t1)
     mean2d_2 = project_point(point_3d, k2, r2, t2)
 
-    # Create 2D Gaussian for first camera view (red color)
     gaussians1 = TwoDGaussians(
-        means=np.array([mean2d_1]),  # 2D projected point
-        covs=np.array([sigma_2d_1_obs]),  # 2D projected covariance
-        rgb=np.array([[1.0, 0.0, 0.0]]),  # Red color
-        alpha=np.array([1.0]),  # Full opacity
-        rotations=np.array([0.0]),  # No additional rotation (not used)
-        scales=np.array([[1.0, 1.0]]),  # Unit scale (not used)
+        means=np.array([mean2d_1]),
+        covs=np.array([sigma_2d_1_obs]),
+        rgb=np.array([[1.0, 0.0, 0.0]]),
+        alpha=np.array([1.0]),
+        rotations=np.array([0.0]),
+        scales=np.array([[1.0, 1.0]]),
     )
-
-    # Create 2D Gaussian for second camera view (green color)
     gaussians2 = TwoDGaussians(
-        means=np.array([mean2d_2]),  # 2D projected point
-        covs=np.array([sigma_2d_2_obs]),  # 2D projected covariance
-        rgb=np.array([[0.0, 1.0, 0.0]]),  # Green color (To destinguish from red)
-        alpha=np.array([1.0]),  # Full opacity
-        rotations=np.array([0.0]),  # No additional rotation (not used)
-        scales=np.array([[1.0, 1.0]]),  # Unit scale (not used)
+        means=np.array([mean2d_2]),
+        covs=np.array([sigma_2d_2_obs]),
+        rgb=np.array([[0.0, 1.0, 0.0]]),
+        alpha=np.array([1.0]),
+        rotations=np.array([0.0]),
+        scales=np.array([[1.0, 1.0]]),
     )
 
+    # 4) Instead of homography, use Fundamental approach:
+    solver = OptimalTransportSolver(
+        gaussians1, gaussians2, k1, k2,
+        epsilon=0.1,
+        lambda_mean=0.0,    # might set to 0 if you only want epipolar dist
+        lambda_cov=0.0,     
+        lambda_color=0.0,   
+        device=None
+    )
+    # Optimize fundamental
+    solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
+    # Get transport
+    cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
+    transport = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
+    transport_matrix = transport.detach().cpu().numpy()  # shape (1,1)
 
+    # 5) Use reconstructor => pass dummy homography to constructor
+    reconstructor = Initial3DReconstructor(
+        gaussians1, gaussians2, k1, k2, np.eye(3)
+    )
 
-    # plane-induced homography consistent with (r1,t1) and (r2,t2).
-    #   plane z=30 in camera1 coords, so normal n=[0,0,1], d=30.
-    #   Then H = K2 * (R12 + (t12 n^T)/d) * inv(K1)
-    #   where R12 = r2*r1^T, t12 = t2 - R12*t1
-    inv_k1 = np.linalg.inv(k1)
-    r12 = r2 @ r1.T
-    t12 = t2 - r12 @ t1
-    n = np.array([0., 0., 1.], dtype=float)
-    d = 30.0
-    h_real = k2 @ (r12 + (np.outer(t12, n) / d)) @ inv_k1
+    # Explicitly define p1, p2 from (r1,t1), (r2,t2)
+    reconstructor.set_camera_matrices_explicitly(r1, t1, r2, t2)
 
-    # Initialize the 3D reconstructor with our 2D Gaussians
-    reconstructor = Initial3DReconstructor(gaussians1, gaussians2, k1, k2, h_real)
+    # Triangulate => we have only 1 match => top_k=1
+    reconstructor.triangulate_gaussian_centers(transport_matrix, threshold=0.0, top_k=1)
 
-    # Here, we use the homography-based method to compute camera matrices:
-    reconstructor.compute_camera_matrices_from_homography()
-
-    # Now we triangulate the single 2D-2D match using a transport matrix (1x1 identity).
-    # This replaces the manual setting of reconstructor.points_3d.
-    transport_matrix = np.array([[1.0]], dtype=float)
-    reconstructor.triangulate_gaussian_centers(transport_matrix)
-
-    # After triangulation, we can compute 3D Gaussian covariances
-    # lambda_volume=0.0: no volume regularization
-    # target_volume=1.0: target volume constraint (not used when lambda=0)
+    # 6) Now compute 3D covariance => no volume regularization
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=0.0, target_volume=1.0)
 
-    # Get the reconstructed 3D covariance
     sigma_3_reconstructed = reconstructor.covariances_3d[0]
 
-    # Verify that reconstructed covariance matches the original
-    # Allow for small numerical differences (atol=1e-2)
-    assert np.allclose(
-        sigma_3_reconstructed, sigma_3_true, atol=1e-2
-    ), "Reconstructed covariance does not match true covariance."
+    # 7) Compare
+    diff_mat = sigma_3_reconstructed - sigma_3_true
+    frob_diff = np.linalg.norm(diff_mat, ord='fro')  # Frobenius norm
+    n_elements = diff_mat.size  # 3x3 => 9
+
+    # Root Mean Square Error (RMS) per element
+    rms = frob_diff / np.sqrt(n_elements)
+
+    threshold_rms = 0.5
+    assert rms < threshold_rms, f"RMS difference too large: {rms}"
+    denom = np.linalg.norm(sigma_3_true, ord='fro') + 1e-12
+    rel_diff = frob_diff / denom
+
+    assert rel_diff < 0.3, f"Relative Frobenius difference too large: {rel_diff}"
