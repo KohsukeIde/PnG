@@ -1,5 +1,6 @@
 import copy
 import os
+import sys
 from typing import Optional, Tuple
 
 import numpy as np
@@ -36,7 +37,6 @@ class OptimalTransportSolver:
             lambda_mean (float): Weight for mean difference term.
             lambda_cov (float): Weight for covariance difference term.
             lambda_color (float): Weight for color difference term.
-            lambda_alpha (float): Weight for alpha difference term.
             device (torch.device): Device to perform computations on.
         """
         self.gaussians1 = copy.deepcopy(gaussians1)
@@ -483,12 +483,20 @@ class OptimalTransportSolver:
         Returns:
             torch.Tensor: Cost matrix of shape (K1, K2).
         """
+        
+        w, h = 1554, 1162
+        
+        means1_norm = self.means1 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
+        means2_norm = self.means2 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
+        # Get number of gaussians for each image
         k1 = self.means1.shape[0]
         k2 = self.means2.shape[0]
 
         # Create homogeneous coords
         ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
-        p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
+        # p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
+        p1_homo = torch.cat([means1_norm, ones1], dim=1)  # (K1,3)
+
         ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
         p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
 
@@ -522,6 +530,18 @@ class OptimalTransportSolver:
         # color difference
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
+        print("=== Before Normalization ===")
+        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+
+        # max_dim = 1554  # largest image dimension
+        # epipolar_dist = epipolar_dist /  (max_dim**2)
+        
+        print("=== After Normalization ===")
+        epipolar_dist = epipolar_dist / 2 # devide by 2 because we technically have 2 distances
+        d_color = d_color / 3.0
+        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # combine with weights, epipolar_dist can be scaled if needed
         cost_matrix = epipolar_dist + self.lambda_color * d_color
@@ -554,6 +574,9 @@ class OptimalTransportSolver:
             transport = self.unbalanced_sinkhorn_algorithm(
                 cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
             )
+            # transport = self.sinkhorn_algorithm(
+            #     cost_matrix, max_iter=10000, tol=1e-6
+            # )
 
             # Compute objective function
             loss = torch.sum(transport * cost_matrix)
