@@ -273,6 +273,7 @@ class Initial3DReconstructor:
         self.p1 = self.k1 @ np.hstack((self.r1, self.t1.reshape(3, 1)))
         self.p2 = self.k2 @ np.hstack((self.r2, self.t2.reshape(3, 1)))
         
+    @staticmethod
     def recover_extrinsics_from_fundamental(f, k1, k2, pts1=None, pts2=None):
         """
         Given a fundamental matrix F and camera intrinsics k1, k2, 
