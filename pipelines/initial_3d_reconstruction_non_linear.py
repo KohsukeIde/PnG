@@ -460,7 +460,6 @@ def main():
         lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=1.0,
-        lambda_alpha=1.0,
         device=device
     )
 
@@ -501,6 +500,7 @@ def main():
     h_dummy = np.eye(3)
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
     # reconstructor.compute_camera_matrices_from_homography()
+
     R_est, t_est = reconstructor.recover_extrinsics_from_fundamental(F_optimized, K1, K2)
     
     reconstructor.set_camera_matrices_explicitly(
@@ -684,7 +684,7 @@ def main():
     ##############################
     results = {
         # 'homography_matrix': H_optimized,
-        'fundamental_matrix': F_optimized,   # 新
+        'fundamental_matrix': F_optimized,   # new
         'cost_matrix': cost_matrix.cpu().numpy(),
         'transport_matrix': transport_matrix_np,
         'camera1_K': K1,
