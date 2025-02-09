@@ -220,7 +220,12 @@ class Initial3DReconstructor:
         self.match_pairs: Optional[List[Tuple[int, int]]] = None
 
     def compute_camera_matrices_from_homography(self) -> None:
-        """Compute camera projection matrices p1 and p2 from the homography matrix."""
+        """Compute camera projection matrices p1 and p2 from the homography matrix.
+
+        Note:
+            If you plan to use a Fundamental matrix approach (rather than a plane-induced homography),
+            you can skip this method and set p1, p2 explicitly with your own extrinsics.
+        """
         decomp = cv2.decomposeHomographyMat(self.h, self.k1)
 
         if decomp is None:
@@ -267,6 +272,79 @@ class Initial3DReconstructor:
 
         self.p1 = self.k1 @ np.hstack((self.r1, self.t1.reshape(3, 1)))
         self.p2 = self.k2 @ np.hstack((self.r2, self.t2.reshape(3, 1)))
+        
+    def recover_extrinsics_from_fundamental(f, k1, k2, pts1=None, pts2=None):
+        """
+        Given a fundamental matrix F and camera intrinsics k1, k2, 
+        recover extrinsics (R,t) using an essential matrix approach.
+        Optionally uses actual correspondences (pts1, pts2) to pick the correct solution.
+        
+        Args:
+            f (np.ndarray): shape (3,3) fundamental matrix
+            k1 (np.ndarray): shape (3,3) camera1 intrinsics
+            k2 (np.ndarray): shape (3,3) camera2 intrinsics
+            pts1 (Optional[np.ndarray]): shape (N,2) correspondences in image1 (pixel coords)
+            pts2 (Optional[np.ndarray]): shape (N,2) correspondences in image2 (pixel coords)
+        Returns:
+            (R, t): a tuple of rotation(3x3) and translation(3,) 
+                    up to scale (||t|| is unknown if using decomposeEssentialMat).
+        """
+        e = k2.T @ f @ k1  # E = K2^T * F * K1
+
+        # Enforce rank2 if needed
+        u, s, vt = np.linalg.svd(e)
+        s[-1] = 0.0
+        e = u @ np.diag(s) @ vt
+
+        # If we have actual matched points, we can use recoverPose for a single solution
+        if pts1 is not None and pts2 is not None:
+            # We assume pts1, pts2 are pixel coords -> convert to normalized for recoverPose
+            # (OpenCV can do that inside if we pass the intrinsics, but let's be consistent)
+            # shape(N,1,2) needed
+            pts1_undist = cv2.undistortPoints(
+                pts1.reshape(-1,1,2), cameraMatrix=k1, distCoeffs=None
+            )
+            pts2_undist = cv2.undistortPoints(
+                pts2.reshape(-1,1,2), cameraMatrix=k2, distCoeffs=None
+            )
+            # recoverPose => R, t
+            ret_val, R_est, t_est, mask = cv2.recoverPose(
+                e,
+                pts1_undist,
+                pts2_undist,
+            )
+            return R_est, t_est.flatten()
+        else:
+            # Without correspondences, we can only do decomposeEssentialMat => multiple solutions
+            R1, R2, t = cv2.decomposeEssentialMat(e)
+            # Usually, we pick the combination => (R1, t) or (R1, -t) or (R2, t) or (R2, -t)
+            # Then we would do a cheirality check with some 2D-2D matches if we had them.
+            # For now, let's just return the first possibility
+            return R1, t.flatten()
+
+    def set_camera_matrices_explicitly(
+            self, r1: np.ndarray, t1: np.ndarray, r2: np.ndarray, t2: np.ndarray
+        ) -> None:
+            """Set the camera matrices p1 and p2 explicitly from external parameters.
+
+            Args:
+                r1 (np.ndarray): Rotation (3x3) for camera1 (world->camera1).
+                t1 (np.ndarray): Translation (3,) for camera1.
+                r2 (np.ndarray): Rotation (3x3) for camera2 (world->camera2).
+                t2 (np.ndarray): Translation (3,) for camera2.
+            """
+            if r1.shape != (3, 3) or r2.shape != (3, 3):
+                raise ValueError("r1 and r2 must be 3x3 rotation matrices.")
+            if t1.shape != (3,) or t2.shape != (3,):
+                raise ValueError("t1 and t2 must be shape (3,) translation vectors.")
+
+            self.r1 = r1
+            self.t1 = t1
+            self.r2 = r2
+            self.t2 = t2
+
+            self.p1 = self.k1 @ np.hstack((self.r1, self.t1.reshape(3, 1)))
+            self.p2 = self.k2 @ np.hstack((self.r2, self.t2.reshape(3, 1)))
 
     def triangulate_gaussian_centers(
         self, transport_matrix: np.ndarray, threshold: float = 1e-3, top_k: int = 100
