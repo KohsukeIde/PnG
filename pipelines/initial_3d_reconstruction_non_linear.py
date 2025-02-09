@@ -467,26 +467,49 @@ def main():
     ##############################
     # 5) Homography optimization
     ##############################
-    solver.h = torch.eye(3, dtype=torch.float32, device=device)
-    print("\n--- Optimizing Homography ---")
-    solver.optimize_with_homography(max_iter=500, tol=1e-6)
+    # solver.h = torch.eye(3, dtype=torch.float32, device=device)
+    # print("\n--- Optimizing Homography ---")
+    # solver.optimize_with_homography(max_iter=500, tol=1e-6)
 
-    H_optimized = solver.h.detach().cpu().numpy()
-    print("\nOptimized Homography matrix:\n", H_optimized)
+    # H_optimized = solver.h.detach().cpu().numpy()
+    # print("\nOptimized Homography matrix:\n", H_optimized)
+    
+    ##############################
+    # 5) Fundamental matrix optimization
+    ##############################
+    print("\n--- Optimizing Fundamental Matrix ---")
+    solver.optimize_with_fundamental(max_iter=500, tol=1e-6)
+    F_optimized = solver.f.detach().cpu().numpy()
+    print("\nOptimized Fundamental matrix:\n", F_optimized)
 
     ##############################
     # 6) Final cost & unbalanced transport
     ##############################
+    # with torch.no_grad():
+    #     cost_matrix = solver.compute_cost_matrix(solver.h)
+    #     transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
+    #     transport_matrix_np = transport_matrix.cpu().numpy()
+        
     with torch.no_grad():
-        cost_matrix = solver.compute_cost_matrix(solver.h)
+        cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         transport_matrix_np = transport_matrix.cpu().numpy()
 
     ##############################
     # 7) Triangulate
     ##############################
-    reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, H_optimized)
-    reconstructor.compute_camera_matrices_from_homography()
+    h_dummy = np.eye(3)
+    reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
+    # reconstructor.compute_camera_matrices_from_homography()
+    R_est, t_est = reconstructor.recover_extrinsics_from_fundamental(F_optimized, K1, K2)
+    
+    reconstructor.set_camera_matrices_explicitly(
+        r1=np.eye(3), 
+        t1=np.zeros(3), 
+        r2=R_est, 
+        t2=t_est
+    )
+
     threshold = 1e-6
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold, top_k=100000)
     points_3d = reconstructor.points_3d
@@ -660,7 +683,8 @@ def main():
     # 12) Save final results
     ##############################
     results = {
-        'homography_matrix': H_optimized,
+        # 'homography_matrix': H_optimized,
+        'fundamental_matrix': F_optimized,   # 新
         'cost_matrix': cost_matrix.cpu().numpy(),
         'transport_matrix': transport_matrix_np,
         'camera1_K': K1,
