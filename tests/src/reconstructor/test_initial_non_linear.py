@@ -448,11 +448,14 @@ def test_3d_to_2d_and_back_non_linear():
         epsilon=0.1,
         lambda_mean=0.0,    # might set to 0 if you only want epipolar dist
         lambda_cov=0.0,     
-        lambda_color=0.0,   
+        lambda_color=0.0,  
+        lambda_epipolar=1.0,
         device=None
     )
     # Optimize fundamental
     solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
+    # solver.optimize_with_fundamental_svd(max_iter=1000, tol=1e-6)
+    
     # Get transport
     cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
     transport = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
