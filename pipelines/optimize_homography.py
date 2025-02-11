@@ -227,7 +227,7 @@ def main():
         lambda_mean=1,
         lambda_cov=1,
         lambda_color=1,
-        lambda_alpha=1,
+        lambda_epipolar=0.0,
         device=device
     )
 
