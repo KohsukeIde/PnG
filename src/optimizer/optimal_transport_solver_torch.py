@@ -323,7 +323,7 @@ class OptimalTransportSolver:
 
         transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
         return transport
-
+    
     def unbalanced_sinkhorn_algorithm(
         self,
         cost_matrix: torch.Tensor,
@@ -383,7 +383,7 @@ class OptimalTransportSolver:
             max_iter (int): Maximum number of iterations.
             tol (float): Convergence tolerance.
         """
-        transport_dir = os.path.join("results", "transport")
+        transport_dir = os.path.join("results", "transport_homography")
         os.makedirs(transport_dir, exist_ok=True)
 
         self.h = torch.eye(
@@ -565,9 +565,53 @@ class OptimalTransportSolver:
         cost_matrix = self.lambda_epipolar * epipolar_dist + self.lambda_color * d_color
 
         return cost_matrix
+    
+    
+    def compute_cost_matrix_fundamental_direct(self, f: torch.Tensor) -> torch.Tensor:
+        """Compute the cost matrix as the absolute value of x2^T F x1 in pixel space."""
+        
+    
+        k1 = self.means1.shape[0]
+        k2 = self.means2.shape[0]
 
-    
-    
+        # Homogeneous coords in pixel space
+        ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
+        p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
+
+        ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
+        p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
+
+        # Compute x2^T F x1 for all i,j
+        # p1_homo: (K1,3)
+        # p2_homo: (K2,3)
+        # We want a cost_matrix of shape (K1,K2).
+        # one way: cost[i,j] = | p2_homo[j] @ f @ p1_homo[i] |
+        # We can do a broadcast trick:
+
+        # (K2,3) x (3,3) -> (K2,3)
+        Fx1 = (f @ p1_homo.T).T  # shape (K1,3)
+        # Then x2^T Fx1: shape (K2, K1)
+        # But we want (K1, K2). So we can do:
+        cost_matrix = torch.abs(
+            (p2_homo.unsqueeze(1) * Fx1.unsqueeze(0)).sum(dim=2)
+        )
+        # => cost_matrix: (K2, K1). We might want to transpose it:
+        cost_matrix = cost_matrix.transpose(0,1)  # shape (K1,K2)
+
+        # (optionally) color difference
+        if self.lambda_color > 0:
+            color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
+            d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
+            cost_matrix = self.lambda_epipolar * cost_matrix + self.lambda_color * d_color 
+        else:
+            cost_matrix = self.lambda_epipolar * cost_matrix 
+        
+        print("=== Cost Matrix ===")
+        print(f"cost_matrix: min={cost_matrix.min():.6f}, max={cost_matrix.max():.6f}, mean={cost_matrix.mean():.6f}")
+
+        return cost_matrix
+
+
     def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
         """Optimize the Fundamental matrix F using epipolar distance + color difference. Enforce rank-2 during forward to avoid broken momentum of Adam.
 
@@ -591,7 +635,10 @@ class OptimalTransportSolver:
             # Use mat_rank2 for forward computation, but backpropagate to mat (original parameter)
             return mat + (mat_rank2 - mat).detach()
         
-        self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
+        if self.f is None:
+            self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
+        else:
+            self.f = nn.Parameter(self.f.clone().detach())
         optimizer = torch.optim.Adam([self.f], lr=1e-4)
         
         prev_loss_val = torch.tensor(float('inf'), device=self.device)
