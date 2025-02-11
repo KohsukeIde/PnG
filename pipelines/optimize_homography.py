@@ -183,12 +183,10 @@ def main():
 
     # Data paths
     data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63'
-    data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs'
-    # gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_1k.pkl')
-    # gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_1k.pkl')
+    data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/train_results_scan63_32_masked'
+    gaussians1_path = os.path.join(data_dir_gmm, '0022_fitted_gaussians.pkl')
+    gaussians2_path = os.path.join(data_dir_gmm, '0023_fitted_gaussians.pkl')
     
-    gaussians1_path = os.path.join(data_dir_gmm, 'fitted_gaussians_22_16.pkl')
-    gaussians2_path = os.path.join(data_dir_gmm, 'fitted_gaussians_23_16.pkl')
     colmap_dir = os.path.join(data_dir, 'sparse/0')
     
     image1_name = '0022.png'
