@@ -15,10 +15,9 @@ from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 from utils.gs_pkl_loader import load_gaussians_torch
 
-# これにより pickle 内の 'twodgs' モジュールを src.primitive.twod_gaussians_rs にマッピング
+# pickle 内の 'twodgs' モジュールを src.primitive.twod_gaussians_rs にマッピング
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
-# Homography用の可視化関数を流用
 from utils.homography_pipeline_visualization import (
     visualize_point_matches,
     visualize_epipolar_lines,
@@ -32,7 +31,7 @@ def get_top_correspondences_fundamental(solver, num_points=100):
     Sinkhorn / Unbalanced Sinkhorn から上位の対応点を貪欲に取り出す。
     """
     with torch.no_grad():
-        # Fundamental 用のコスト行列を計算（実装は solver 内にある想定）
+        # Fundamental 用のコスト行列を計算
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
     
@@ -139,7 +138,7 @@ def main():
         epsilon=0.1,
         lambda_mean=3.0,
         lambda_cov=1.0,
-        lambda_color=0.0,
+        lambda_color=0.0, # 一旦無効化
         lambda_epipolar=1.0, 
         device=device
     )
@@ -156,10 +155,10 @@ def main():
     # 6) Before Optimization
     print("\n--- Optimization Before ---")
     
-    # 対応点を抽出 (Fundamental 用)
+    # 輸送行列が最大のペアを抽出
     pts1_before, pts2_before = get_top_correspondences_fundamental(solver, num_points=1000)
 
-    # RANSAC で F を推定（あくまで可視化用・誤差評価用）
+    # RANSAC で F を推定
     F_before, mask_before = cv2.findFundamentalMat(
         pts1_before.astype(np.float32),
         pts2_before.astype(np.float32),
@@ -177,7 +176,8 @@ def main():
 
     # 7) Optimize with Fundamental
     print("\n--- Optimizing Fundamental Matrix ---")
-    # 初期値を numpy から torch に変換
+    
+    # 初期値としてRansacで推定したFを使用
     # F_torch = torch.from_numpy(F_before).float().to(device)
     # solver.f = F_torch
 
@@ -195,17 +195,15 @@ def main():
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         print_stats(transport_matrix, "Transport Matrix (after optimization)")
 
-        # Numpy 変換
         cost_matrix = cost_matrix.cpu().numpy()
         transport_matrix = transport_matrix.cpu().numpy()
 
     # 8) After Optimization
     print("\n--- Optimization After ---")
 
-    # 再度対応点を抽出
+    # 更新された輸送行列をもとに対応点を抽出
     pts1_after, pts2_after = get_top_correspondences_fundamental(solver, num_points=5000)
 
-    # RANSAC で F を推定し、エピポーラ誤差を計算
     F_after, mask_after = cv2.findFundamentalMat(
         pts1_after.astype(np.float32),
         pts2_after.astype(np.float32),
@@ -236,12 +234,15 @@ def main():
         sys.exit(1)
 
     # - Before
+    # Ransacで推定したFを可視化
     visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_before, output_dir='results/epilines_before_ransac')
     visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir='results/matches_before_ransac')
 
     # - After
+    # 最適化後のFを可視化
     visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_optimized, output_dir='results/epilines_after_optimized')
     visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after_optimized')
+    # Ransacで推定したFを可視化
     visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_after, output_dir='results/epilines_after_ransac')
     visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after_ransac')
     
