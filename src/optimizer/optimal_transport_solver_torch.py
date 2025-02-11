@@ -594,7 +594,7 @@ class OptimalTransportSolver:
         self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
         optimizer = torch.optim.Adam([self.f], lr=1e-4)
         
-        prev_loss_val = float('inf', device=self.device)
+        prev_loss_val = torch.tensor(float('inf'), device=self.device)
         loss_history = []
 
         for iteration in range(max_iter):
