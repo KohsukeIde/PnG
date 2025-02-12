@@ -135,7 +135,7 @@ def main():
         gaussians2=gaussians2,
         k1=K1,
         k2=K2,
-        epsilon=0.1,
+        epsilon=0.01,
         lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=0.0, # 一旦無効化
@@ -181,7 +181,7 @@ def main():
     # F_torch = torch.from_numpy(F_before).float().to(device)
     # solver.f = F_torch
 
-    solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
+    solver.optimize_with_fundamental(max_iter=1000, tol=1e-4)
 
     # ここで最適化された solver.f を取得
     F_optimized = solver.f.detach().cpu().numpy()
