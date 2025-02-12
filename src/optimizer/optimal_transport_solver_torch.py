@@ -818,159 +818,159 @@ class OptimalTransportSolver:
     #     self.f = self.f.detach()
 
 
-    def optimize_with_fundamental_visualize_momentum(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
-        """Optimize the Fundamental matrix F using epipolar distance + color difference. 
-        Enforce rank-2 during forward to avoid broken momentum of Adam.
+    # def optimize_with_fundamental_visualize_momentum(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+    #     """Optimize the Fundamental matrix F using epipolar distance + color difference. 
+    #     Enforce rank-2 during forward to avoid broken momentum of Adam.
 
-        Args:
-            max_iter (int): Maximum number of iterations.
-            tol (float): Convergence tolerance.
-        """
-        transport_dir = os.path.join("results", "transport_fundamental")
-        os.makedirs(transport_dir, exist_ok=True)
+    #     Args:
+    #         max_iter (int): Maximum number of iterations.
+    #         tol (float): Convergence tolerance.
+    #     """
+    #     transport_dir = os.path.join("results", "transport_fundamental")
+    #     os.makedirs(transport_dir, exist_ok=True)
 
-        def rank2_enforce(mat: torch.Tensor) -> torch.Tensor:
-            """Perform rank-2 projection in a no_grad block,
-            then do a 'straight-through' approach so that
-            the returned tensor still requires grad.
-            """
-            with torch.no_grad():
-                u, s, vt = torch.linalg.svd(mat, full_matrices=False)
-                s[-1] = 0.0
-                mat_rank2 = u @ torch.diag(s) @ vt
+    #     def rank2_enforce(mat: torch.Tensor) -> torch.Tensor:
+    #         """Perform rank-2 projection in a no_grad block,
+    #         then do a 'straight-through' approach so that
+    #         the returned tensor still requires grad.
+    #         """
+    #         with torch.no_grad():
+    #             u, s, vt = torch.linalg.svd(mat, full_matrices=False)
+    #             s[-1] = 0.0
+    #             mat_rank2 = u @ torch.diag(s) @ vt
             
-            # Use mat_rank2 for forward computation, but backpropagate to mat (original parameter)
-            return mat + (mat_rank2 - mat).detach()
+    #         # Use mat_rank2 for forward computation, but backpropagate to mat (original parameter)
+    #         return mat + (mat_rank2 - mat).detach()
         
-        # F の初期化
-        if self.f is None:
-            self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
-        else:
-            # 初期値がある場合はその値を使う（パイプライン側でsolver.fを設定）
-            self.f = nn.Parameter(self.f.clone().detach())
+    #     # F の初期化
+    #     if self.f is None:
+    #         self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
+    #     else:
+    #         # 初期値がある場合はその値を使う（パイプライン側でsolver.fを設定）
+    #         self.f = nn.Parameter(self.f.clone().detach())
 
-        # Adam オプティマイザ
-        optimizer = torch.optim.Adam([self.f], lr=1e-4)
+    #     # Adam オプティマイザ
+    #     optimizer = torch.optim.Adam([self.f], lr=1e-4)
         
-        # 収束判定用
-        prev_loss_val = torch.tensor(float('inf'), device=self.device)
-        loss_history = []
+    #     # 収束判定用
+    #     prev_loss_val = torch.tensor(float('inf'), device=self.device)
+    #     loss_history = []
 
-        # ★ 追加: Adamのモーメントと rank2 の差分ノルムを可視化するための配列
-        m1_norm_history = []
-        m2_norm_history = []
-        rank2_diff_history = []
+    #     # ★ 追加: Adamのモーメントと rank2 の差分ノルムを可視化するための配列
+    #     m1_norm_history = []
+    #     m2_norm_history = []
+    #     rank2_diff_history = []
 
-        for iteration in range(max_iter):
-            optimizer.zero_grad()
+    #     for iteration in range(max_iter):
+    #         optimizer.zero_grad()
 
-            # rank 2 enforce for forward computation
-            f_enforced = rank2_enforce(self.f)
+    #         # rank 2 enforce for forward computation
+    #         f_enforced = rank2_enforce(self.f)
 
-            # コスト行列の計算
-            cost_matrix = self.compute_cost_matrix_fundamental(f_enforced)
+    #         # コスト行列の計算
+    #         cost_matrix = self.compute_cost_matrix_fundamental(f_enforced)
             
-            # アンバランスドSinkhornでtransportを計算
-            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=1.0, max_iter=10000, tol=1e-6)
+    #         # アンバランスドSinkhornでtransportを計算
+    #         transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=1.0, max_iter=10000, tol=1e-6)
             
-            # ロス計算
-            loss = torch.sum(transport * cost_matrix)
-            loss.backward()
+    #         # ロス計算
+    #         loss = torch.sum(transport * cost_matrix)
+    #         loss.backward()
 
-            optimizer.step()
+    #         optimizer.step()
 
-            current_loss = loss.item()
-            loss_history.append(current_loss)
+    #         current_loss = loss.item()
+    #         loss_history.append(current_loss)
 
-            # ★ 追加: rank2_enforceでの差分ノルムを測る
-            #         f_enforced (ランク2投影後) と self.f (オリジナル) のノルム差
-            with torch.no_grad():
-                rank2_diff = (f_enforced - self.f).norm().item()
-                rank2_diff_history.append(rank2_diff)
+    #         # ★ 追加: rank2_enforceでの差分ノルムを測る
+    #         #         f_enforced (ランク2投影後) と self.f (オリジナル) のノルム差
+    #         with torch.no_grad():
+    #             rank2_diff = (f_enforced - self.f).norm().item()
+    #             rank2_diff_history.append(rank2_diff)
             
-            # ★ 追加: Adam のモーメントを取得してノルムを記録
-            with torch.no_grad():
-                # optimizer.state[self.f] に 'exp_avg' (m1) と 'exp_avg_sq' (m2) が入っている
-                m1 = optimizer.state[self.f]["exp_avg"]
-                m2 = optimizer.state[self.f]["exp_avg_sq"]
-                m1_norm_history.append(m1.norm().item())
-                m2_norm_history.append(m2.norm().item())
+    #         # ★ 追加: Adam のモーメントを取得してノルムを記録
+    #         with torch.no_grad():
+    #             # optimizer.state[self.f] に 'exp_avg' (m1) と 'exp_avg_sq' (m2) が入っている
+    #             m1 = optimizer.state[self.f]["exp_avg"]
+    #             m2 = optimizer.state[self.f]["exp_avg_sq"]
+    #             m1_norm_history.append(m1.norm().item())
+    #             m2_norm_history.append(m2.norm().item())
 
-            # 収束判定
-            if abs(prev_loss_val - current_loss) < tol:
-                print(f"Converged at iteration {iteration}")
-                break
-            prev_loss_val = current_loss
+    #         # 収束判定
+    #         if abs(prev_loss_val - current_loss) < tol:
+    #             print(f"Converged at iteration {iteration}")
+    #             break
+    #         prev_loss_val = current_loss
 
-            # debug print
-            if iteration % 5 == 0 or iteration == max_iter - 1:
-                grad_norm = 0.0
-                if self.f.grad is not None:
-                    grad_norm = self.f.grad.norm().item()
-                print(f"Iteration {iteration}, Loss={current_loss:.6f}, "
-                      f"F.grad norm={grad_norm:.6f}, rank2_diff={rank2_diff:.6f}")
+    #         # debug print
+    #         if iteration % 5 == 0 or iteration == max_iter - 1:
+    #             grad_norm = 0.0
+    #             if self.f.grad is not None:
+    #                 grad_norm = self.f.grad.norm().item()
+    #             print(f"Iteration {iteration}, Loss={current_loss:.6f}, "
+    #                   f"F.grad norm={grad_norm:.6f}, rank2_diff={rank2_diff:.6f}")
 
-            # show transport matrix (任意のタイミングで可視化)
-            if iteration % 10 == 0 or iteration == max_iter - 1:
-                with torch.no_grad():
-                    t_np = transport.detach().cpu().numpy()
-                    plt.figure(figsize=(8, 6))
-                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
-                    plt.colorbar(label="Transport Plan Value")
-                    plt.title(f"Transport Plan at Iteration {iteration}")
-                    plt.xlabel("Image 2 Gaussians")
-                    plt.ylabel("Image 1 Gaussians")
-                    plt.tight_layout()
-                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-                    plt.savefig(plt_path)
-                    plt.close()
-                    print(f"Transport matrix heatmap saved to '{plt_path}'")
+    #         # show transport matrix 
+    #         if iteration % 10 == 0 or iteration == max_iter - 1:
+    #             with torch.no_grad():
+    #                 t_np = transport.detach().cpu().numpy()
+    #                 plt.figure(figsize=(8, 6))
+    #                 plt.imshow(t_np, cmap="hot", interpolation="nearest")
+    #                 plt.colorbar(label="Transport Plan Value")
+    #                 plt.title(f"Transport Plan at Iteration {iteration}")
+    #                 plt.xlabel("Image 2 Gaussians")
+    #                 plt.ylabel("Image 1 Gaussians")
+    #                 plt.tight_layout()
+    #                 plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+    #                 plt.savefig(plt_path)
+    #                 plt.close()
+    #                 print(f"Transport matrix heatmap saved to '{plt_path}'")
 
-        # 最終的にランク2 enforce をかけて self.f に反映
-        with torch.no_grad():
-            final_rank2 = rank2_enforce(self.f)
-            self.f.copy_(final_rank2)
-            print("Final rank-2 enforcement on fundamental matrix.")
+    #     # 最終的にランク2 enforce をかけて self.f に反映
+    #     with torch.no_grad():
+    #         final_rank2 = rank2_enforce(self.f)
+    #         self.f.copy_(final_rank2)
+    #         print("Final rank-2 enforcement on fundamental matrix.")
 
-        # ====== visualization ======
+    #     # ====== visualization ======
 
-        # 1) Loss
-        plt.figure()
-        plt.plot(loss_history, label="loss")
-        plt.xlabel("Iteration")
-        plt.ylabel("Loss")
-        plt.title("Fundamental Optimization Loss")
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(transport_dir, "fundamental_loss.png"))
-        plt.close()
-        print(f"Saved fundamental loss plot to '{transport_dir}'")
+    #     # 1) Loss
+    #     plt.figure()
+    #     plt.plot(loss_history, label="loss")
+    #     plt.xlabel("Iteration")
+    #     plt.ylabel("Loss")
+    #     plt.title("Fundamental Optimization Loss")
+    #     plt.grid(True)
+    #     plt.legend()
+    #     plt.savefig(os.path.join(transport_dir, "fundamental_loss.png"))
+    #     plt.close()
+    #     print(f"Saved fundamental loss plot to '{transport_dir}'")
 
-        # 2) Rank-2差分 
-        plt.figure()
-        plt.plot(rank2_diff_history, label="rank2_diff")
-        plt.xlabel("Iteration")
-        plt.ylabel("||F_enforced - F||")
-        plt.title("Rank2 Difference per Iteration")
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(transport_dir, "rank2_diff.png"))
-        plt.close()
-        print(f"Saved rank2 difference plot to '{transport_dir}'")
+    #     # 2) Rank-2差分 
+    #     plt.figure()
+    #     plt.plot(rank2_diff_history, label="rank2_diff")
+    #     plt.xlabel("Iteration")
+    #     plt.ylabel("||F_enforced - F||")
+    #     plt.title("Rank2 Difference per Iteration")
+    #     plt.grid(True)
+    #     plt.legend()
+    #     plt.savefig(os.path.join(transport_dir, "rank2_diff.png"))
+    #     plt.close()
+    #     print(f"Saved rank2 difference plot to '{transport_dir}'")
 
-        # 3) Adam のモーメント ノルム
-        plt.figure()
-        plt.plot(m1_norm_history, label="exp_avg (1st moment) norm")
-        plt.plot(m2_norm_history, label="exp_avg_sq (2nd moment) norm")
-        plt.xlabel("Iteration")
-        plt.ylabel("Norm value")
-        plt.title("Adam Moments Norm")
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(transport_dir, "adam_moments.png"))
-        plt.close()
-        print(f"Saved Adam moments plot to '{transport_dir}'")
+    #     # 3) Adam のモーメント ノルム
+    #     plt.figure()
+    #     plt.plot(m1_norm_history, label="exp_avg (1st moment) norm")
+    #     plt.plot(m2_norm_history, label="exp_avg_sq (2nd moment) norm")
+    #     plt.xlabel("Iteration")
+    #     plt.ylabel("Norm value")
+    #     plt.title("Adam Moments Norm")
+    #     plt.grid(True)
+    #     plt.legend()
+    #     plt.savefig(os.path.join(transport_dir, "adam_moments.png"))
+    #     plt.close()
+    #     print(f"Saved Adam moments plot to '{transport_dir}'")
 
-        # detach
-        self.f = self.f.detach()
-        print("Done optimizing fundamental.")
+    #     # detach
+    #     self.f = self.f.detach()
+    #     print("Done optimizing fundamental.")
