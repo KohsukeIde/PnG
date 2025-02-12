@@ -139,7 +139,7 @@ def main():
         lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=0.0, # 一旦無効化
-        lambda_epipolar=1.0, 
+        lambda_epipolar=1e-4, 
         device=device
     )
 
