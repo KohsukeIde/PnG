@@ -486,10 +486,10 @@ class OptimalTransportSolver:
             torch.Tensor: Cost matrix of shape (K1, K2).
         """
         # 内部パラメータ行列 K の逆行列を使って画像座標を正規化平面（理想ピンホール）に変換も考えられる
-        w, h = 1554, 1162
+        # w, h = 1554, 1162
         
-        means1_norm = self.means1 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
-        means2_norm = self.means2 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
+        # means1_norm = self.means1 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
+        # means2_norm = self.means2 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
         # Get number of gaussians for each image
         k1 = self.means1.shape[0]
         k2 = self.means2.shape[0]
@@ -497,77 +497,79 @@ class OptimalTransportSolver:
         # Create homogeneous coords
         ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
         p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
-        p1_homo_norm = torch.cat([means1_norm, ones1], dim=1)  # (K1,3)
+        # p1_homo_norm = torch.cat([means1_norm, ones1], dim=1)  # (K1,3)
 
         ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
         p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
-        p2_homo_norm = torch.cat([means2_norm, ones2], dim=1)  # (K2,3)
+        # p2_homo_norm = torch.cat([means2_norm, ones2], dim=1)  # (K2,3)
 
         # Compute epipolar lines
         # line in image1 for each p2: l1 = F * p2
-        # l1 = (f @ p2_homo.T).T  # (K2,3)
-        # # line in image2 for each p1: l2 = F^T * p1
-        # l2 = (f.t() @ p1_homo.T).T  # (K1,3)
+        l1 = (f @ p2_homo.T).T  # (K2,3)
+        # line in image2 for each p1: l2 = F^T * p1
+        l2 = (f.t() @ p1_homo.T).T  # (K1,3)
         
         # Computeepipolar lines in normalized space
-        l1 = (f @ p2_homo_norm.T).T  # (K2,3)
-        l2 = (f.t() @ p1_homo_norm.T).T  # (K1,3)
+        # l1 = (f @ p2_homo_norm.T).T  # (K2,3)
+        # l2 = (f.t() @ p1_homo_norm.T).T  # (K1,3)
 
         # Define the distance p1-l1 + p2-l2 as a symmetrical epipolar cost
         # Dist from p1[i] to line l1[j]: |p1[i].dot(l1[j])| / sqrt(a^2 + b^2) where l1[j] = [a,b,c]
         # shape: (K1,K2)
 
         # shape (K1,1,3) * (1,K2,3,1) => (K1,K2,1,1)
-        # numerator_12 = torch.abs(
-        #     p1_homo.unsqueeze(1) @ l1.unsqueeze(2)
-        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        # denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
-        # denom_12 = denom_12.view(1, -1)  # (1,K2)
-        # dist_12 = numerator_12 / denom_12  # (K1,K2)
-        
-        numerator_12_norm = torch.abs(
-            p1_homo_norm.unsqueeze(1) @ l1.unsqueeze(2)
+        numerator_12 = torch.abs(
+            p1_homo.unsqueeze(1) @ l1.unsqueeze(2)
         ).squeeze(-1).squeeze(-1)  # (K1,K2)
         denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
         denom_12 = denom_12.view(1, -1)  # (1,K2)
-        dist_12_norm = numerator_12_norm / denom_12  # (K1,K2)
-
-        # numerator_21 = torch.abs(
-        #     p2_homo.unsqueeze(0) @ l2.unsqueeze(2)
-        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        # denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
-        # denom_21 = denom_21.view(-1, 1)  # (K1,1)
-        # dist_21 = numerator_21 / denom_21  # (K1,K2)
+        dist_12 = numerator_12 / denom_12  # (K1,K2)
         
-        numerator_21_norm = torch.abs(
-            p2_homo_norm.unsqueeze(0) @ l2.unsqueeze(2)
-        ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        denom_21_norm = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
-        denom_21_norm = denom_21_norm.view(-1, 1)  # (K1,1)
-        dist_21_norm = numerator_21_norm / denom_21_norm  # (K1,K2)
+        # numerator_12_norm = torch.abs(
+        #     p1_homo_norm.unsqueeze(1) @ l1.unsqueeze(2)
+        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        # denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
+        # denom_12 = denom_12.view(1, -1)  # (1,K2)
+        # dist_12_norm = numerator_12_norm / denom_12  # (K1,K2)
 
-        # epipolar_dist = dist_12 + dist_21
-        epipolar_dist_norm = dist_12_norm + dist_21_norm
+        numerator_21 = torch.abs(
+            p2_homo.unsqueeze(0) @ l2.unsqueeze(2)
+        ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
+        denom_21 = denom_21.view(-1, 1)  # (K1,1)
+        dist_21 = numerator_21 / denom_21  # (K1,K2)
+        
+        # numerator_21_norm = torch.abs(
+        #     p2_homo_norm.unsqueeze(0) @ l2.unsqueeze(2)
+        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        # denom_21_norm = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
+        # denom_21_norm = denom_21_norm.view(-1, 1)  # (K1,1)
+        # dist_21_norm = numerator_21_norm / denom_21_norm  # (K1,K2)
+
+        epipolar_dist = dist_12 + dist_21
+        # epipolar_dist_norm = dist_12_norm + dist_21_norm
         # color difference
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
         print("=== Before Normalization ===")
-        print(f"epipolar_dist: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
+        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        # print(f"epipolar_dist: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
         print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # max_dim = 1554  # largest image dimension
-        # epipolar_dist = epipolar_dist /  (max_dim**2)
         
-        epipolar_dist_norm = epipolar_dist_norm / 2 # オーダー調整
+        epipolar_dist = epipolar_dist /  2
+        # epipolar_dist_norm = epipolar_dist_norm / 2 # オーダー調整
         d_color = d_color / 3.0
         
         print("=== After Normalization ===")
-        print(f"epipolar_dist_norm: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
+        print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, max={self.lambda_epipolar * epipolar_dist.max():.6f}, mean={self.lambda_epipolar * epipolar_dist.mean():.6f}")
+        # print(f"epipolar_dist_norm: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
         print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
         
         # combine with weights, epipolar_dist can be scaled if needed
-        cost_matrix = self.lambda_epipolar * epipolar_dist_norm + self.lambda_color * d_color
-
+        cost_matrix = self.lambda_epipolar * epipolar_dist + self.lambda_color * d_color
+        # cost_matrix = self.lambda_epipolar * epipolar_dist_norm + self.lambda_color * d_color
         return cost_matrix
     
     #　ピクセル座標でのエピポーラコストを計算
@@ -615,7 +617,7 @@ class OptimalTransportSolver:
     #     return cost_matrix
 
 
-    def optimize_with_fundamental_original(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+    def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
         """Optimize the Fundamental matrix F using epipolar distance + color difference. Enforce rank-2 during forward to avoid broken momentum of Adam.
 
         Args:
@@ -816,7 +818,7 @@ class OptimalTransportSolver:
     #     self.f = self.f.detach()
 
 
-    def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+    def optimize_with_fundamental_visualize_momentum(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
         """Optimize the Fundamental matrix F using epipolar distance + color difference. 
         Enforce rank-2 during forward to avoid broken momentum of Adam.
 
@@ -930,9 +932,9 @@ class OptimalTransportSolver:
             self.f.copy_(final_rank2)
             print("Final rank-2 enforcement on fundamental matrix.")
 
-        # ====== 各種履歴を可視化して保存 ======
+        # ====== visualization ======
 
-        # 1) Loss の履歴
+        # 1) Loss
         plt.figure()
         plt.plot(loss_history, label="loss")
         plt.xlabel("Iteration")
@@ -944,7 +946,7 @@ class OptimalTransportSolver:
         plt.close()
         print(f"Saved fundamental loss plot to '{transport_dir}'")
 
-        # 2) Rank-2差分 の履歴
+        # 2) Rank-2差分 
         plt.figure()
         plt.plot(rank2_diff_history, label="rank2_diff")
         plt.xlabel("Iteration")
