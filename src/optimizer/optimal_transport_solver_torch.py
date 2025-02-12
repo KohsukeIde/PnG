@@ -105,224 +105,224 @@ class OptimalTransportSolver:
             self.gaussians2.alpha, dtype=torch.float32, device=self.device
         )  # Shape: (K2,)
 
-    def compute_cost_matrix(self, h: torch.Tensor) -> torch.Tensor:
-        """Compute the cost matrix between two sets of 2D Gaussians using a homography.
+    # def compute_cost_matrix(self, h: torch.Tensor) -> torch.Tensor:
+    #     """Compute the cost matrix between two sets of 2D Gaussians using a homography.
 
-        Args:
-            h (torch.Tensor): The homography transformation matrix (3x3).
+    #     Args:
+    #         h (torch.Tensor): The homography transformation matrix (3x3).
 
-        Returns:
-            torch.Tensor: Cost matrix of shape (K1, K2).
-        """
-        k1 = self.means1.shape[0]
+    #     Returns:
+    #         torch.Tensor: Cost matrix of shape (K1, K2).
+    #     """
+    #     k1 = self.means1.shape[0]
 
-        # 1) Transform means1 by homography h
-        ones = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
-        means1_h = torch.cat([self.means1, ones], dim=1)  # shape (K1, 3)
-        transformed_means1_h = (h @ means1_h.T).T  # shape (K1, 3)
-        transformed_means1 = transformed_means1_h[:, :2] / transformed_means1_h[
-            :, 2
-        ].unsqueeze(1)
+    #     # 1) Transform means1 by homography h
+    #     ones = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
+    #     means1_h = torch.cat([self.means1, ones], dim=1)  # shape (K1, 3)
+    #     transformed_means1_h = (h @ means1_h.T).T  # shape (K1, 3)
+    #     transformed_means1 = transformed_means1_h[:, :2] / transformed_means1_h[
+    #         :, 2
+    #     ].unsqueeze(1)
 
-        # 2) Compute Wasserstein distance components
-        mean_term, cov_term = self._wasserstein_distance(
-            transformed_means1,
-            self.scales1,
-            self.rotations1,
-            self.means2,
-            self.scales2,
-            self.rotations2,
-        )  # each shape (K1, K2)
+    #     # 2) Compute Wasserstein distance components
+    #     mean_term, cov_term = self._wasserstein_distance(
+    #         transformed_means1,
+    #         self.scales1,
+    #         self.rotations1,
+    #         self.means2,
+    #         self.scales2,
+    #         self.rotations2,
+    #     )  # each shape (K1, K2)
 
-        # 3) Compute color differences
-        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
-        d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
+    #     # 3) Compute color differences
+    #     color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
+    #     d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
 
-        # Debug prints (optional)
-        print("=== Before Normalization ===")
-        print(
-            f"mean_term: min={mean_term.min():.4f}, max={mean_term.max():.4f}, mean={mean_term.mean():.4f}"
-        )
-        print(
-            f"cov_term: min={cov_term.min():.4f}, max={cov_term.max():.4f}, mean={cov_term.mean():.4f}"
-        )
-        print(
-            f"d_color: min={d_color.min():.4f}, max={d_color.max():.4f}, mean={d_color.mean():.4f}"
-        )
+    #     # Debug prints (optional)
+    #     print("=== Before Normalization ===")
+    #     print(
+    #         f"mean_term: min={mean_term.min():.4f}, max={mean_term.max():.4f}, mean={mean_term.mean():.4f}"
+    #     )
+    #     print(
+    #         f"cov_term: min={cov_term.min():.4f}, max={cov_term.max():.4f}, mean={cov_term.mean():.4f}"
+    #     )
+    #     print(
+    #         f"d_color: min={d_color.min():.4f}, max={d_color.max():.4f}, mean={d_color.mean():.4f}"
+    #     )
 
-        # 6) Normalize each component (example approach)
-        max_dim = 1554  # largest image dimension
-        mean_term = mean_term / (max_dim**2)
-        cov_term = cov_term / (max_dim**2 / 100000)
-        d_color = d_color / 3.0
+    #     # 6) Normalize each component (example approach)
+    #     max_dim = 1554  # largest image dimension
+    #     mean_term = mean_term / (max_dim**2)
+    #     cov_term = cov_term / (max_dim**2 / 100000)
+    #     d_color = d_color / 3.0
 
-        print("=== After Normalization ===")
-        print(
-            f"mean_term: min={mean_term.min():.6f}, max={mean_term.max():.6f}, mean={mean_term.mean():.6f}"
-        )
-        print(
-            f"cov_term: min={cov_term.min():.6f}, max={cov_term.max():.6f}, mean={cov_term.mean():.6f}"
-        )
-        print(
-            f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}"
-        )
+    #     print("=== After Normalization ===")
+    #     print(
+    #         f"mean_term: min={mean_term.min():.6f}, max={mean_term.max():.6f}, mean={mean_term.mean():.6f}"
+    #     )
+    #     print(
+    #         f"cov_term: min={cov_term.min():.6f}, max={cov_term.max():.6f}, mean={cov_term.mean():.6f}"
+    #     )
+    #     print(
+    #         f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}"
+    #     )
 
-        cost_matrix = (
-            self.lambda_mean * mean_term
-            + self.lambda_cov * cov_term
-            + self.lambda_color * d_color
-        )
+    #     cost_matrix = (
+    #         self.lambda_mean * mean_term
+    #         + self.lambda_cov * cov_term
+    #         + self.lambda_color * d_color
+    #     )
 
-        print("=== Final Cost Matrix ===")
-        print(
-            f"cost_matrix: min={cost_matrix.min():.6f}, max={cost_matrix.max():.6f}, mean={cost_matrix.mean():.6f}"
-        )
+    #     print("=== Final Cost Matrix ===")
+    #     print(
+    #         f"cost_matrix: min={cost_matrix.min():.6f}, max={cost_matrix.max():.6f}, mean={cost_matrix.mean():.6f}"
+    #     )
 
-        return torch.as_tensor(cost_matrix)
+    #     return torch.as_tensor(cost_matrix)
 
-    def _construct_covariance(
-        self, scales: torch.Tensor, rotations: torch.Tensor
-    ) -> torch.Tensor:
-        """Construct covariance matrices from scales and rotations.
+    # def _construct_covariance(
+    #     self, scales: torch.Tensor, rotations: torch.Tensor
+    # ) -> torch.Tensor:
+    #     """Construct covariance matrices from scales and rotations.
 
-        Args:
-            scales (torch.Tensor): Scales (K, 2).
-            rotations (torch.Tensor): Rotations (K,).
+    #     Args:
+    #         scales (torch.Tensor): Scales (K, 2).
+    #         rotations (torch.Tensor): Rotations (K,).
 
-        Returns:
-            torch.Tensor: Covariance matrices (K, 2, 2).
-        """
-        cos_r = torch.cos(rotations)
-        sin_r = torch.sin(rotations)
+    #     Returns:
+    #         torch.Tensor: Covariance matrices (K, 2, 2).
+    #     """
+    #     cos_r = torch.cos(rotations)
+    #     sin_r = torch.sin(rotations)
 
-        # Rotation matrices
-        r = torch.stack(
-            [torch.stack([cos_r, -sin_r], dim=1), torch.stack([sin_r, cos_r], dim=1)],
-            dim=2,
-        )  # shape (K, 2, 2)
+    #     # Rotation matrices
+    #     r = torch.stack(
+    #         [torch.stack([cos_r, -sin_r], dim=1), torch.stack([sin_r, cos_r], dim=1)],
+    #         dim=2,
+    #     )  # shape (K, 2, 2)
 
-        # Scale matrices
-        s = torch.zeros(
-            (scales.shape[0], 2, 2), dtype=torch.float32, device=self.device
-        )
-        s[:, 0, 0] = scales[:, 0] ** 2
-        s[:, 1, 1] = scales[:, 1] ** 2
+    #     # Scale matrices
+    #     s = torch.zeros(
+    #         (scales.shape[0], 2, 2), dtype=torch.float32, device=self.device
+    #     )
+    #     s[:, 0, 0] = scales[:, 0] ** 2
+    #     s[:, 1, 1] = scales[:, 1] ** 2
 
-        # Covariance matrices
-        covariance = r @ s @ r.transpose(1, 2)  # shape (K, 2, 2)
-        return covariance
+    #     # Covariance matrices
+    #     covariance = r @ s @ r.transpose(1, 2)  # shape (K, 2, 2)
+    #     return covariance
 
-    def _matrix_sqrt(self, matrices: torch.Tensor) -> torch.Tensor:
-        """Compute the square root of batched 2x2 symmetric positive-definite matrices.
+    # def _matrix_sqrt(self, matrices: torch.Tensor) -> torch.Tensor:
+    #     """Compute the square root of batched 2x2 symmetric positive-definite matrices.
 
-        Args:
-            matrices (torch.Tensor): Input matrices of shape (..., 2, 2).
+    #     Args:
+    #         matrices (torch.Tensor): Input matrices of shape (..., 2, 2).
 
-        Returns:
-            torch.Tensor: Square root of the input matrices with same shape.
-        """
-        batch_shape = matrices.shape[:-2]
-        matrices_2d = matrices.reshape(-1, 2, 2)
+    #     Returns:
+    #         torch.Tensor: Square root of the input matrices with same shape.
+    #     """
+    #     batch_shape = matrices.shape[:-2]
+    #     matrices_2d = matrices.reshape(-1, 2, 2)
 
-        # Compute eigenvalues and eigenvectors for all matrices
-        eigenvalues, eigenvectors = torch.linalg.eigh(matrices_2d)
-        sqrt_eigenvalues = torch.sqrt(torch.clamp(eigenvalues, min=1e-10))
-        sqrt_eigenvalues = torch.diag_embed(sqrt_eigenvalues)
+    #     # Compute eigenvalues and eigenvectors for all matrices
+    #     eigenvalues, eigenvectors = torch.linalg.eigh(matrices_2d)
+    #     sqrt_eigenvalues = torch.sqrt(torch.clamp(eigenvalues, min=1e-10))
+    #     sqrt_eigenvalues = torch.diag_embed(sqrt_eigenvalues)
 
-        sqrt_matrices = eigenvectors @ sqrt_eigenvalues @ eigenvectors.transpose(-2, -1)
-        sqrt_matrices = sqrt_matrices.reshape(*batch_shape, 2, 2)
-        return torch.Tensor(sqrt_matrices)
+    #     sqrt_matrices = eigenvectors @ sqrt_eigenvalues @ eigenvectors.transpose(-2, -1)
+    #     sqrt_matrices = sqrt_matrices.reshape(*batch_shape, 2, 2)
+    #     return torch.Tensor(sqrt_matrices)
 
-    def _wasserstein_distance(
-        self,
-        means1: torch.Tensor,
-        scales1: torch.Tensor,
-        rotations1: torch.Tensor,
-        means2: torch.Tensor,
-        scales2: torch.Tensor,
-        rotations2: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the squared 2-Wasserstein distance components between two sets of Gaussians.
+    # def _wasserstein_distance(
+    #     self,
+    #     means1: torch.Tensor,
+    #     scales1: torch.Tensor,
+    #     rotations1: torch.Tensor,
+    #     means2: torch.Tensor,
+    #     scales2: torch.Tensor,
+    #     rotations2: torch.Tensor,
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     """Compute the squared 2-Wasserstein distance components between two sets of Gaussians.
 
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Mean term and covariance term (K1, K2).
-        """
-        k1, k2 = means1.shape[0], means2.shape[0]
+    #     Returns:
+    #         Tuple[torch.Tensor, torch.Tensor]: Mean term and covariance term (K1, K2).
+    #     """
+    #     k1, k2 = means1.shape[0], means2.shape[0]
 
-        # Mean difference
-        diff = means1.unsqueeze(1) - means2.unsqueeze(0)  # (K1,K2,2)
-        mean_term = torch.sum(diff**2, dim=2)  # (K1,K2)
+    #     # Mean difference
+    #     diff = means1.unsqueeze(1) - means2.unsqueeze(0)  # (K1,K2,2)
+    #     mean_term = torch.sum(diff**2, dim=2)  # (K1,K2)
 
-        # 2D covariance
-        sigma1 = self._construct_covariance(scales1, rotations1)  # (K1,2,2)
-        sigma2 = self._construct_covariance(scales2, rotations2)  # (K2,2,2)
+    #     # 2D covariance
+    #     sigma1 = self._construct_covariance(scales1, rotations1)  # (K1,2,2)
+    #     sigma2 = self._construct_covariance(scales2, rotations2)  # (K2,2,2)
 
-        sigma1_exp = sigma1.unsqueeze(1).expand(-1, k2, -1, -1)  # (K1,K2,2,2)
-        sigma2_exp = sigma2.unsqueeze(0).expand(k1, -1, -1, -1)  # (K1,K2,2,2)
+    #     sigma1_exp = sigma1.unsqueeze(1).expand(-1, k2, -1, -1)  # (K1,K2,2,2)
+    #     sigma2_exp = sigma2.unsqueeze(0).expand(k1, -1, -1, -1)  # (K1,K2,2,2)
 
-        sqrt_sigma1 = self._matrix_sqrt(sigma1)  # (K1,2,2)
-        sqrt_sigma1_exp = sqrt_sigma1.unsqueeze(1).expand(-1, k2, -1, -1)  # (K1,K2,2,2)
+    #     sqrt_sigma1 = self._matrix_sqrt(sigma1)  # (K1,2,2)
+    #     sqrt_sigma1_exp = sqrt_sigma1.unsqueeze(1).expand(-1, k2, -1, -1)  # (K1,K2,2,2)
 
-        intermediate = sqrt_sigma1_exp @ sigma2_exp @ sqrt_sigma1_exp
-        sqrt_intermediate = self._matrix_sqrt(intermediate)
+    #     intermediate = sqrt_sigma1_exp @ sigma2_exp @ sqrt_sigma1_exp
+    #     sqrt_intermediate = self._matrix_sqrt(intermediate)
 
-        trace_term = torch.diagonal(
-            sigma1_exp + sigma2_exp - 2 * sqrt_intermediate, dim1=-2, dim2=-1
-        ).sum(-1)  # (K1,K2)
+    #     trace_term = torch.diagonal(
+    #         sigma1_exp + sigma2_exp - 2 * sqrt_intermediate, dim1=-2, dim2=-1
+    #     ).sum(-1)  # (K1,K2)
 
-        return mean_term, trace_term
+    #     return mean_term, trace_term
 
-    def sinkhorn_algorithm(
-        self,
-        cost_matrix: torch.Tensor,
-        max_iter: int = 1000,
-        tol: float = 1e-6,
-    ) -> torch.Tensor:
-        """Implement the Sinkhorn algorithm for optimal transport.
+    # def sinkhorn_algorithm(
+    #     self,
+    #     cost_matrix: torch.Tensor,
+    #     max_iter: int = 1000,
+    #     tol: float = 1e-6,
+    # ) -> torch.Tensor:
+    #     """Implement the Sinkhorn algorithm for optimal transport.
 
-        Args:
-            cost_matrix (torch.Tensor): The cost matrix (K1, K2).
-            max_iter (int): Maximum number of iterations. Defaults to 1000.
-            tol (float): Convergence tolerance. Defaults to 1e-6.
+    #     Args:
+    #         cost_matrix (torch.Tensor): The cost matrix (K1, K2).
+    #         max_iter (int): Maximum number of iterations. Defaults to 1000.
+    #         tol (float): Convergence tolerance. Defaults to 1e-6.
 
-        Returns:
-            torch.Tensor: The transport plan matrix (K1, K2).
-        """
-        k1, k2 = cost_matrix.shape
-        kernel = torch.exp(-cost_matrix / self.epsilon)
+    #     Returns:
+    #         torch.Tensor: The transport plan matrix (K1, K2).
+    #     """
+    #     k1, k2 = cost_matrix.shape
+    #     kernel = torch.exp(-cost_matrix / self.epsilon)
 
-        alpha = self.alpha1 / self.alpha1.sum()
-        beta = self.alpha2 / self.alpha2.sum()
+    #     alpha = self.alpha1 / self.alpha1.sum()
+    #     beta = self.alpha2 / self.alpha2.sum()
 
-        # Initialize scaling vectors
-        u = torch.ones(k1, dtype=torch.float32, device=self.device)
-        v = torch.ones(k2, dtype=torch.float32, device=self.device)
+    #     # Initialize scaling vectors
+    #     u = torch.ones(k1, dtype=torch.float32, device=self.device)
+    #     v = torch.ones(k2, dtype=torch.float32, device=self.device)
 
-        for i in range(max_iter):
-            # Update u
-            kv = torch.matmul(kernel, v)
-            u_new = alpha / (kv + 1e-16)
+    #     for i in range(max_iter):
+    #         # Update u
+    #         kv = torch.matmul(kernel, v)
+    #         u_new = alpha / (kv + 1e-16)
 
-            # Update v
-            ktu = torch.matmul(kernel.t(), u_new)
-            v_new = beta / (ktu + 1e-16)
+    #         # Update v
+    #         ktu = torch.matmul(kernel.t(), u_new)
+    #         v_new = beta / (ktu + 1e-16)
 
-            # Check for convergence
-            if (
-                torch.max(torch.abs(u_new - u)) < tol
-                and torch.max(torch.abs(v_new - v)) < tol
-            ):
-                print(f"Sinkhorn converged at iteration {i}")
-                break
+    #         # Check for convergence
+    #         if (
+    #             torch.max(torch.abs(u_new - u)) < tol
+    #             and torch.max(torch.abs(v_new - v)) < tol
+    #         ):
+    #             print(f"Sinkhorn converged at iteration {i}")
+    #             break
 
-            u, v = u_new, v_new
+    #         u, v = u_new, v_new
 
-            if i % 100 == 0:
-                cur_sum = (u.unsqueeze(1) * kernel * v.unsqueeze(0)).sum().item()
-                print(f"Sinkhorn Iteration {i}, Transport sum: {cur_sum}")
+    #         if i % 100 == 0:
+    #             cur_sum = (u.unsqueeze(1) * kernel * v.unsqueeze(0)).sum().item()
+    #             print(f"Sinkhorn Iteration {i}, Transport sum: {cur_sum}")
 
-        transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
-        return transport
+    #     transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
+    #     return transport
     
     def unbalanced_sinkhorn_algorithm(
         self,
@@ -376,101 +376,101 @@ class OptimalTransportSolver:
         transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
         return transport
 
-    def optimize_with_homography(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
-        """Optimize the homography matrix H.
+    # def optimize_with_homography(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+    #     """Optimize the homography matrix H.
 
-        Args:
-            max_iter (int): Maximum number of iterations.
-            tol (float): Convergence tolerance.
-        """
-        transport_dir = os.path.join("results", "transport_homography")
-        os.makedirs(transport_dir, exist_ok=True)
+    #     Args:
+    #         max_iter (int): Maximum number of iterations.
+    #         tol (float): Convergence tolerance.
+    #     """
+    #     transport_dir = os.path.join("results", "transport_homography")
+    #     os.makedirs(transport_dir, exist_ok=True)
 
-        self.h = torch.eye(
-            3, dtype=torch.float32, device=self.device, requires_grad=True
-        )
-        optimizer = torch.optim.Adam([self.h], lr=1e-4)
-        prev_loss = torch.tensor(float("inf"), device=self.device)
+    #     self.h = torch.eye(
+    #         3, dtype=torch.float32, device=self.device, requires_grad=True
+    #     )
+    #     optimizer = torch.optim.Adam([self.h], lr=1e-4)
+    #     prev_loss = torch.tensor(float("inf"), device=self.device)
 
-        loss_history = []
+    #     loss_history = []
 
-        for iteration in tqdm(range(max_iter), desc="Optimization with Homography"):
-            optimizer.zero_grad()
+    #     for iteration in tqdm(range(max_iter), desc="Optimization with Homography"):
+    #         optimizer.zero_grad()
 
-            # Compute cost matrix with current h
-            cost_matrix = self.compute_cost_matrix(self.h)
-            # Compute transport plan using unbalanced Sinkhorn
-            transport = self.unbalanced_sinkhorn_algorithm(
-                cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
-            )
+    #         # Compute cost matrix with current h
+    #         cost_matrix = self.compute_cost_matrix(self.h)
+    #         # Compute transport plan using unbalanced Sinkhorn
+    #         transport = self.unbalanced_sinkhorn_algorithm(
+    #             cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
+    #         )
 
-            # Compute objective function
-            loss = torch.sum(transport * cost_matrix)
-            loss.backward()  # type: ignore
+    #         # Compute objective function
+    #         loss = torch.sum(transport * cost_matrix)
+    #         loss.backward()  # type: ignore
 
-            if iteration % 5 == 0 or iteration == max_iter - 1:
-                grad_norm = (
-                    self.h.grad.norm().item() if self.h.grad is not None else 0.0
-                )
-                print(
-                    f"Iteration {iteration}, Loss: {loss.item():.6f}, H.grad norm: {grad_norm:.6f}"
-                )
+    #         if iteration % 5 == 0 or iteration == max_iter - 1:
+    #             grad_norm = (
+    #                 self.h.grad.norm().item() if self.h.grad is not None else 0.0
+    #             )
+    #             print(
+    #                 f"Iteration {iteration}, Loss: {loss.item():.6f}, H.grad norm: {grad_norm:.6f}"
+    #             )
 
-            optimizer.step()
-            loss_history.append(loss.item())
+    #         optimizer.step()
+    #         loss_history.append(loss.item())
 
-            if iteration % 5 == 0 or iteration == max_iter - 1:
-                print(
-                    f"Iteration {iteration}, Loss={loss.item():.6f}, GradNorm={grad_norm:.6f}"
-                )
+    #         if iteration % 5 == 0 or iteration == max_iter - 1:
+    #             print(
+    #                 f"Iteration {iteration}, Loss={loss.item():.6f}, GradNorm={grad_norm:.6f}"
+    #             )
 
-            if iteration % 10 == 0 or iteration == max_iter - 1:
-                with torch.no_grad():
-                    t_np = transport.cpu().numpy()
-                    plt.figure(figsize=(8, 6))
-                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
-                    plt.colorbar(label="Transport Plan Value")
-                    plt.title(f"Transport Plan at Iteration {iteration}")
-                    plt.xlabel("Image 2 Gaussians")
-                    plt.ylabel("Image 1 Gaussians")
-                    plt.tight_layout()
-                    plt_path = os.path.join(
-                        transport_dir, f"transport_iter_{iteration}.png"
-                    )
-                    plt.savefig(plt_path)
-                    plt.close()
-                    print(f"Transport matrix heatmap saved to '{plt_path}'")
+    #         if iteration % 10 == 0 or iteration == max_iter - 1:
+    #             with torch.no_grad():
+    #                 t_np = transport.cpu().numpy()
+    #                 plt.figure(figsize=(8, 6))
+    #                 plt.imshow(t_np, cmap="hot", interpolation="nearest")
+    #                 plt.colorbar(label="Transport Plan Value")
+    #                 plt.title(f"Transport Plan at Iteration {iteration}")
+    #                 plt.xlabel("Image 2 Gaussians")
+    #                 plt.ylabel("Image 1 Gaussians")
+    #                 plt.tight_layout()
+    #                 plt_path = os.path.join(
+    #                     transport_dir, f"transport_iter_{iteration}.png"
+    #                 )
+    #                 plt.savefig(plt_path)
+    #                 plt.close()
+    #                 print(f"Transport matrix heatmap saved to '{plt_path}'")
 
-            if abs(prev_loss.item() - loss.item()) < tol:
-                print(f"Converged at iteration {iteration}")
-                break
-            prev_loss = loss
+    #         if abs(prev_loss.item() - loss.item()) < tol:
+    #             print(f"Converged at iteration {iteration}")
+    #             break
+    #         prev_loss = loss
 
-        with torch.no_grad():
-            print(f"Before normalization, H[2,2]: {self.h[2,2].item()}")
-            if self.h[2, 2] != 0:
-                h_norm = self.h / self.h[2, 2].clone()
-            else:
-                h_norm = self.h / torch.max(torch.abs(self.h)).clone()
-            self.h.copy_(h_norm)
-            print(f"After normalization, H[2,2]: {self.h[2,2].item()}")
+    #     with torch.no_grad():
+    #         print(f"Before normalization, H[2,2]: {self.h[2,2].item()}")
+    #         if self.h[2, 2] != 0:
+    #             h_norm = self.h / self.h[2, 2].clone()
+    #         else:
+    #             h_norm = self.h / torch.max(torch.abs(self.h)).clone()
+    #         self.h.copy_(h_norm)
+    #         print(f"After normalization, H[2,2]: {self.h[2,2].item()}")
 
-        # Detach final homography
-        self.h = self.h.detach()
+    #     # Detach final homography
+    #     self.h = self.h.detach()
 
-        # Visualize loss
-        plt.figure(figsize=(10, 6))
-        plt.plot(loss_history, label="Loss")
-        plt.xlabel("Iteration")
-        plt.ylabel("Loss")
-        plt.title("Optimization Loss over Iterations")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt_path = os.path.join("results", "optimization_loss.png")
-        plt.savefig(plt_path)
-        plt.close()
-        print(f"Optimization loss plot saved to '{plt_path}'")
+    #     # Visualize loss
+    #     plt.figure(figsize=(10, 6))
+    #     plt.plot(loss_history, label="Loss")
+    #     plt.xlabel("Iteration")
+    #     plt.ylabel("Loss")
+    #     plt.title("Optimization Loss over Iterations")
+    #     plt.legend()
+    #     plt.grid(True)
+    #     plt.tight_layout()
+    #     plt_path = os.path.join("results", "optimization_loss.png")
+    #     plt.savefig(plt_path)
+    #     plt.close()
+    #     print(f"Optimization loss plot saved to '{plt_path}'")
 
     # === Added below for Fundamental Matrix version ===
     def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
@@ -615,7 +615,7 @@ class OptimalTransportSolver:
     #     return cost_matrix
 
 
-    def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+    def optimize_with_fundamental_original(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
         """Optimize the Fundamental matrix F using epipolar distance + color difference. Enforce rank-2 during forward to avoid broken momentum of Adam.
 
         Args:
@@ -715,10 +715,110 @@ class OptimalTransportSolver:
 
 
     #計算遅いから一旦使わない
-    def optimize_with_fundamental_svd(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
-        """
-        Optimize the Fundamental matrix F using epipolar distance + color difference.
-        F is parameterized as F = U @ S @ V.T with S = diag(sigma1, sigma2, 0) so that F is always rank-2.
+    # def optimize_with_fundamental_svd(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+    #     """
+    #     Optimize the Fundamental matrix F using epipolar distance + color difference.
+    #     F is parameterized as F = U @ S @ V.T with S = diag(sigma1, sigma2, 0) so that F is always rank-2.
+
+    #     Args:
+    #         max_iter (int): Maximum number of iterations.
+    #         tol (float): Convergence tolerance.
+    #     """
+    #     transport_dir = os.path.join("results", "transport_fundamental")
+    #     os.makedirs(transport_dir, exist_ok=True)
+
+    #     # Initialize learnable parameters:
+    #     # - U and V are 3x3 matrices (initialized to identity) and will be re-orthonormalized.
+    #     # - raw_singular will be optimized and then converted to singular_vals using softplus (non-negative).
+    #     U_init = torch.eye(3, dtype=torch.float32, device=self.device)
+    #     V_init = torch.eye(3, dtype=torch.float32, device=self.device)
+    #     self.U = torch.nn.Parameter(U_init.clone())
+    #     self.V = torch.nn.Parameter(V_init.clone())
+    #     # Optimize raw singular values; softplus will ensure they remain non-negative.
+    #     self.raw_singular = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32, device=self.device))
+
+    #     # Adam now optimizes U, V, and raw_singular.
+    #     optimizer = torch.optim.Adam([self.U, self.V, self.raw_singular], lr=1e-4)
+    #     prev_loss = float("inf")
+    #     loss_history = []
+
+    #     for iteration in tqdm(range(max_iter), desc="Optimization with Fundamental"):
+    #         optimizer.zero_grad()
+
+    #         # Reconstruct F from the learnable parameters:
+    #         # 1. Orthonormalize U and V using QR decomposition.
+    #         U_q, _ = torch.linalg.qr(self.U)
+    #         # Create a new tensor if the determinant is negative. (No in-place modification)
+    #         if torch.det(U_q) < 0:
+    #             U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
+
+    #         V_q, _ = torch.linalg.qr(self.V)
+    #         if torch.det(V_q) < 0:
+    #             V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
+
+    #         # Convert raw_singular to non-negative singular values.
+    #         singular_vals = torch.nn.functional.softplus(self.raw_singular)
+    #         S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
+    #         S = torch.diag(S_diag)
+    #         F = U_q @ S @ V_q.T
+
+    #         # Compute cost matrix using the current F.
+    #         cost_matrix = self.compute_cost_matrix_fundamental(F)
+    #         # Compute transport plan using unbalanced Sinkhorn.
+    #         transport = self.unbalanced_sinkhorn_algorithm(
+    #             cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
+    #         )
+    #         # Define the loss as the inner product between transport and cost_matrix.
+    #         loss = torch.sum(transport * cost_matrix)
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         if iteration % 5 == 0 or iteration == max_iter - 1:
+    #             print(f"Iteration {iteration}, Loss={loss.item():.6f}")
+    #         loss_history.append(loss.item())
+
+    #         if abs(prev_loss - loss.item()) < tol:
+    #             print(f"Converged at iteration {iteration}")
+    #             break
+    #         prev_loss = loss.item()
+
+    #         if iteration % 100 == 0 or iteration == max_iter - 1:
+    #             with torch.no_grad():
+    #                 t_np = transport.cpu().numpy()
+    #                 plt.figure(figsize=(8, 6))
+    #                 plt.imshow(t_np, cmap="hot", interpolation="nearest")
+    #                 plt.colorbar(label="Transport Plan Value")
+    #                 plt.title(f"Transport Plan at Iteration {iteration}")
+    #                 plt.xlabel("Image 2 Gaussians")
+    #                 plt.ylabel("Image 1 Gaussians")
+    #                 plt.tight_layout()
+    #                 plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+    #                 plt.savefig(plt_path)
+    #                 plt.close()
+    #                 print(f"Transport matrix heatmap saved to '{plt_path}'")
+
+    #     # After optimization, reconstruct and save the final F.
+    #     with torch.no_grad():
+    #         U_q, _ = torch.linalg.qr(self.U)
+    #         if torch.det(U_q) < 0:
+    #             U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
+
+    #         V_q, _ = torch.linalg.qr(self.V)
+    #         if torch.det(V_q) < 0:
+    #             V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
+
+    #         singular_vals = torch.nn.functional.softplus(self.raw_singular)
+    #         S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
+    #         S = torch.diag(S_diag)
+    #         self.f = U_q @ S @ V_q.T
+    #         print("Final Fundamental matrix computed from SVD parameters.")
+
+    #     self.f = self.f.detach()
+
+
+    def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+        """Optimize the Fundamental matrix F using epipolar distance + color difference. 
+        Enforce rank-2 during forward to avoid broken momentum of Adam.
 
         Args:
             max_iter (int): Maximum number of iterations.
@@ -727,64 +827,91 @@ class OptimalTransportSolver:
         transport_dir = os.path.join("results", "transport_fundamental")
         os.makedirs(transport_dir, exist_ok=True)
 
-        # Initialize learnable parameters:
-        # - U and V are 3x3 matrices (initialized to identity) and will be re-orthonormalized.
-        # - raw_singular will be optimized and then converted to singular_vals using softplus (non-negative).
-        U_init = torch.eye(3, dtype=torch.float32, device=self.device)
-        V_init = torch.eye(3, dtype=torch.float32, device=self.device)
-        self.U = torch.nn.Parameter(U_init.clone())
-        self.V = torch.nn.Parameter(V_init.clone())
-        # Optimize raw singular values; softplus will ensure they remain non-negative.
-        self.raw_singular = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32, device=self.device))
+        def rank2_enforce(mat: torch.Tensor) -> torch.Tensor:
+            """Perform rank-2 projection in a no_grad block,
+            then do a 'straight-through' approach so that
+            the returned tensor still requires grad.
+            """
+            with torch.no_grad():
+                u, s, vt = torch.linalg.svd(mat, full_matrices=False)
+                s[-1] = 0.0
+                mat_rank2 = u @ torch.diag(s) @ vt
+            
+            # Use mat_rank2 for forward computation, but backpropagate to mat (original parameter)
+            return mat + (mat_rank2 - mat).detach()
+        
+        # F の初期化
+        if self.f is None:
+            self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
+        else:
+            # 初期値がある場合はその値を使う（パイプライン側でsolver.fを設定）
+            self.f = nn.Parameter(self.f.clone().detach())
 
-        # Adam now optimizes U, V, and raw_singular.
-        optimizer = torch.optim.Adam([self.U, self.V, self.raw_singular], lr=1e-4)
-        prev_loss = float("inf")
+        # Adam オプティマイザ
+        optimizer = torch.optim.Adam([self.f], lr=1e-4)
+        
+        # 収束判定用
+        prev_loss_val = torch.tensor(float('inf'), device=self.device)
         loss_history = []
 
-        for iteration in tqdm(range(max_iter), desc="Optimization with Fundamental"):
+        # ★ 追加: Adamのモーメントと rank2 の差分ノルムを可視化するための配列
+        m1_norm_history = []
+        m2_norm_history = []
+        rank2_diff_history = []
+
+        for iteration in range(max_iter):
             optimizer.zero_grad()
 
-            # Reconstruct F from the learnable parameters:
-            # 1. Orthonormalize U and V using QR decomposition.
-            U_q, _ = torch.linalg.qr(self.U)
-            # Create a new tensor if the determinant is negative. (No in-place modification)
-            if torch.det(U_q) < 0:
-                U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
+            # rank 2 enforce for forward computation
+            f_enforced = rank2_enforce(self.f)
 
-            V_q, _ = torch.linalg.qr(self.V)
-            if torch.det(V_q) < 0:
-                V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
-
-            # Convert raw_singular to non-negative singular values.
-            singular_vals = torch.nn.functional.softplus(self.raw_singular)
-            S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
-            S = torch.diag(S_diag)
-            F = U_q @ S @ V_q.T
-
-            # Compute cost matrix using the current F.
-            cost_matrix = self.compute_cost_matrix_fundamental(F)
-            # Compute transport plan using unbalanced Sinkhorn.
-            transport = self.unbalanced_sinkhorn_algorithm(
-                cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
-            )
-            # Define the loss as the inner product between transport and cost_matrix.
+            # コスト行列の計算
+            cost_matrix = self.compute_cost_matrix_fundamental(f_enforced)
+            
+            # アンバランスドSinkhornでtransportを計算
+            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=1.0, max_iter=10000, tol=1e-6)
+            
+            # ロス計算
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
+
             optimizer.step()
 
-            if iteration % 5 == 0 or iteration == max_iter - 1:
-                print(f"Iteration {iteration}, Loss={loss.item():.6f}")
-            loss_history.append(loss.item())
+            current_loss = loss.item()
+            loss_history.append(current_loss)
 
-            if abs(prev_loss - loss.item()) < tol:
+            # ★ 追加: rank2_enforceでの差分ノルムを測る
+            #         f_enforced (ランク2投影後) と self.f (オリジナル) のノルム差
+            with torch.no_grad():
+                rank2_diff = (f_enforced - self.f).norm().item()
+                rank2_diff_history.append(rank2_diff)
+            
+            # ★ 追加: Adam のモーメントを取得してノルムを記録
+            with torch.no_grad():
+                # optimizer.state[self.f] に 'exp_avg' (m1) と 'exp_avg_sq' (m2) が入っている
+                m1 = optimizer.state[self.f]["exp_avg"]
+                m2 = optimizer.state[self.f]["exp_avg_sq"]
+                m1_norm_history.append(m1.norm().item())
+                m2_norm_history.append(m2.norm().item())
+
+            # 収束判定
+            if abs(prev_loss_val - current_loss) < tol:
                 print(f"Converged at iteration {iteration}")
                 break
-            prev_loss = loss.item()
+            prev_loss_val = current_loss
 
-            if iteration % 100 == 0 or iteration == max_iter - 1:
+            # debug print
+            if iteration % 5 == 0 or iteration == max_iter - 1:
+                grad_norm = 0.0
+                if self.f.grad is not None:
+                    grad_norm = self.f.grad.norm().item()
+                print(f"Iteration {iteration}, Loss={current_loss:.6f}, "
+                      f"F.grad norm={grad_norm:.6f}, rank2_diff={rank2_diff:.6f}")
+
+            # show transport matrix (任意のタイミングで可視化)
+            if iteration % 10 == 0 or iteration == max_iter - 1:
                 with torch.no_grad():
-                    t_np = transport.cpu().numpy()
+                    t_np = transport.detach().cpu().numpy()
                     plt.figure(figsize=(8, 6))
                     plt.imshow(t_np, cmap="hot", interpolation="nearest")
                     plt.colorbar(label="Transport Plan Value")
@@ -797,21 +924,51 @@ class OptimalTransportSolver:
                     plt.close()
                     print(f"Transport matrix heatmap saved to '{plt_path}'")
 
-        # After optimization, reconstruct and save the final F.
+        # 最終的にランク2 enforce をかけて self.f に反映
         with torch.no_grad():
-            U_q, _ = torch.linalg.qr(self.U)
-            if torch.det(U_q) < 0:
-                U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
+            final_rank2 = rank2_enforce(self.f)
+            self.f.copy_(final_rank2)
+            print("Final rank-2 enforcement on fundamental matrix.")
 
-            V_q, _ = torch.linalg.qr(self.V)
-            if torch.det(V_q) < 0:
-                V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
+        # ====== 各種履歴を可視化して保存 ======
 
-            singular_vals = torch.nn.functional.softplus(self.raw_singular)
-            S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
-            S = torch.diag(S_diag)
-            self.f = U_q @ S @ V_q.T
-            print("Final Fundamental matrix computed from SVD parameters.")
+        # 1) Loss の履歴
+        plt.figure()
+        plt.plot(loss_history, label="loss")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title("Fundamental Optimization Loss")
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(os.path.join(transport_dir, "fundamental_loss.png"))
+        plt.close()
+        print(f"Saved fundamental loss plot to '{transport_dir}'")
 
+        # 2) Rank-2差分 の履歴
+        plt.figure()
+        plt.plot(rank2_diff_history, label="rank2_diff")
+        plt.xlabel("Iteration")
+        plt.ylabel("||F_enforced - F||")
+        plt.title("Rank2 Difference per Iteration")
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(os.path.join(transport_dir, "rank2_diff.png"))
+        plt.close()
+        print(f"Saved rank2 difference plot to '{transport_dir}'")
+
+        # 3) Adam のモーメント ノルム
+        plt.figure()
+        plt.plot(m1_norm_history, label="exp_avg (1st moment) norm")
+        plt.plot(m2_norm_history, label="exp_avg_sq (2nd moment) norm")
+        plt.xlabel("Iteration")
+        plt.ylabel("Norm value")
+        plt.title("Adam Moments Norm")
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(os.path.join(transport_dir, "adam_moments.png"))
+        plt.close()
+        print(f"Saved Adam moments plot to '{transport_dir}'")
+
+        # detach
         self.f = self.f.detach()
-
+        print("Done optimizing fundamental.")
