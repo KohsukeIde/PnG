@@ -505,21 +505,25 @@ class OptimalTransportSolver:
 
         # Compute epipolar lines
         # line in image1 for each p2: l1 = F * p2
-        l1 = (f @ p2_homo.T).T  # (K2,3)
-        # line in image2 for each p1: l2 = F^T * p1
-        l2 = (f.t() @ p1_homo.T).T  # (K1,3)
+        # l1 = (f @ p2_homo.T).T  # (K2,3)
+        # # line in image2 for each p1: l2 = F^T * p1
+        # l2 = (f.t() @ p1_homo.T).T  # (K1,3)
+        
+        # Computeepipolar lines in normalized space
+        l1 = (f @ p2_homo_norm.T).T  # (K2,3)
+        l2 = (f.t() @ p1_homo_norm.T).T  # (K1,3)
 
-        # We define the distance p1-l1 + p2-l2 as a symmetrical epipolar cost
-        # Dist from p1[i] to line l1[j]: |p1[i].dot(l1[j])| / sqrt(a^2 + b^2)
+        # Define the distance p1-l1 + p2-l2 as a symmetrical epipolar cost
+        # Dist from p1[i] to line l1[j]: |p1[i].dot(l1[j])| / sqrt(a^2 + b^2) where l1[j] = [a,b,c]
         # shape: (K1,K2)
 
         # shape (K1,1,3) * (1,K2,3,1) => (K1,K2,1,1)
-        numerator_12 = torch.abs(
-            p1_homo.unsqueeze(1) @ l1.unsqueeze(2)
-        ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
-        denom_12 = denom_12.view(1, -1)  # (1,K2)
-        dist_12 = numerator_12 / denom_12  # (K1,K2)
+        # numerator_12 = torch.abs(
+        #     p1_homo.unsqueeze(1) @ l1.unsqueeze(2)
+        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        # denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
+        # denom_12 = denom_12.view(1, -1)  # (1,K2)
+        # dist_12 = numerator_12 / denom_12  # (K1,K2)
         
         numerator_12_norm = torch.abs(
             p1_homo_norm.unsqueeze(1) @ l1.unsqueeze(2)
@@ -528,12 +532,12 @@ class OptimalTransportSolver:
         denom_12 = denom_12.view(1, -1)  # (1,K2)
         dist_12_norm = numerator_12_norm / denom_12  # (K1,K2)
 
-        numerator_21 = torch.abs(
-            p2_homo.unsqueeze(0) @ l2.unsqueeze(2)
-        ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
-        denom_21 = denom_21.view(-1, 1)  # (K1,1)
-        dist_21 = numerator_21 / denom_21  # (K1,K2)
+        # numerator_21 = torch.abs(
+        #     p2_homo.unsqueeze(0) @ l2.unsqueeze(2)
+        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        # denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
+        # denom_21 = denom_21.view(-1, 1)  # (K1,1)
+        # dist_21 = numerator_21 / denom_21  # (K1,K2)
         
         numerator_21_norm = torch.abs(
             p2_homo_norm.unsqueeze(0) @ l2.unsqueeze(2)
@@ -542,27 +546,27 @@ class OptimalTransportSolver:
         denom_21_norm = denom_21_norm.view(-1, 1)  # (K1,1)
         dist_21_norm = numerator_21_norm / denom_21_norm  # (K1,K2)
 
-        epipolar_dist = dist_12 + dist_21
+        # epipolar_dist = dist_12 + dist_21
         epipolar_dist_norm = dist_12_norm + dist_21_norm
         # color difference
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
         print("=== Before Normalization ===")
-        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        print(f"epipolar_dist: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
         print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # max_dim = 1554  # largest image dimension
         # epipolar_dist = epipolar_dist /  (max_dim**2)
         
-        epipolar_dist = epipolar_dist_norm / 200 # オーダー調整
+        epipolar_dist_norm = epipolar_dist_norm / 2 # オーダー調整
         d_color = d_color / 3.0
         
         print("=== After Normalization ===")
-        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        print(f"epipolar_dist_norm: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
         print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
         
         # combine with weights, epipolar_dist can be scaled if needed
-        cost_matrix = self.lambda_epipolar * epipolar_dist + self.lambda_color * d_color
+        cost_matrix = self.lambda_epipolar * epipolar_dist_norm + self.lambda_color * d_color
 
         return cost_matrix
     
@@ -637,6 +641,7 @@ class OptimalTransportSolver:
         if self.f is None:
             self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
         else:
+            # 初期値がある場合はその値を使う（パイプライン側でsolver.fを設定）
             self.f = nn.Parameter(self.f.clone().detach())
         optimizer = torch.optim.Adam([self.f], lr=1e-4)
         
@@ -674,7 +679,7 @@ class OptimalTransportSolver:
                 print(f"Iteration {iteration}, Loss={current_loss:.6f}, F.grad norm={grad_norm:.6f}")
 
             # show transport matrix
-            if iteration % 100 == 0 or iteration == max_iter - 1:
+            if iteration % 10 == 0 or iteration == max_iter - 1:
                 with torch.no_grad():
                     t_np = transport.detach().cpu().numpy()
                     plt.figure(figsize=(8, 6))
@@ -710,103 +715,103 @@ class OptimalTransportSolver:
 
 
     #計算遅いから一旦使わない
-    # def optimize_with_fundamental_svd(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
-    #     """
-    #     Optimize the Fundamental matrix F using epipolar distance + color difference.
-    #     F is parameterized as F = U @ S @ V.T with S = diag(sigma1, sigma2, 0) so that F is always rank-2.
+    def optimize_with_fundamental_svd(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
+        """
+        Optimize the Fundamental matrix F using epipolar distance + color difference.
+        F is parameterized as F = U @ S @ V.T with S = diag(sigma1, sigma2, 0) so that F is always rank-2.
 
-    #     Args:
-    #         max_iter (int): Maximum number of iterations.
-    #         tol (float): Convergence tolerance.
-    #     """
-    #     transport_dir = os.path.join("results", "transport_fundamental")
-    #     os.makedirs(transport_dir, exist_ok=True)
+        Args:
+            max_iter (int): Maximum number of iterations.
+            tol (float): Convergence tolerance.
+        """
+        transport_dir = os.path.join("results", "transport_fundamental")
+        os.makedirs(transport_dir, exist_ok=True)
 
-    #     # Initialize learnable parameters:
-    #     # - U and V are 3x3 matrices (initialized to identity) and will be re-orthonormalized.
-    #     # - raw_singular will be optimized and then converted to singular_vals using softplus (non-negative).
-    #     U_init = torch.eye(3, dtype=torch.float32, device=self.device)
-    #     V_init = torch.eye(3, dtype=torch.float32, device=self.device)
-    #     self.U = torch.nn.Parameter(U_init.clone())
-    #     self.V = torch.nn.Parameter(V_init.clone())
-    #     # Optimize raw singular values; softplus will ensure they remain non-negative.
-    #     self.raw_singular = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32, device=self.device))
+        # Initialize learnable parameters:
+        # - U and V are 3x3 matrices (initialized to identity) and will be re-orthonormalized.
+        # - raw_singular will be optimized and then converted to singular_vals using softplus (non-negative).
+        U_init = torch.eye(3, dtype=torch.float32, device=self.device)
+        V_init = torch.eye(3, dtype=torch.float32, device=self.device)
+        self.U = torch.nn.Parameter(U_init.clone())
+        self.V = torch.nn.Parameter(V_init.clone())
+        # Optimize raw singular values; softplus will ensure they remain non-negative.
+        self.raw_singular = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32, device=self.device))
 
-    #     # Adam now optimizes U, V, and raw_singular.
-    #     optimizer = torch.optim.Adam([self.U, self.V, self.raw_singular], lr=1e-4)
-    #     prev_loss = float("inf")
-    #     loss_history = []
+        # Adam now optimizes U, V, and raw_singular.
+        optimizer = torch.optim.Adam([self.U, self.V, self.raw_singular], lr=1e-4)
+        prev_loss = float("inf")
+        loss_history = []
 
-    #     for iteration in tqdm(range(max_iter), desc="Optimization with Fundamental"):
-    #         optimizer.zero_grad()
+        for iteration in tqdm(range(max_iter), desc="Optimization with Fundamental"):
+            optimizer.zero_grad()
 
-    #         # Reconstruct F from the learnable parameters:
-    #         # 1. Orthonormalize U and V using QR decomposition.
-    #         U_q, _ = torch.linalg.qr(self.U)
-    #         # Create a new tensor if the determinant is negative. (No in-place modification)
-    #         if torch.det(U_q) < 0:
-    #             U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
+            # Reconstruct F from the learnable parameters:
+            # 1. Orthonormalize U and V using QR decomposition.
+            U_q, _ = torch.linalg.qr(self.U)
+            # Create a new tensor if the determinant is negative. (No in-place modification)
+            if torch.det(U_q) < 0:
+                U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
 
-    #         V_q, _ = torch.linalg.qr(self.V)
-    #         if torch.det(V_q) < 0:
-    #             V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
+            V_q, _ = torch.linalg.qr(self.V)
+            if torch.det(V_q) < 0:
+                V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
 
-    #         # Convert raw_singular to non-negative singular values.
-    #         singular_vals = torch.nn.functional.softplus(self.raw_singular)
-    #         S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
-    #         S = torch.diag(S_diag)
-    #         F = U_q @ S @ V_q.T
+            # Convert raw_singular to non-negative singular values.
+            singular_vals = torch.nn.functional.softplus(self.raw_singular)
+            S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
+            S = torch.diag(S_diag)
+            F = U_q @ S @ V_q.T
 
-    #         # Compute cost matrix using the current F.
-    #         cost_matrix = self.compute_cost_matrix_fundamental(F)
-    #         # Compute transport plan using unbalanced Sinkhorn.
-    #         transport = self.unbalanced_sinkhorn_algorithm(
-    #             cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
-    #         )
-    #         # Define the loss as the inner product between transport and cost_matrix.
-    #         loss = torch.sum(transport * cost_matrix)
-    #         loss.backward()
-    #         optimizer.step()
+            # Compute cost matrix using the current F.
+            cost_matrix = self.compute_cost_matrix_fundamental(F)
+            # Compute transport plan using unbalanced Sinkhorn.
+            transport = self.unbalanced_sinkhorn_algorithm(
+                cost_matrix, rho=1.0, max_iter=10000, tol=1e-6
+            )
+            # Define the loss as the inner product between transport and cost_matrix.
+            loss = torch.sum(transport * cost_matrix)
+            loss.backward()
+            optimizer.step()
 
-    #         if iteration % 5 == 0 or iteration == max_iter - 1:
-    #             print(f"Iteration {iteration}, Loss={loss.item():.6f}")
-    #         loss_history.append(loss.item())
+            if iteration % 5 == 0 or iteration == max_iter - 1:
+                print(f"Iteration {iteration}, Loss={loss.item():.6f}")
+            loss_history.append(loss.item())
 
-    #         if abs(prev_loss - loss.item()) < tol:
-    #             print(f"Converged at iteration {iteration}")
-    #             break
-    #         prev_loss = loss.item()
+            if abs(prev_loss - loss.item()) < tol:
+                print(f"Converged at iteration {iteration}")
+                break
+            prev_loss = loss.item()
 
-    #         if iteration % 100 == 0 or iteration == max_iter - 1:
-    #             with torch.no_grad():
-    #                 t_np = transport.cpu().numpy()
-    #                 plt.figure(figsize=(8, 6))
-    #                 plt.imshow(t_np, cmap="hot", interpolation="nearest")
-    #                 plt.colorbar(label="Transport Plan Value")
-    #                 plt.title(f"Transport Plan at Iteration {iteration}")
-    #                 plt.xlabel("Image 2 Gaussians")
-    #                 plt.ylabel("Image 1 Gaussians")
-    #                 plt.tight_layout()
-    #                 plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-    #                 plt.savefig(plt_path)
-    #                 plt.close()
-    #                 print(f"Transport matrix heatmap saved to '{plt_path}'")
+            if iteration % 100 == 0 or iteration == max_iter - 1:
+                with torch.no_grad():
+                    t_np = transport.cpu().numpy()
+                    plt.figure(figsize=(8, 6))
+                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
+                    plt.colorbar(label="Transport Plan Value")
+                    plt.title(f"Transport Plan at Iteration {iteration}")
+                    plt.xlabel("Image 2 Gaussians")
+                    plt.ylabel("Image 1 Gaussians")
+                    plt.tight_layout()
+                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+                    plt.savefig(plt_path)
+                    plt.close()
+                    print(f"Transport matrix heatmap saved to '{plt_path}'")
 
-    #     # After optimization, reconstruct and save the final F.
-    #     with torch.no_grad():
-    #         U_q, _ = torch.linalg.qr(self.U)
-    #         if torch.det(U_q) < 0:
-    #             U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
+        # After optimization, reconstruct and save the final F.
+        with torch.no_grad():
+            U_q, _ = torch.linalg.qr(self.U)
+            if torch.det(U_q) < 0:
+                U_q = torch.cat([-U_q[:, :1], U_q[:, 1:]], dim=1)
 
-    #         V_q, _ = torch.linalg.qr(self.V)
-    #         if torch.det(V_q) < 0:
-    #             V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
+            V_q, _ = torch.linalg.qr(self.V)
+            if torch.det(V_q) < 0:
+                V_q = torch.cat([-V_q[:, :1], V_q[:, 1:]], dim=1)
 
-    #         singular_vals = torch.nn.functional.softplus(self.raw_singular)
-    #         S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
-    #         S = torch.diag(S_diag)
-    #         self.f = U_q @ S @ V_q.T
-    #         print("Final Fundamental matrix computed from SVD parameters.")
+            singular_vals = torch.nn.functional.softplus(self.raw_singular)
+            S_diag = torch.cat([singular_vals, torch.tensor([0.0], device=self.device)])
+            S = torch.diag(S_diag)
+            self.f = U_q @ S @ V_q.T
+            print("Final Fundamental matrix computed from SVD parameters.")
 
-    #     self.f = self.f.detach()
+        self.f = self.f.detach()
 
