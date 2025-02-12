@@ -181,7 +181,7 @@ def main():
     # F_torch = torch.from_numpy(F_before).float().to(device)
     # solver.f = F_torch
 
-    solver.optimize_with_fundamental(max_iter=1000, tol=1e-2)
+    solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
 
     # ここで最適化された solver.f を取得
     F_optimized = solver.f.detach().cpu().numpy()
