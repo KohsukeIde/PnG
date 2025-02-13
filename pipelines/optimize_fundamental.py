@@ -20,9 +20,9 @@ sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
 from utils.homography_pipeline_visualization import (
     visualize_point_matches,
-    visualize_epipolar_lines,
-    plot_epipolar_cost_change
-    # save_warped_image  # Fundamental optimizationでは使わない
+    visualize_epipolar_lines
+    # plot_epipolar_cost_change,  # <- RANSAC等の比較不要のため削除
+    # save_warped_image  # ← Fundamental optimizationでは使わない
 )
 
 def get_top_correspondences_fundamental(solver, num_points=100):
@@ -31,7 +31,6 @@ def get_top_correspondences_fundamental(solver, num_points=100):
     Sinkhorn / Unbalanced Sinkhorn から上位の対応点を貪欲に取り出す。
     """
     with torch.no_grad():
-        # Fundamental 用のコスト行列を計算
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
     
@@ -48,7 +47,7 @@ def get_top_correspondences_fundamental(solver, num_points=100):
     used_cols = set()
     matches = []
 
-    flat_indices = np.argsort(-T_np.flatten())  # 降順ソート
+    flat_indices = np.argsort(-T_np.ravel())  # 降順ソート
     rows, cols = np.unravel_index(flat_indices, T_np.shape)
     
     for row, col in zip(rows, cols):
@@ -80,20 +79,6 @@ def get_top_correspondences_fundamental(solver, num_points=100):
 
     return pts1, pts2
 
-def compute_epipolar_cost_cv2(F, pts1, pts2):
-    """Compute the average epipolar constraint residuals for given correspondences.
-       epipolar residual = mean( |x2^T F x1| ).
-    """
-    if F is None or F.shape != (3, 3):
-        return float('inf')
-    pts1_h = np.hstack([pts1, np.ones((pts1.shape[0], 1))])
-    pts2_h = np.hstack([pts2, np.ones((pts2.shape[0], 1))])
-
-    Fx1 = F @ pts1_h.T
-    x2Fx1 = np.sum(pts2_h * Fx1.T, axis=1)
-    residuals = np.abs(x2Fx1)
-    return np.mean(residuals)
-
 def main():
     # 1) Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -123,6 +108,7 @@ def main():
 
     camera1_id = images_data[image1_id]['camera_id']
     camera2_id = images_data[image2_id]['camera_id']
+
     camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
     camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
 
@@ -130,6 +116,7 @@ def main():
     K2 = camera2.K
 
     # 5) Initialize Solver
+    #    -> パラメータは従来通り: epsilon=0.01, lambda_mean=3.0, lambda_cov=1.0, lambda_color=0.0, lambda_epipolar=1e-4
     solver = OptimalTransportSolver(
         gaussians1=gaussians1,
         gaussians2=gaussians2,
@@ -138,12 +125,15 @@ def main():
         epsilon=0.01,
         lambda_mean=3.0,
         lambda_cov=1.0,
-        lambda_color=0.0, # 一旦無効化
-        lambda_epipolar=1e-4, 
+        lambda_color=0.0,
+        lambda_epipolar=1e-4,
         device=device
     )
 
+    # 初期 F を恒等行列(3x3)
     solver.f = torch.eye(3, device=device, dtype=torch.float32)
+
+    # Helper function: debug stats
     def print_stats(tensor, name):
         print(f"\n{name} statistics:")
         print(f"  Min: {tensor.min().item()}")
@@ -155,32 +145,11 @@ def main():
     # 6) Before Optimization
     print("\n--- Optimization Before ---")
     
-    # 輸送行列が最大のペアを抽出
+    # 輸送行列が高い対応(最大で 1000組)を可視化
     pts1_before, pts2_before = get_top_correspondences_fundamental(solver, num_points=1000)
-
-    # RANSAC で F を推定
-    F_before, mask_before = cv2.findFundamentalMat(
-        pts1_before.astype(np.float32),
-        pts2_before.astype(np.float32),
-        cv2.FM_RANSAC
-    )
-    if F_before is not None and F_before.shape == (3, 3):
-        print("\nEstimated Fundamental Matrix (RANSAC) Before Optimization:")
-        print(F_before)
-    else:
-        print("Failed to estimate Fundamental Matrix before optimization.")
-        F_before = np.eye(3, dtype=np.float32)
-
-    epipolar_cost_before = compute_epipolar_cost_cv2(F_before, pts1_before, pts2_before)
-    print(f"Epipolar Cost Before Optimization: {epipolar_cost_before:.6f}")
 
     # 7) Optimize with Fundamental
     print("\n--- Optimizing Fundamental Matrix ---")
-    
-    # 初期値としてRansacで推定したFを使用
-    # F_torch = torch.from_numpy(F_before).float().to(device)
-    # solver.f = F_torch
-
     solver.optimize_with_fundamental(max_iter=1000, tol=1e-4)
 
     # ここで最適化された solver.f を取得
@@ -192,38 +161,20 @@ def main():
     with torch.no_grad():
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         print_stats(cost_matrix, "Cost Matrix (after optimization)")
+
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         print_stats(transport_matrix, "Transport Matrix (after optimization)")
 
-        cost_matrix = cost_matrix.cpu().numpy()
-        transport_matrix = transport_matrix.cpu().numpy()
+        cost_matrix_np = cost_matrix.cpu().numpy()
+        transport_matrix_np = transport_matrix.cpu().numpy()
 
     # 8) After Optimization
     print("\n--- Optimization After ---")
 
-    # 更新された輸送行列をもとに対応点を抽出
+    # 再度対応点を抽出 (最大で 5000組)
     pts1_after, pts2_after = get_top_correspondences_fundamental(solver, num_points=5000)
 
-    F_after, mask_after = cv2.findFundamentalMat(
-        pts1_after.astype(np.float32),
-        pts2_after.astype(np.float32),
-        cv2.FM_RANSAC
-    )
-    if F_after is not None and F_after.shape == (3, 3):
-        print("\nEstimated Fundamental Matrix (RANSAC) After Optimization:")
-        print(F_after)
-    else:
-        print("Failed to estimate Fundamental Matrix after optimization.")
-        F_after = np.eye(3, dtype=np.float32)
-        
-
-    epipolar_cost_after = compute_epipolar_cost_cv2(F_optimized, pts1_after, pts2_after)
-    print(f"Epipolar Cost After Optimization: {epipolar_cost_after:.6f}")
-
-    # 9) Plot epipolar cost change
-    plot_epipolar_cost_change(epipolar_cost_before, epipolar_cost_after, output_dir='results')
-
-    # 10) Visualize epipolar lines and corresponding points
+    # 画像パス
     image1_path = os.path.join(data_dir, 'images', image1_name)
     image2_path = os.path.join(data_dir, 'images', image2_name)
     img1 = cv2.imread(image1_path)
@@ -233,35 +184,30 @@ def main():
         print(f"Failed to load images for visualization.")
         sys.exit(1)
 
+    # 9) Visualize epipolar lines and corresponding points
     # - Before
-    # Ransacで推定したFを可視化
-    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_before, output_dir='results/epilines_before_ransac')
-    visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir='results/matches_before_ransac')
+    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_optimized, output_dir='results/epilines_before')
+    visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir='results/matches_before')
 
     # - After
-    # 最適化後のFを可視化
-    visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_optimized, output_dir='results/epilines_after_optimized')
-    visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after_optimized')
-    # Ransacで推定したFを可視化
-    visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_after, output_dir='results/epilines_after_ransac')
-    visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after_ransac')
-    
+    visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_optimized, output_dir='results/epilines_after')
+    visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after')
 
-    # 11) Save results as pickle
+    # 10) Save results as pickle
     output_dir = 'results'
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, 'fundamental_optimization_results.pkl')
 
     results = {
         'fundamental_matrix_optimized': F_optimized,
-        'fundamental_matrix_before_ransac': F_before,
-        'fundamental_matrix_after_ransac': F_after,
-        'epipolar_cost_before': epipolar_cost_before,
-        'epipolar_cost_after': epipolar_cost_after,
-        'cost_matrix': cost_matrix,
-        'transport_matrix': transport_matrix,
+        'cost_matrix': cost_matrix_np,
+        'transport_matrix': transport_matrix_np,
         'camera1_K': K1,
         'camera2_K': K2,
+        'pts1_before': pts1_before,
+        'pts2_before': pts2_before,
+        'pts1_after': pts1_after,
+        'pts2_after': pts2_after,
     }
 
     with open(output_path, 'wb') as f:
@@ -269,9 +215,9 @@ def main():
 
     print(f"\nResults saved to {output_path}")
     print("Optimization Statistics:")
-    print(f"  Final transport matrix shape: {transport_matrix.shape}")
-    print(f"  Transport matrix sum: {transport_matrix.sum()}")
-    print(f"  Final cost matrix mean: {cost_matrix.mean()}")
+    print(f"  Final transport matrix shape: {transport_matrix_np.shape}")
+    print(f"  Transport matrix sum: {transport_matrix_np.sum()}")
+    print(f"  Final cost matrix mean: {cost_matrix_np.mean()}")
 
 if __name__ == '__main__':
     main()
