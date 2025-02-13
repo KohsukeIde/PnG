@@ -654,7 +654,7 @@ class OptimalTransportSolver:
         else:
             # 初期値がある場合はその値を使う（パイプライン側でsolver.fを設定）
             self.f = nn.Parameter(self.f.clone().detach())
-        optimizer = torch.optim.Adam([self.f], lr=1e-2)
+        optimizer = torch.optim.Adam([self.f], lr=1e-3)
         
         prev_loss_val = torch.tensor(float('inf'), device=self.device)
         loss_history = []
