@@ -79,6 +79,8 @@ def get_top_correspondences_fundamental(solver, num_points=100):
 
     return pts1, pts2
 
+
+
 def main():
     # 1) Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,7 +118,6 @@ def main():
     K2 = camera2.K
 
     # 5) Initialize Solver
-    #    -> パラメータは従来通り: epsilon=0.01, lambda_mean=3.0, lambda_cov=1.0, lambda_color=0.0, lambda_epipolar=1e-4
     solver = OptimalTransportSolver(
         gaussians1=gaussians1,
         gaussians2=gaussians2,
@@ -126,12 +127,59 @@ def main():
         lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=0.0,
-        lambda_epipolar=1e-4,
+        lambda_epipolar=0.1,
         device=device
     )
 
-    # 初期 F を恒等行列(3x3)
-    solver.f = torch.eye(3, device=device, dtype=torch.float32)
+    # 画像読み込み（SIFT/ORBはグレースケール使用）
+    image1_path = os.path.join(data_dir, 'images', image1_name)
+    image2_path = os.path.join(data_dir, 'images', image2_name)
+    img1_color = cv2.imread(image1_path)
+    img2_color = cv2.imread(image2_path)
+    if img1_color is None or img2_color is None:
+        print(f"Failed to load images for visualization.")
+        sys.exit(1)
+
+    img1_gray = cv2.cvtColor(img1_color, cv2.COLOR_BGR2GRAY)
+    img2_gray = cv2.cvtColor(img2_color, cv2.COLOR_BGR2GRAY)
+
+    # 特徴量検出 (SIFT)
+    sift = cv2.SIFT_create()  # cv2.SIFT_create() はOpenCVのバージョンに依存
+    keypoints1, descriptors1 = sift.detectAndCompute(img1_gray, None)
+    keypoints2, descriptors2 = sift.detectAndCompute(img2_gray, None)
+
+    # BFMatcher でマッチング + ratio test
+    bf = cv2.BFMatcher()
+    knn_matches = bf.knnMatch(descriptors1, descriptors2, k=2)
+
+    good_matches = []
+    ratio_threshold = 0.7
+    for m, n in knn_matches:
+        if m.distance < ratio_threshold * n.distance:
+            good_matches.append(m)
+
+    # キーポイントの座標を取得
+    pts1_before = []
+    pts2_before = []
+    for m in good_matches:
+        pts1_before.append(keypoints1[m.queryIdx].pt)
+        pts2_before.append(keypoints2[m.trainIdx].pt)
+
+    pts1_before = np.array(pts1_before, dtype=np.float32)
+    pts2_before = np.array(pts2_before, dtype=np.float32)
+
+    # 6) Use RANSAC to get initial F
+    F_ransac, mask_before = cv2.findFundamentalMat(
+        pts1_before,
+        pts2_before,
+        cv2.FM_RANSAC
+    )
+    print("\n--- Optimization Before ---")
+    print("\nInitial F from ransac")
+    print(F_ransac)
+
+    # 7) Set solver.f to F_ransac
+    solver.f = torch.from_numpy(F_ransac).float().to(device)
 
     # Helper function: debug stats
     def print_stats(tensor, name):
@@ -142,20 +190,22 @@ def main():
         print(f"  Has NaN: {torch.isnan(tensor).any().item()}")
         print(f"  Has Inf: {torch.isinf(tensor).any().item()}")
 
-    # 6) Before Optimization
-    print("\n--- Optimization Before ---")
-    
-    # 輸送行列が高い対応(最大で 1000組)を可視化
-    pts1_before, pts2_before = get_top_correspondences_fundamental(solver, num_points=1000)
-
     # 7) Optimize with Fundamental
     print("\n--- Optimizing Fundamental Matrix ---")
-    solver.optimize_with_fundamental(max_iter=1000, tol=1e-4)
+    solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
 
-    # ここで最適化された solver.f を取得
+    
+    print("Initial F from ransac")
+    print(F_ransac)
+    
+    # 最適化された solver.f を取得
     F_optimized = solver.f.detach().cpu().numpy()
     print("\nOptimized Fundamental matrix:")
     print(F_optimized)
+    
+    # F_optimized_scaled = scale_F_for_visualization(F_optimized)
+    # print("Optimized Fundamental matrix (scaled for visualization):")
+    # print(F_optimized_scaled)
 
     # コスト行列を確認
     with torch.no_grad():
@@ -186,7 +236,7 @@ def main():
 
     # 9) Visualize epipolar lines and corresponding points
     # - Before
-    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_optimized, output_dir='results/epilines_before')
+    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_ransac, output_dir='results/epilines_before')
     visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir='results/matches_before')
 
     # - After
