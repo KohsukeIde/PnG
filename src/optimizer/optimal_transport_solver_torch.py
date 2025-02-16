@@ -211,6 +211,57 @@ class OptimalTransportSolver:
     #     # Covariance matrices
     #     covariance = r @ s @ r.transpose(1, 2)  # shape (K, 2, 2)
     #     return covariance
+    
+    def rodrigues(self, rvec: torch.Tensor) -> torch.Tensor:
+        """
+        PyTorch実装のRodrigues変換 (OpenCVのcv2.Rodrigues相当)。
+        rvec: (3,) -> 回転ベクトル
+        戻り値: (3,3) 回転行列
+        """
+        # ノルム(回転角)
+        theta = torch.norm(rvec) + 1e-12
+        # 単位方向
+        r_axis = rvec / theta
+
+        # 外積行列Kを「定数tensor([...])」ではなく，zeros + 代入で組み立て
+        K = torch.zeros((3,3), dtype=torch.float32, device=rvec.device)
+        K[0,1] = -r_axis[2]
+        K[0,2] =  r_axis[1]
+        K[1,0] =  r_axis[2]
+        K[1,2] = -r_axis[0]
+        K[2,0] = -r_axis[1]
+        K[2,1] =  r_axis[0]
+
+        # Rodrigues formula
+        I = torch.eye(3, dtype=torch.float32, device=rvec.device)
+        R = I + torch.sin(theta)*K + (1.0 - torch.cos(theta))*(K @ K)
+        return R
+
+    def build_f_from_rt(self, rvec: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
+        """
+        rvec, tvec から F を構築。
+        F = K2^-T [t]_x R K1^-1
+        """
+        R = self.rodrigues(rvec)
+
+        # [t]_x も同様に zeros + 代入で組み立て
+        tx = torch.zeros((3,3), device=self.device)
+        tx[0,1] = -tvec[2]
+        tx[0,2] =  tvec[1]
+        tx[1,0] =  tvec[2]
+        tx[1,2] = -tvec[0]
+        tx[2,0] = -tvec[1]
+        tx[2,1] =  tvec[0]
+
+        E = tx @ R  # (3,3)
+
+        K1_inv = torch.inverse(self.k1)
+        K2_inv = torch.inverse(self.k2)
+        K2_inv_T = K2_inv.transpose(0,1)
+
+        F = K2_inv_T @ E @ K1_inv
+        return F
+
 
     # def _matrix_sqrt(self, matrices: torch.Tensor) -> torch.Tensor:
     #     """Compute the square root of batched 2x2 symmetric positive-definite matrices.
@@ -520,8 +571,101 @@ class OptimalTransportSolver:
     #     print(f"cost_matrix: min={cost_matrix.min():.6f}, max={cost_matrix.max():.6f}, mean={cost_matrix.mean():.6f}")
 
     #     return cost_matrix
-
+    
     def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+        """Compute the cost matrix between two sets of 2D Gaussians using the Sampson error
+        with a Fundamental Matrix F. Also includes color difference term as an example.
+
+        Sampson error for a pair of correspondences (p1, p2):
+            d_sampson(p1, p2) = (p2^T * F * p1)^2
+                                --------------------------------
+                                (F * p1)[0]^2 + (F * p1)[1]^2 + (F^T * p2)[0]^2 + (F^T * p2)[1]^2
+
+        The resulting cost is then combined with a color difference term.
+
+        Args:
+            f (torch.Tensor): The Fundamental matrix (3 x 3).
+
+        Returns:
+            torch.Tensor: Cost matrix of shape (K1, K2).
+                        cost_matrix[i,j] = lambda_epipolar * SampsonError(i,j) + lambda_color * colorDiff(i,j)
+        """
+        # ----------------------------------------
+        # Optional: Normalize image points by image width/height or by Hartley normalization
+        # w, h = 1554, 1162
+        # means1_norm = self.means1 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
+        # means2_norm = self.means2 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
+        # (Or use a custom function that does full Hartley normalization.)
+        #
+        # For now, we assume self.means1, self.means2 are in raw image coordinates.
+        # ----------------------------------------
+
+        # Number of Gaussians in each image
+        k1 = self.means1.shape[0]
+        k2 = self.means2.shape[0]
+
+        # Create homogeneous coords
+        ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
+        p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
+
+        ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
+        p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
+
+        # --------------------------
+        #  Sampson error calculation
+        # --------------------------
+        # F * p1 (shape: (3, K1))
+        Fx1 = f @ p1_homo.T
+        # F^T * p2 (shape: (3, K2))
+        Ftx2 = f.t() @ p2_homo.T
+
+        # 分子: (p2^T * F * p1)^2
+        # -> p2_homo (K2,3) dot Fx1 (3, K1) -> shape (K2, K1)
+        # -> transpose to (K1, K2)
+        dot_vals = p2_homo @ Fx1  # (K2, K1)
+        numerator = dot_vals.T.pow(2)  # (K1, K2)
+
+        # 分母: (F p1)_x^2 + (F p1)_y^2 + (F^T p2)_x^2 + (F^T p2)_y^2
+        # (F p1) -> shape (3, K1), take first 2 rows => (2, K1), sum of squares over row => (K1,)
+        Fx1_sq = Fx1[:2, :].pow(2).sum(dim=0)  # shape: (K1,)
+        Ftx2_sq = Ftx2[:2, :].pow(2).sum(dim=0)  # shape: (K2,)
+
+        denominator = Fx1_sq.unsqueeze(1) + Ftx2_sq.unsqueeze(0) + 1e-12  # shape: (K1, K2)
+
+        # Sampson error (K1, K2)
+        sampson_error = numerator / denominator
+        sampson_error = sampson_error / 1e5  # 例: 大きさに応じて調整
+
+        # ---------------
+        # Color difference
+        # ---------------
+        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1, K2, 3)
+        d_color = torch.sum(color_diff ** 2, dim=2)  # (K1, K2)
+
+        # ------------
+        # Debug prints
+        # ------------
+        print("=== Sampson Error Stats ===")
+        print(f"  min={sampson_error.min():.6f}, max={sampson_error.max():.6f}, mean={sampson_error.mean():.6f}")
+        print("=== Color Diff Stats ===")
+        print(f"  min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+
+        # ------------------------------------------
+        # Example: Simple normalization or scaling
+        # (Adjust to taste based on your data ranges)
+        # ------------------------------------------
+        # e.g. Optional small scaling to keep values in a good range
+        # sampson_error = sampson_error / 2.0
+        # d_color       = d_color / 3.0
+
+        # -------------
+        # Combine costs
+        # -------------
+        cost_matrix = self.lambda_epipolar * sampson_error + self.lambda_color * d_color
+
+        return cost_matrix
+
+    def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
 
         This replaces the Homography-based distance with an epipolar distance.
@@ -985,3 +1129,77 @@ class OptimalTransportSolver:
     #     # detach
     #     self.f = self.f.detach()
     #     print("Done optimizing fundamental.")
+    
+    
+    def optimize_with_RT(self, max_iter=1000, tol=1e-6):
+        """
+        R,tを直接最適化してFを構築して self.f に反映させる。
+        """
+        # 1) R,tをパラメータに設定（初期値を適宜調整）
+        if not hasattr(self, 'rvec'):
+            self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+        if not hasattr(self, 'tvec'):
+            self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
+        
+        optimizer = torch.optim.Adam([self.rvec, self.tvec], lr=1e-3)
+        prev_loss_val = float('inf')
+        loss_history = []
+
+        for iteration in range(max_iter):
+            optimizer.zero_grad()
+
+            # 2) R,t -> F
+            F = self.build_f_from_rt(self.rvec, self.tvec)
+
+            # 3) コスト行列計算
+            cost_matrix = self.compute_cost_matrix_fundamental(F)
+
+            # 4) unbalanced Sinkhorn
+            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
+
+            # 5) ロス計算
+            loss = torch.sum(transport * cost_matrix)
+            loss.backward()
+
+            optimizer.step()
+
+            current_loss = loss.item()
+            loss_history.append(current_loss)
+
+            # 6) 収束判定
+            loss_diff = abs(prev_loss_val - current_loss)
+            if iteration > 5 and loss_diff < tol:
+                print(f"Converged at iteration {iteration} (loss_diff={loss_diff:.2e})")
+                break
+            prev_loss_val = current_loss
+
+            # 7) ログ出力
+            if iteration % 10 == 0:
+                # 勾配のnormを見たい場合など
+                grad_r = self.rvec.grad.norm().item()
+                grad_t = self.tvec.grad.norm().item()
+                print(f"Iter {iteration}, Loss={current_loss:.6f}, Grad_r={grad_r:.6f}, Grad_t={grad_t:.6f}")
+
+            # (オプション) 回転ベクトルの範囲を制限 etc.
+            with torch.no_grad():
+                pass
+
+        # 8) 結果表示
+        print("Optimized rvec:", self.rvec)
+        print("Optimized tvec:", self.tvec)
+        final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
+        print("Final F:\n", final_F.cpu().numpy())
+
+        # 9) solver.f にコピー
+        with torch.no_grad():
+            self.f = final_F
+
+        # 10) ロス履歴を簡易プロット
+        plt.figure()
+        plt.plot(loss_history, '-o')
+        plt.title("Loss (optimize_with_RT)")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.grid(True)
+        plt.savefig(os.path.join("results", "loss_optimize_with_RT.png"))
+        plt.close()
