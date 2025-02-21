@@ -77,22 +77,45 @@ def get_top_correspondences_fundamental(solver, num_points=100):
     return pts1, pts2
 
 
-
 def main():
+    import argparse
+
+    
+    parser = argparse.ArgumentParser(description="Fundamental matrix optimization with Gaussian correspondences.")
+    parser.add_argument('--data_dir', type=str,
+                        default='/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24',
+                        help='Path to the base data directory.')
+    parser.add_argument('--data_dir_gmm', type=str,
+                        default='/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/scan24_200_10k_masked',
+                        help='Path to the directory where the GMM data files are stored.')
+    parser.add_argument('--gaussians1_filename', type=str, default='0022_fitted_gaussians.pkl',
+                        help='Filename for the first set of Gaussians.')
+    parser.add_argument('--gaussians2_filename', type=str, default='0023_fitted_gaussians.pkl',
+                        help='Filename for the second set of Gaussians.')
+    parser.add_argument('--colmap_subdir', type=str, default='sparse/0',
+                        help='Subdirectory (relative to data_dir) where COLMAP files are located.')
+    parser.add_argument('--image1_name', type=str, default='0022.png',
+                        help='Name of the first image file.')
+    parser.add_argument('--image2_name', type=str, default='0023.png',
+                        help='Name of the second image file.')
+    parser.add_argument('--output_dir', type=str, default='results',
+                        help='Output directory where results (images, pickles) will be saved.')
+    args = parser.parse_args()
+    
     # 1) Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 2) Data paths
-    data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24'
+    # 2) Data paths (now derived from arguments)
+    data_dir = args.data_dir
     
-    data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/scan24_200_10k_masked'
-    gaussians1_path = os.path.join(data_dir_gmm, '0022_fitted_gaussians.pkl')
-    gaussians2_path = os.path.join(data_dir_gmm, '0023_fitted_gaussians.pkl')
-    colmap_dir = os.path.join(data_dir, 'sparse/0')
+    data_dir_gmm = args.data_dir_gmm
+    gaussians1_path = os.path.join(data_dir_gmm, args.gaussians1_filename)
+    gaussians2_path = os.path.join(data_dir_gmm, args.gaussians2_filename)
+    colmap_dir = os.path.join(data_dir, args.colmap_subdir)
 
-    image1_name = '0022.png'
-    image2_name = '0023.png'
+    image1_name = args.image1_name
+    image2_name = args.image2_name
 
     # 3) Load Gaussians
     _, gaussians1, _, _ = load_gaussians_torch(gaussians1_path, device)
@@ -166,7 +189,6 @@ def main():
     pts1_before = np.array(pts1_before, dtype=np.float32)
     pts2_before = np.array(pts2_before, dtype=np.float32)
 
-
     # 6) Use RANSAC to get initial F
     F_ransac, mask_before = cv2.findFundamentalMat(
         pts1_before,
@@ -176,9 +198,6 @@ def main():
     print("\n--- Optimization Before ---")
     print("\nInitial F from ransac")
     print(F_ransac)
-
-    # Set solver.f to F_ransac (to check convergence not in use)
-    # solver.f = torch.from_numpy(F_ransac).float().to(device)
 
     # Helper function: debug stats
     def print_stats(tensor, name):
@@ -195,7 +214,6 @@ def main():
     solver.optimize_with_RT(max_iter=1000, tol=1e-6)
     # solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
 
-    
     print("Initial F from ransac")
     print(F_ransac)
     
@@ -203,7 +221,6 @@ def main():
     F_optimized = solver.f.detach().cpu().numpy()
     print("\nOptimized Fundamental matrix:")
     print(F_optimized)
-    
 
     # コスト行列を確認
     with torch.no_grad():
@@ -234,17 +251,16 @@ def main():
 
     # 9) Visualize epipolar lines and corresponding points
     # - Before
-    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_ransac, output_dir='results/epilines_before')
-    visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir='results/matches_before')
+    visualize_epipolar_lines(img1, img2, pts1_before, pts2_before, F_ransac, output_dir=os.path.join(args.output_dir, 'epilines_before'))
+    visualize_point_matches(img1, img2, pts1_before, pts2_before, output_dir=os.path.join(args.output_dir, 'matches_before'))
 
     # - After
-    visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_optimized, output_dir='results/epilines_after')
-    visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir='results/matches_after')
+    visualize_epipolar_lines(img1, img2, pts1_after, pts2_after, F_optimized, output_dir=os.path.join(args.output_dir, 'epilines_after'))
+    visualize_point_matches(img1, img2, pts1_after, pts2_after, output_dir=os.path.join(args.output_dir, 'matches_after'))
 
     # 10) Save results as pickle
-    output_dir = 'results'
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'fundamental_optimization_results.pkl')
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = os.path.join(args.output_dir, 'fundamental_optimization_results.pkl')
 
     results = {
         'fundamental_matrix_optimized': F_optimized,
