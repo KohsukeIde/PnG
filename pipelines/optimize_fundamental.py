@@ -86,7 +86,7 @@ def main():
                         default='/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24',
                         help='Path to the base data directory.')
     parser.add_argument('--data_dir_gmm', type=str,
-                        default='/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/scan24_200_10k_masked',
+                        default='/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/house_100gs_10kiter_masked',
                         help='Path to the directory where the GMM data files are stored.')
     parser.add_argument('--gaussians1_filename', type=str, default='0022_fitted_gaussians.pkl',
                         help='Filename for the first set of Gaussians.')
