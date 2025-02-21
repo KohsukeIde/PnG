@@ -477,9 +477,9 @@ def main():
     # 5) Fundamental matrix optimization
     ##############################
     print("\n--- Optimizing Fundamental Matrix ---")
-    solver.optimize_with_fundamental(max_iter=500, tol=1e-6)
+    solver.optimize_with_RT(max_iter=500, tol=1e-6)
     F_optimized = solver.f.detach().cpu().numpy()
-    print("\nOptimized Fundamental matrix:\n", F_optimized)
+    print("\nOptimized Fundamental matrix (from R,t):\n", F_optimized)
 
     ##############################
     # 6) Final cost & unbalanced transport
@@ -501,13 +501,19 @@ def main():
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
     # reconstructor.compute_camera_matrices_from_homography()
 
-    R_est, t_est = reconstructor.recover_extrinsics_from_fundamental(F_optimized, K1, K2)
+    # R_est, t_est = reconstructor.recover_extrinsics_from_fundamental(F_optimized, K1, K2)
+    
+    r_optimized = solver.rvec.detach().cpu().numpy()
+    t_optimized = solver.tvec.detach().cpu().numpy()
+    R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()  # (3,3)
+    print("R_est:\n", R_est)
+    print("t_est:\n", t_optimized)
     
     reconstructor.set_camera_matrices_explicitly(
         r1=np.eye(3), 
         t1=np.zeros(3), 
-        r2=R_est, 
-        t2=t_est
+        r2=R_est,   # 上で計算した R_est
+        t2=t_optimized  # 上で取り出した t_optimized
     )
 
     threshold = 1e-6
