@@ -213,17 +213,16 @@ class OptimalTransportSolver:
     #     return covariance
     
     def rodrigues(self, rvec: torch.Tensor) -> torch.Tensor:
-        """
-        PyTorch実装のRodrigues変換 (OpenCVのcv2.Rodrigues相当)。
+        """Rodrigues変換 (OpenCVのcv2.Rodrigues相当)。
         rvec: (3,) -> 回転ベクトル
-        戻り値: (3,3) 回転行列
+        Returns : (3,3) 回転行列
         """
         # ノルム(回転角)
         theta = torch.norm(rvec) + 1e-12
         # 単位方向
         r_axis = rvec / theta
 
-        # 外積行列Kを「定数tensor([...])」ではなく，zeros + 代入で組み立て
+        # 外積行列Kを「定数tensor([...])」ではなく，zeros + 代入で組み立て(じゃないと勾配流れない...)
         K = torch.zeros((3,3), dtype=torch.float32, device=rvec.device)
         K[0,1] = -r_axis[2]
         K[0,2] =  r_axis[1]
@@ -238,13 +237,12 @@ class OptimalTransportSolver:
         return R
 
     def build_f_from_rt(self, rvec: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
-        """
-        rvec, tvec から F を構築。
+        """rvec, tvec から F を構築。
         F = K2^-T [t]_x R K1^-1
         """
         R = self.rodrigues(rvec)
 
-        # [t]_x も同様に zeros + 代入で組み立て
+        # [t]_x も同様に zeros + 代入
         tx = torch.zeros((3,3), device=self.device)
         tx[0,1] = -tvec[2]
         tx[0,2] =  tvec[1]
@@ -526,53 +524,7 @@ class OptimalTransportSolver:
     #     print(f"Optimization loss plot saved to '{plt_path}'")
 
 
-    # === Added below for Fundamental Matrix version ===
-
-    #　ピクセル座標でのエピポーラコストを計算
-    # def compute_cost_matrix_fundamental_direct(self, f: torch.Tensor) -> torch.Tensor:
-    #     """Compute the cost matrix as the absolute value of x2^T F x1 in pixel space."""
-        
-    
-    #     k1 = self.means1.shape[0]
-    #     k2 = self.means2.shape[0]
-
-    #     # Homogeneous coords in pixel space
-    #     ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
-    #     p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
-
-    #     ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
-    #     p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
-
-    #     # Compute x2^T F x1 for all i,j
-    #     # p1_homo: (K1,3)
-    #     # p2_homo: (K2,3)
-    #     # We want a cost_matrix of shape (K1,K2).
-    #     # cost[i,j] = | p2_homo[j] @ f @ p1_homo[i] 
-
-    #     # (K2,3) x (3,3) -> (K2,3)
-    #     Fx1 = (f @ p1_homo.T).T  # shape (K1,3)
-    #     # Then x2^T Fx1: shape (K2, K1)
-    #     # But we want (K1, K2). So we can do:
-    #     cost_matrix = torch.abs(
-    #         (p2_homo.unsqueeze(1) * Fx1.unsqueeze(0)).sum(dim=2)
-    #     )
-    #     # => cost_matrix: (K2, K1). make it (K1,K2)
-    #     cost_matrix = cost_matrix.transpose(0,1)  # shape (K1,K2)
-
-    #     # color difference　
-    #     if self.lambda_color > 0:
-    #         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
-    #         d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
-    #         cost_matrix = self.lambda_epipolar * cost_matrix + self.lambda_color * d_color 
-    #     else:
-    #         cost_matrix = self.lambda_epipolar * cost_matrix 
-        
-    #     print("=== Cost Matrix ===")
-    #     print(f"cost_matrix: min={cost_matrix.min():.6f}, max={cost_matrix.max():.6f}, mean={cost_matrix.mean():.6f}")
-
-    #     return cost_matrix
-    
-    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental_sampson(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using the Sampson error
         with a Fundamental Matrix F. Also includes color difference term as an example.
 
@@ -634,7 +586,7 @@ class OptimalTransportSolver:
 
         # Sampson error (K1, K2)
         sampson_error = numerator / denominator
-        sampson_error = sampson_error / 1e5  # 例: 大きさに応じて調整
+        sampson_error = sampson_error / 1e5  
 
         # ---------------
         # Color difference
@@ -665,7 +617,7 @@ class OptimalTransportSolver:
 
         return cost_matrix
 
-    def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
 
         This replaces the Homography-based distance with an epipolar distance.
@@ -677,93 +629,83 @@ class OptimalTransportSolver:
         Returns:
             torch.Tensor: Cost matrix of shape (K1, K2).
         """
-        # 内部パラメータ行列 K の逆行列を使って画像座標を正規化平面（理想ピンホール）に変換も考えられる
-        # w, h = 1554, 1162
-        
-        # means1_norm = self.means1 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
-        # means2_norm = self.means2 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
-        # Get number of gaussians for each image
+         # 1) 画像1,2 それぞれのGaussians数
         k1 = self.means1.shape[0]
         k2 = self.means2.shape[0]
 
-        # Create homogeneous coords
+        # 2) 平均点を同次座標化 (x,y,1)
         ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
         p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
-        # p1_homo_norm = torch.cat([means1_norm, ones1], dim=1)  # (K1,3)
 
         ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
         p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
-        # p2_homo_norm = torch.cat([means2_norm, ones2], dim=1)  # (K2,3)
 
-        # Compute epipolar lines
-        # line in image1 for each p2: l1 = F * p2
+        # 3) p2_j に対応するエピポーラ線を画像1上で計算: l1[j] = F * p2[j]
+        #    p1_i に対応するエピポーラ線を画像2上で計算: l2[i] = F^T * p1[i]
+        #    (shape: l1 -> (K2,3), l2 -> (K1,3))
         l1 = (f @ p2_homo.T).T  # (K2,3)
-        # line in image2 for each p1: l2 = F^T * p1
         l2 = (f.t() @ p1_homo.T).T  # (K1,3)
-        
-        # Computeepipolar lines in normalized space
-        # l1 = (f @ p2_homo_norm.T).T  # (K2,3)
-        # l2 = (f.t() @ p1_homo_norm.T).T  # (K1,3)
 
-        # Define the distance p1-l1 + p2-l2 as a symmetrical epipolar cost
-        # Dist from p1[i] to line l1[j]: |p1[i].dot(l1[j])| / sqrt(a^2 + b^2) where l1[j] = [a,b,c]
-        # shape: (K1,K2)
-
-        # shape (K1,1,3) * (1,K2,3,1) => (K1,K2,1,1)
-        numerator_12 = torch.abs(
-            p1_homo.unsqueeze(1) @ l1.unsqueeze(2)
-        ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        # 4) p1[i] と l1[j] の距離をペアごとに計算
+        #    l1[j] = (a_j, b_j, c_j), p1[i] = (x_i, y_i, 1)
+        #    dist_12(i,j) = | p1[i]·l1[j] | / sqrt(a_j^2 + b_j^2)
+        #
+        #   - numerator_12(i,j) = | p1[i]·l1[j] |
+        #   - denominator_12(j) = sqrt(a_j^2 + b_j^2)
+        #   → shape はそれぞれ (K1,K2), (K2,) になり
+        #     dist_12 = numerator_12 / denom_12(ブロードキャスト)
+        numerator_12 = torch.abs(p1_homo @ l1.T)    # => (K1, K2)
         denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
-        denom_12 = denom_12.view(1, -1)  # (1,K2)
+        denom_12 = denom_12.view(1, -1)  # (1,K2) for broadcast
         dist_12 = numerator_12 / denom_12  # (K1,K2)
-        
-        # numerator_12_norm = torch.abs(
-        #     p1_homo_norm.unsqueeze(1) @ l1.unsqueeze(2)
-        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        # denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
-        # denom_12 = denom_12.view(1, -1)  # (1,K2)
-        # dist_12_norm = numerator_12_norm / denom_12  # (K1,K2)
 
-        numerator_21 = torch.abs(
-            p2_homo.unsqueeze(0) @ l2.unsqueeze(2)
-        ).squeeze(-1).squeeze(-1)  # (K1,K2)
+        # 5) p2[j] と l2[i] の距離をペアごとに計算
+        #    l2[i] = (a_i, b_i, c_i), p2[j] = (x_j, y_j, 1)
+        #    dist_21(i,j) = | p2[j]·l2[i] | / sqrt(a_i^2 + b_i^2)
+        #
+        #   - numerator_21(i,j) = | p2[j]·l2[i] |
+        #   - denominator_21(i)  = sqrt(a_i^2 + b_i^2)
+        #   → shape はそれぞれ (K2,K1) (K1,) となるのを転置して (K1,K2) など
+        numerator_21 = torch.abs(p2_homo @ l2.T)    # => (K2, K1)
+        numerator_21 = numerator_21.T              # => (K1, K2)
         denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
-        denom_21 = denom_21.view(-1, 1)  # (K1,1)
-        dist_21 = numerator_21 / denom_21  # (K1,K2)
-        
-        # numerator_21_norm = torch.abs(
-        #     p2_homo_norm.unsqueeze(0) @ l2.unsqueeze(2)
-        # ).squeeze(-1).squeeze(-1)  # (K1,K2)
-        # denom_21_norm = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
-        # denom_21_norm = denom_21_norm.view(-1, 1)  # (K1,1)
-        # dist_21_norm = numerator_21_norm / denom_21_norm  # (K1,K2)
+        denom_21 = denom_21.view(-1, 1)            # (K1,1)
+        dist_21 = numerator_21 / denom_21          # (K1,K2)
 
+        # 6) 対称エピポーラ距離を合計
+        #    epipolar_dist(i,j) = dist_12(i,j) + dist_21(i,j)
         epipolar_dist = dist_12 + dist_21
-        # epipolar_dist_norm = dist_12_norm + dist_21_norm
-        # color difference
-        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
-        d_color = torch.sum(color_diff**2, dim=2)  # (K1,K2)
-        print("=== Before Normalization ===")
-        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
-        # print(f"epipolar_dist: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
-        print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
-        # max_dim = 1554  # largest image dimension
-        
-        epipolar_dist = epipolar_dist /  2
-        # epipolar_dist_norm = epipolar_dist_norm / 2 # オーダー調整
-        d_color = d_color / 3.0
-        
+        # 7) カラー差分 (RGB) を計算
+        #    color_diff(i,j) = sum_k ( rgb1[i][k] - rgb2[j][k] )^2
+        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
+        d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
+
+        # - デバッグ出力（正規化前）
+        print("=== Before Normalization ===")
+        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, "
+            f"max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        print(f"d_color:       min={d_color.min():.6f}, "
+            f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+
+        # 8) （任意のスケーリング・調整）
+        epipolar_dist = epipolar_dist / 2.0  # 例: 大きさを半分にしておく
+        d_color = d_color / 3.0             # 例: 色差も軽く正規化
+
         print("=== After Normalization ===")
-        print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, max={self.lambda_epipolar * epipolar_dist.max():.6f}, mean={self.lambda_epipolar * epipolar_dist.mean():.6f}")
-        # print(f"epipolar_dist_norm: min={epipolar_dist_norm.min():.6f}, max={epipolar_dist_norm.max():.6f}, mean={epipolar_dist_norm.mean():.6f}")
-        print(f"d_color: min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
-        
-        # combine with weights, epipolar_dist can be scaled if needed
+        print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, "
+            f"max={self.lambda_epipolar * epipolar_dist.max():.6f}, "
+            f"mean={self.lambda_epipolar * epipolar_dist.mean():.6f}")
+        print(f"d_color:       min={d_color.min():.6f}, "
+            f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+
+        # 9) 上記2種のコストを重み付けして合成
+        #    cost_matrix(i,j) = lambda_epipolar * epipolar_dist(i,j)
+        #                     + lambda_color   * d_color(i,j)
         cost_matrix = self.lambda_epipolar * epipolar_dist + self.lambda_color * d_color
-        # cost_matrix = self.lambda_epipolar * epipolar_dist_norm + self.lambda_color * d_color
+
         return cost_matrix
-    
+        
 
     def optimize_with_fundamental(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
         """Optimize the Fundamental matrix F using epipolar distance + color difference. Enforce rank-2 during forward to avoid broken momentum of Adam.
@@ -857,11 +799,12 @@ class OptimalTransportSolver:
             print("Final rank-2 enforcement on fundamental matrix.")
 
         plt.figure()
-        plt.plot(loss_history)
+        plt.plot(loss_history, label="Loss")
         plt.xlabel("Iteration")
         plt.ylabel("Loss")
         plt.title("Fundamental Optimization Loss")
         plt.grid(True)
+        plt.legend()
         plt.savefig(os.path.join(transport_dir, "fundamental_loss.png"))
         plt.close()
         print(f"Saved fundamental loss plot to '{transport_dir}'")
@@ -972,170 +915,14 @@ class OptimalTransportSolver:
 
     #     self.f = self.f.detach()
 
-
-    # def optimize_with_fundamental_visualize_momentum(self, max_iter: int = 1000, tol: float = 1e-3) -> None:
-    #     """Optimize the Fundamental matrix F using epipolar distance + color difference. 
-    #     Enforce rank-2 during forward to avoid broken momentum of Adam.
-
-    #     Args:
-    #         max_iter (int): Maximum number of iterations.
-    #         tol (float): Convergence tolerance.
-    #     """
-    #     transport_dir = os.path.join("results", "transport_fundamental")
-    #     os.makedirs(transport_dir, exist_ok=True)
-
-    #     def rank2_enforce(mat: torch.Tensor) -> torch.Tensor:
-    #         """Perform rank-2 projection in a no_grad block,
-    #         then do a 'straight-through' approach so that
-    #         the returned tensor still requires grad.
-    #         """
-    #         with torch.no_grad():
-    #             u, s, vt = torch.linalg.svd(mat, full_matrices=False)
-    #             s[-1] = 0.0
-    #             mat_rank2 = u @ torch.diag(s) @ vt
-            
-    #         # Use mat_rank2 for forward computation, but backpropagate to mat (original parameter)
-    #         return mat + (mat_rank2 - mat).detach()
-        
-    #     # F の初期化
-    #     if self.f is None:
-    #         self.f = nn.Parameter(torch.eye(3, dtype=torch.float32, device=self.device))
-    #     else:
-    #         # 初期値がある場合はその値を使う（パイプライン側でsolver.fを設定）
-    #         self.f = nn.Parameter(self.f.clone().detach())
-
-    #     # Adam オプティマイザ
-    #     optimizer = torch.optim.Adam([self.f], lr=1e-4)
-        
-    #     # 収束判定用
-    #     prev_loss_val = torch.tensor(float('inf'), device=self.device)
-    #     loss_history = []
-
-    #     # ★ 追加: Adamのモーメントと rank2 の差分ノルムを可視化するための配列
-    #     m1_norm_history = []
-    #     m2_norm_history = []
-    #     rank2_diff_history = []
-
-    #     for iteration in range(max_iter):
-    #         optimizer.zero_grad()
-
-    #         # rank 2 enforce for forward computation
-    #         f_enforced = rank2_enforce(self.f)
-
-    #         # コスト行列の計算
-    #         cost_matrix = self.compute_cost_matrix_fundamental(f_enforced)
-            
-    #         # アンバランスドSinkhornでtransportを計算
-    #         transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=1.0, max_iter=10000, tol=1e-6)
-            
-    #         # ロス計算
-    #         loss = torch.sum(transport * cost_matrix)
-    #         loss.backward()
-
-    #         optimizer.step()
-
-    #         current_loss = loss.item()
-    #         loss_history.append(current_loss)
-
-    #         # ★ 追加: rank2_enforceでの差分ノルムを測る
-    #         #         f_enforced (ランク2投影後) と self.f (オリジナル) のノルム差
-    #         with torch.no_grad():
-    #             rank2_diff = (f_enforced - self.f).norm().item()
-    #             rank2_diff_history.append(rank2_diff)
-            
-    #         # ★ 追加: Adam のモーメントを取得してノルムを記録
-    #         with torch.no_grad():
-    #             # optimizer.state[self.f] に 'exp_avg' (m1) と 'exp_avg_sq' (m2) が入っている
-    #             m1 = optimizer.state[self.f]["exp_avg"]
-    #             m2 = optimizer.state[self.f]["exp_avg_sq"]
-    #             m1_norm_history.append(m1.norm().item())
-    #             m2_norm_history.append(m2.norm().item())
-
-    #         # 収束判定
-    #         if abs(prev_loss_val - current_loss) < tol:
-    #             print(f"Converged at iteration {iteration}")
-    #             break
-    #         prev_loss_val = current_loss
-
-    #         # debug print
-    #         if iteration % 5 == 0 or iteration == max_iter - 1:
-    #             grad_norm = 0.0
-    #             if self.f.grad is not None:
-    #                 grad_norm = self.f.grad.norm().item()
-    #             print(f"Iteration {iteration}, Loss={current_loss:.6f}, "
-    #                   f"F.grad norm={grad_norm:.6f}, rank2_diff={rank2_diff:.6f}")
-
-    #         # show transport matrix 
-    #         if iteration % 10 == 0 or iteration == max_iter - 1:
-    #             with torch.no_grad():
-    #                 t_np = transport.detach().cpu().numpy()
-    #                 plt.figure(figsize=(8, 6))
-    #                 plt.imshow(t_np, cmap="hot", interpolation="nearest")
-    #                 plt.colorbar(label="Transport Plan Value")
-    #                 plt.title(f"Transport Plan at Iteration {iteration}")
-    #                 plt.xlabel("Image 2 Gaussians")
-    #                 plt.ylabel("Image 1 Gaussians")
-    #                 plt.tight_layout()
-    #                 plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-    #                 plt.savefig(plt_path)
-    #                 plt.close()
-    #                 print(f"Transport matrix heatmap saved to '{plt_path}'")
-
-    #     # 最終的にランク2 enforce をかけて self.f に反映
-    #     with torch.no_grad():
-    #         final_rank2 = rank2_enforce(self.f)
-    #         self.f.copy_(final_rank2)
-    #         print("Final rank-2 enforcement on fundamental matrix.")
-
-    #     # ====== visualization ======
-
-    #     # 1) Loss
-    #     plt.figure()
-    #     plt.plot(loss_history, label="loss")
-    #     plt.xlabel("Iteration")
-    #     plt.ylabel("Loss")
-    #     plt.title("Fundamental Optimization Loss")
-    #     plt.grid(True)
-    #     plt.legend()
-    #     plt.savefig(os.path.join(transport_dir, "fundamental_loss.png"))
-    #     plt.close()
-    #     print(f"Saved fundamental loss plot to '{transport_dir}'")
-
-    #     # 2) Rank-2差分 
-    #     plt.figure()
-    #     plt.plot(rank2_diff_history, label="rank2_diff")
-    #     plt.xlabel("Iteration")
-    #     plt.ylabel("||F_enforced - F||")
-    #     plt.title("Rank2 Difference per Iteration")
-    #     plt.grid(True)
-    #     plt.legend()
-    #     plt.savefig(os.path.join(transport_dir, "rank2_diff.png"))
-    #     plt.close()
-    #     print(f"Saved rank2 difference plot to '{transport_dir}'")
-
-    #     # 3) Adam のモーメント ノルム
-    #     plt.figure()
-    #     plt.plot(m1_norm_history, label="exp_avg (1st moment) norm")
-    #     plt.plot(m2_norm_history, label="exp_avg_sq (2nd moment) norm")
-    #     plt.xlabel("Iteration")
-    #     plt.ylabel("Norm value")
-    #     plt.title("Adam Moments Norm")
-    #     plt.grid(True)
-    #     plt.legend()
-    #     plt.savefig(os.path.join(transport_dir, "adam_moments.png"))
-    #     plt.close()
-    #     print(f"Saved Adam moments plot to '{transport_dir}'")
-
-    #     # detach
-    #     self.f = self.f.detach()
-    #     print("Done optimizing fundamental.")
     
     
     def optimize_with_RT(self, max_iter=1000, tol=1e-6):
+        """R,tを直接最適化してFを構築して self.f に反映させる。
+        最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
         """
-        R,tを直接最適化してFを構築して self.f に反映させる。
-        """
-        # 1) R,tをパラメータに設定（初期値を適宜調整）
+
+        # 1) R,tを最適化パラメータ設定
         if not hasattr(self, 'rvec'):
             self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
         if not hasattr(self, 'tvec'):
@@ -1145,61 +932,76 @@ class OptimalTransportSolver:
         prev_loss_val = float('inf')
         loss_history = []
 
+        transport_dir = os.path.join("results", "transport_RT")
+        os.makedirs(transport_dir, exist_ok=True)
+
         for iteration in range(max_iter):
             optimizer.zero_grad()
 
-            # 2) R,t -> F
+            # (1) rvec, tvec -> F
             F = self.build_f_from_rt(self.rvec, self.tvec)
 
-            # 3) コスト行列計算
+            # (2) コスト行列計算
             cost_matrix = self.compute_cost_matrix_fundamental(F)
 
-            # 4) unbalanced Sinkhorn
+            # (3) Unbalanced Sinkhorn
             transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
 
-            # 5) ロス計算
+            # (4) ロス計算 & 逆伝播
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
 
+            # (5) パラメータ更新
             optimizer.step()
 
             current_loss = loss.item()
             loss_history.append(current_loss)
 
-            # 6) 収束判定
+            # (6) 収束判定
             loss_diff = abs(prev_loss_val - current_loss)
             if iteration > 5 and loss_diff < tol:
                 print(f"Converged at iteration {iteration} (loss_diff={loss_diff:.2e})")
                 break
             prev_loss_val = current_loss
 
-            # 7) ログ出力
+            # ログ出力
             if iteration % 10 == 0:
-                # 勾配のnormを見たい場合など
                 grad_r = self.rvec.grad.norm().item()
                 grad_t = self.tvec.grad.norm().item()
                 print(f"Iter {iteration}, Loss={current_loss:.6f}, Grad_r={grad_r:.6f}, Grad_t={grad_t:.6f}")
 
-            # (オプション) 回転ベクトルの範囲を制限 etc.
-            with torch.no_grad():
-                pass
+                # Transport matrix 可視化
+                with torch.no_grad():
+                    t_np = transport.detach().cpu().numpy()
+                    plt.figure(figsize=(8, 6))
+                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
+                    plt.colorbar(label="Transport Plan Value")
+                    plt.title(f"Transport Plan at Iteration {iteration}")
+                    plt.xlabel("Image 2 Gaussians")
+                    plt.ylabel("Image 1 Gaussians")
+                    plt.tight_layout()
+                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+                    plt.savefig(plt_path)
+                    plt.close()
+                    print(f"Transport matrix heatmap saved to '{plt_path}'")
 
-        # 8) 結果表示
+
         print("Optimized rvec:", self.rvec)
         print("Optimized tvec:", self.tvec)
+
+        # build_f_from_rt から最終Fを取り出す
         final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
         print("Final F:\n", final_F.cpu().numpy())
 
-        # 9) solver.f にコピー
+        # solver.f にコピー
         with torch.no_grad():
             self.f = final_F
 
-        # 10) ロス履歴を簡易プロット
         plt.figure()
         plt.plot(loss_history, '-o')
         plt.title("Loss (optimize_with_RT)")
         plt.xlabel("Iteration")
         plt.ylabel("Loss")
         plt.grid(True)
-        plt.savefig(os.path.join("results", "loss_optimize_with_RT.png"))
+        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
         plt.close()
