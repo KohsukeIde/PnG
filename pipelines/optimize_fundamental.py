@@ -21,14 +21,11 @@ sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 from utils.homography_pipeline_visualization import (
     visualize_point_matches,
     visualize_epipolar_lines
-    # plot_epipolar_cost_change,  # <- RANSAC等の比較不要のため削除
-    # save_warped_image  # ← Fundamental optimizationでは使わない
 )
 
 def get_top_correspondences_fundamental(solver, num_points=100):
-    """
-    Fundamental 行列 F を用いたコスト行列を計算し、
-    Sinkhorn / Unbalanced Sinkhorn から上位の対応点を貪欲に取り出す。
+    """Fundamental 行列 F を用いたコスト行列を計算し、
+    Sinkhorn / Unbalanced Sinkhorn から上位の対応点をGreedyで取り出す。
     """
     with torch.no_grad():
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
@@ -87,8 +84,9 @@ def main():
     print(f"Using device: {device}")
 
     # 2) Data paths
-    data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63'
-    data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/train_results_scan63_32_masked'
+    data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24'
+    
+    data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/scan24_200_10k_masked'
     gaussians1_path = os.path.join(data_dir_gmm, '0022_fitted_gaussians.pkl')
     gaussians2_path = os.path.join(data_dir_gmm, '0023_fitted_gaussians.pkl')
     colmap_dir = os.path.join(data_dir, 'sparse/0')
@@ -127,7 +125,7 @@ def main():
         lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=0.0,
-        lambda_epipolar=0.1,
+        lambda_epipolar=0.001,
         device=device
     )
 
@@ -168,6 +166,7 @@ def main():
     pts1_before = np.array(pts1_before, dtype=np.float32)
     pts2_before = np.array(pts2_before, dtype=np.float32)
 
+
     # 6) Use RANSAC to get initial F
     F_ransac, mask_before = cv2.findFundamentalMat(
         pts1_before,
@@ -178,8 +177,8 @@ def main():
     print("\nInitial F from ransac")
     print(F_ransac)
 
-    # 7) Set solver.f to F_ransac
-    solver.f = torch.from_numpy(F_ransac).float().to(device)
+    # Set solver.f to F_ransac (to check convergence not in use)
+    # solver.f = torch.from_numpy(F_ransac).float().to(device)
 
     # Helper function: debug stats
     def print_stats(tensor, name):
@@ -190,9 +189,11 @@ def main():
         print(f"  Has NaN: {torch.isnan(tensor).any().item()}")
         print(f"  Has Inf: {torch.isinf(tensor).any().item()}")
 
+    solver.f = None
     # 7) Optimize with Fundamental
     print("\n--- Optimizing Fundamental Matrix ---")
-    solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
+    solver.optimize_with_RT(max_iter=1000, tol=1e-6)
+    # solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
 
     
     print("Initial F from ransac")
@@ -203,9 +204,6 @@ def main():
     print("\nOptimized Fundamental matrix:")
     print(F_optimized)
     
-    # F_optimized_scaled = scale_F_for_visualization(F_optimized)
-    # print("Optimized Fundamental matrix (scaled for visualization):")
-    # print(F_optimized_scaled)
 
     # コスト行列を確認
     with torch.no_grad():
