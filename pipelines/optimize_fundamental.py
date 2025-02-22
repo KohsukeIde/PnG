@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import pickle
 import torch
 import numpy as np
@@ -77,30 +78,65 @@ def get_top_correspondences_fundamental(solver, num_points=100):
     return pts1, pts2
 
 
-def main():
-    import argparse
-
-    
+def parse_args():
+    """Parse command-line arguments for fundamental matrix optimization.
+    """
     parser = argparse.ArgumentParser(description="Fundamental matrix optimization with Gaussian correspondences.")
-    parser.add_argument('--data_dir', type=str,
-                        default='/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24',
-                        help='Path to the base data directory.')
-    parser.add_argument('--data_dir_gmm', type=str,
-                        default='/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/house_100gs_10kiter_masked',
-                        help='Path to the directory where the GMM data files are stored.')
-    parser.add_argument('--gaussians1_filename', type=str, default='0022_fitted_gaussians.pkl',
-                        help='Filename for the first set of Gaussians.')
-    parser.add_argument('--gaussians2_filename', type=str, default='0023_fitted_gaussians.pkl',
-                        help='Filename for the second set of Gaussians.')
-    parser.add_argument('--colmap_subdir', type=str, default='sparse/0',
-                        help='Subdirectory (relative to data_dir) where COLMAP files are located.')
-    parser.add_argument('--image1_name', type=str, default='0022.png',
-                        help='Name of the first image file.')
-    parser.add_argument('--image2_name', type=str, default='0023.png',
-                        help='Name of the second image file.')
-    parser.add_argument('--output_dir', type=str, default='results',
-                        help='Output directory where results (images, pickles) will be saved.')
-    args = parser.parse_args()
+    
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24",
+        help="Path to the base data directory."
+    )
+    parser.add_argument(
+        "--data_dir_gmm",
+        type=str,
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/house_100gs_10kiter_masked",
+        help="Path to the directory where the GMM data files are stored."
+    )
+    parser.add_argument(
+        "--gaussians1_filename",
+        type=str,
+        default="0022_fitted_gaussians.pkl",
+        help="Filename for the first set of Gaussians."
+    )
+    parser.add_argument(
+        "--gaussians2_filename",
+        type=str,
+        default="0023_fitted_gaussians.pkl",
+        help="Filename for the second set of Gaussians."
+    )
+    parser.add_argument(
+        "--colmap_subdir",
+        type=str,
+        default="sparse/0",
+        help="Subdirectory (relative to data_dir) where COLMAP files are located."
+    )
+    parser.add_argument(
+        "--image1_name",
+        type=str,
+        default="0022.png",
+        help="Name of the first image file."
+    )
+    parser.add_argument(
+        "--image2_name",
+        type=str,
+        default="0023.png",
+        help="Name of the second image file."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results",
+        help="Output directory where results (images, pickles) will be saved."
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     
     # 1) Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
