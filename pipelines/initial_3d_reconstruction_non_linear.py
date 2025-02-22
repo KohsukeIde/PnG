@@ -1,6 +1,7 @@
 import os
 import sys
 import pickle
+import argparse 
 import torch
 import numpy as np
 import cv2
@@ -25,7 +26,7 @@ sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
 ########################
-# 1) Helper function: sample_ellipsoid_vertices_and_faces
+# Helper function: sample_ellipsoid_vertices_and_faces
 ########################
 def sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta=12, n_phi=12):
     """
@@ -77,7 +78,7 @@ def sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta=12, n_phi=12):
 
 
 ########################
-# 2) Helper function: Save ellipsoids as PLY (with color, alpha optional)
+# Helper function: Save ellipsoids as PLY (with color, alpha optional)
 ########################
 def save_ellipsoids_as_ply(all_vertices, all_faces, filename, use_alpha=True):
     """
@@ -137,7 +138,7 @@ def save_ellipsoids_as_ply(all_vertices, all_faces, filename, use_alpha=True):
 
 
 ########################
-# 3) Helper function: Save 3D points as PLY
+# Helper function: Save 3D points as PLY
 ########################
 def save_point_cloud_as_ply(points, filename):
     """
@@ -161,9 +162,8 @@ def save_point_cloud_as_ply(points, filename):
 
 
 ########################
-# 4) (WIP): Project 3D Gaussians back to 2D
+#(WIP): Project 3D Gaussians back to 2D
 ########################
-
 def render_gaussians_pure_mixture(
     points_3d,
     covariances_3d,
@@ -270,7 +270,7 @@ def render_gaussians_pure_mixture(
 
     return mixture_img, weight_buffer
 
-# === (NEED FIX)ADDED for camera frustum visualization ===
+
 def create_camera_frustum_mesh(
     K,
     R_world2cam,
@@ -297,8 +297,6 @@ def create_camera_frustum_mesh(
     """
 
     # 1) Invert (R,t) to get camera pose as cam->world
-    #    Because R_world2cam * X_world + t_world2cam = X_cam
-    #    => X_world = R_cam2world * X_cam + t_cam2world
     R_cam2world = R_world2cam.T
     t_cam2world = -R_world2cam.T @ t_world2cam
 
@@ -306,13 +304,6 @@ def create_camera_frustum_mesh(
     cx, cy = K[0,2], K[1,2]
 
     # 2) Define corners in camera coords
-    #    near-plane corners (z=near_z), far-plane corners (z=far_z)
-    #    We assume image-plane corners are ~ (0..w, 0..h) in pixel,
-    #    but let's do it analytically from fx,fy,cx,cy.
-    #    x = (u - cx)/fx * z, y = (v - cy)/fy * z (assuming no skew).
-    #    For simplicity, define "image corners" as 0..(2*cx), 0..(2*cy) in pixel.
-
-    # near-plane
     corners_cam = []
     for zval in [near_z, far_z]:
         # 4 corners in pixel coords (u,v)
@@ -326,8 +317,6 @@ def create_camera_frustum_mesh(
             x = (u - cx)/fx * zval
             y = (v - cy)/fy * zval
             corners_cam.append(np.array([x, y, zval], dtype=np.float32))
-    # corners_cam[0..3] => near-plane corners
-    # corners_cam[4..7] => far-plane corners
 
     corners_cam = np.array(corners_cam)
     # optionally scale the FOV:
@@ -344,11 +333,6 @@ def create_camera_frustum_mesh(
     # Also define the camera center itself
     camera_center = t_cam2world  # shape (3,)
 
-    # 4) Build vertices array (with color + alpha)
-    #    We will have 1 center + 8 corners = 9 points
-    #    (center) = index 0
-    #    near-plane corners = index 1..4
-    #    far-plane corners  = index 5..8
     def make_vert_xyzrgba(xyz):
         return np.array([xyz[0], xyz[1], xyz[2], color[0], color[1], color[2], alpha], dtype=np.float32)
 
@@ -358,33 +342,26 @@ def create_camera_frustum_mesh(
         frustum_vertices.append(make_vert_xyzrgba(corners_world[i]))  # index i+1
 
     # 5) Build faces
-    #    connect camera_center -> near-plane edges
-    #                   camera_center -> far-plane edges
-    #    Then optionally connect near-plane + far-plane as "side" rectangles.
-    #    For simplicity, we can do a pyramid from center to the four corners of far-plane,
-    #    or connect near-plane edges as well.
-
-    # Here let's connect center -> near-plane corners => 4 triangles
-    # near-plane corners = 1..4
     frustum_faces = []
+    # center -> near-plane
     for i in range(4):
-        i0 = 0          # camera center
-        i1 = 1 + i      # corner i
-        i2 = 1 + ((i+1) % 4)  # next corner (wrap around)
+        i0 = 0
+        i1 = 1 + i
+        i2 = 1 + ((i+1) % 4)
         frustum_faces.append([i0, i1, i2])
 
-    # Similarly connect center -> far-plane corners => 4 triangles
+    # center -> far-plane
     for i in range(4):
         i0 = 0
         i1 = 5 + i
         i2 = 5 + ((i+1) % 4)
         frustum_faces.append([i0, i1, i2])
 
-    # Then optionally connect near-plane ring => 2 triangles
+    # near-plane ring => 2 triangles
     frustum_faces.append([1,2,3])
     frustum_faces.append([1,3,4])
 
-    # connect far-plane ring => 2 triangles
+    # far-plane ring => 2 triangles
     frustum_faces.append([5,6,7])
     frustum_faces.append([5,7,8])
 
@@ -392,25 +369,76 @@ def create_camera_frustum_mesh(
 
 
 
+def parse_args():
+    """Parse command-line arguments for path configuration.
+    """
+    parser = argparse.ArgumentParser(description="Pipeline to reconstruct 3D ellipsoids from 2D Gaussian data.")
+
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63",
+        help="Path to the main data directory (e.g. DTU scan folder)."
+    )
+    parser.add_argument(
+        "--data_dir_gmm",
+        type=str,
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked",
+        help="Path to the directory that contains fitted Gaussian pkls."
+    )
+    parser.add_argument(
+        "--colmap_dir",
+        type=str,
+        default="sparse/0",
+        help="Relative or absolute path to the COLMAP sparse folder."
+    )
+    parser.add_argument(
+        "--image1_name",
+        type=str,
+        default="0022.png",
+        help="Filename of the first image."
+    )
+    parser.add_argument(
+        "--image2_name",
+        type=str,
+        default="0023.png",
+        help="Filename of the second image."
+    )
+    parser.add_argument(
+        "--gaussians1_filename",
+        type=str,
+        default="0022_fitted_gaussians.pkl",
+        help="Filename of the first fitted Gaussians pickle."
+    )
+    parser.add_argument(
+        "--gaussians2_filename",
+        type=str,
+        default="0023_fitted_gaussians.pkl",
+        help="Filename of the second fitted Gaussians pickle."
+    )
+
+    return parser.parse_args()
 
 ########################
-# 5) Main pipeline function
+# Main pipeline function
 ########################
 def main():
+    args = parse_args()  # 追加
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     ##############################
-    # Data / paths
+    # Data / paths 
     ##############################
-    data_dir = '/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63'
-    data_dir_gmm = '/Users/kohsukeide/dev/perspective-n-gaussian/data/train_results_8_10000'
-    gaussians1_path = os.path.join(data_dir_gmm, 'image_22_fitted_gaussians.pkl')
-    gaussians2_path = os.path.join(data_dir_gmm, 'image_23_fitted_gaussians.pkl')
-    colmap_dir = os.path.join(data_dir, 'sparse/0')
+    data_dir = args.data_dir
+    data_dir_gmm = args.data_dir_gmm
+    colmap_dir = os.path.join(data_dir, args.colmap_dir)
+    image1_name = args.image1_name
+    image2_name = args.image2_name
 
-    image1_name = '0022.png'
-    image2_name = '0023.png'
+    gaussians1_path = os.path.join(data_dir_gmm, args.gaussians1_filename)
+    gaussians2_path = os.path.join(data_dir_gmm, args.gaussians2_filename)
 
     ##############################
     # 1) Load Gaussians
@@ -418,7 +446,7 @@ def main():
     _, gaussians1, _, K1 = load_gaussians_torch(gaussians1_path, device)
     _, gaussians2, _, K2 = load_gaussians_torch(gaussians2_path, device)
 
-    # 2) Calculate dynamic target volume based on image properties
+    # 2) Calculate target volume based on image properties
     W1, H1 = K1[0, 2]*2, K1[1, 2]*2  # image1 width, height
     W2, H2 = K2[0, 2]*2, K2[1, 2]*2  # image2 width, height
     avg_pixel_area = (W1 * H1 + W2 * H2) / 2
@@ -456,39 +484,34 @@ def main():
         gaussians2=gaussians2,
         k1=K1,
         k2=K2,
-        epsilon=0.1,
-        lambda_mean=3.0,
-        lambda_cov=1.0,
-        lambda_color=1.0,
+        epsilon=0.01,
+        lambda_mean=0.0,
+        lambda_cov=0.0,
+        lambda_color=0.0,
+        lambda_epipolar=1e-3,
         device=device
     )
 
     ##############################
-    # 5) Homography optimization
+    # 5) (Homography optimization is commented out)
     ##############################
     # solver.h = torch.eye(3, dtype=torch.float32, device=device)
     # print("\n--- Optimizing Homography ---")
     # solver.optimize_with_homography(max_iter=500, tol=1e-6)
-
     # H_optimized = solver.h.detach().cpu().numpy()
     # print("\nOptimized Homography matrix:\n", H_optimized)
     
     ##############################
-    # 5) Fundamental matrix optimization
+    # 5) Fundamental matrix optimization (using R,t)
     ##############################
     print("\n--- Optimizing Fundamental Matrix ---")
-    solver.optimize_with_RT(max_iter=500, tol=1e-6)
+    solver.optimize_with_RT(max_iter=1000, tol=1e-6)
     F_optimized = solver.f.detach().cpu().numpy()
     print("\nOptimized Fundamental matrix (from R,t):\n", F_optimized)
 
     ##############################
     # 6) Final cost & unbalanced transport
     ##############################
-    # with torch.no_grad():
-    #     cost_matrix = solver.compute_cost_matrix(solver.h)
-    #     transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
-    #     transport_matrix_np = transport_matrix.cpu().numpy()
-        
     with torch.no_grad():
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
@@ -497,23 +520,22 @@ def main():
     ##############################
     # 7) Triangulate
     ##############################
+    from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
     h_dummy = np.eye(3)
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
-    # reconstructor.compute_camera_matrices_from_homography()
 
-    # R_est, t_est = reconstructor.recover_extrinsics_from_fundamental(F_optimized, K1, K2)
-    
+    # Get R,t from solver
     r_optimized = solver.rvec.detach().cpu().numpy()
     t_optimized = solver.tvec.detach().cpu().numpy()
-    R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()  # (3,3)
+    R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()
     print("R_est:\n", R_est)
     print("t_est:\n", t_optimized)
     
     reconstructor.set_camera_matrices_explicitly(
         r1=np.eye(3), 
         t1=np.zeros(3), 
-        r2=R_est,   # 上で計算した R_est
-        t2=t_optimized  # 上で取り出した t_optimized
+        r2=R_est, 
+        t2=t_optimized
     )
 
     threshold = 1e-6
@@ -526,7 +548,6 @@ def main():
     ##############################
     print("\n--- Computing 3D Gaussian Covariances with Volume Prior ---")
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
-    # reconstructor.compute_3d_gaussian_covariances()
 
     ply_points_out = os.path.join('results', 'triangulated_points.ply')
     os.makedirs('results', exist_ok=True)
@@ -549,27 +570,23 @@ def main():
     for i in range(points_3d.shape[0]):
         center = points_3d[i]
         Sigma_3 = reconstructor.covariances_3d[i]
-        c3 = reconstructor.color_3d[i]   # [r,g,b] in [0..1]
-        a3 = reconstructor.alpha_3d[i]   # alpha in [0..1]
+        c3 = reconstructor.color_3d[i]
+        a3 = reconstructor.alpha_3d[i]
 
         raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
         extended_vertices = []
         for vert in raw_vertices:
-            # (x, y, z, r, g, b, a)
             combo = np.concatenate([vert, c3, [a3]])
             extended_vertices.append(combo)
 
         all_vertices.append(extended_vertices)
         all_faces.append(faces)
 
-    # Save ellipsoids with alpha channel
     ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
     save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
     
-    
-    
     ##############################
-    # 10) Build ellipsoids => PLY
+    # 10) Build ellipsoids => PLY (with camera frustums)
     ##############################
     all_vertices = []
     all_faces = []
@@ -578,13 +595,12 @@ def main():
     for i in range(points_3d.shape[0]):
         center = points_3d[i]
         Sigma_3 = reconstructor.covariances_3d[i]
-        c3 = reconstructor.color_3d[i]   # [r,g,b] in [0..1]
-        a3 = reconstructor.alpha_3d[i]   # alpha in [0..1]
+        c3 = reconstructor.color_3d[i]
+        a3 = reconstructor.alpha_3d[i]
 
         raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
         extended_vertices = []
         for vert in raw_vertices:
-            # (x, y, z, r, g, b, a)
             combo = np.concatenate([vert, c3, [a3]])
             extended_vertices.append(combo)
 
@@ -592,12 +608,9 @@ def main():
         all_faces.append(faces)
 
     # === ADDED for camera frustum ===
-    # 10A) Camera1のR,t (world->cam) を取得
     R1 = camera1.R_wc  # world->camera
-    t1 = camera1.t_wc  # shape (3,)
-
-    # カメラフラスタムを作成して追加
-    frustum_color = (0.0, 1.0, 0.0)  # 緑
+    t1 = camera1.t_wc
+    frustum_color = (0.0, 1.0, 0.0)
     frustum_alpha = 1.0
     camera1_frustum_verts, camera1_frustum_faces = create_camera_frustum_mesh(
         K=camera1.K,
@@ -606,16 +619,15 @@ def main():
         color=frustum_color,
         alpha=frustum_alpha,
         near_z=0.1,
-        far_z=0.4,     
+        far_z=0.4,
         scale_fov=100.0  
     )
     all_vertices.append(camera1_frustum_verts)
     all_faces.append(camera1_frustum_faces)
 
-    # （camera2も表示したい場合は同様に作る）
     R2 = camera2.R_wc
     t2 = camera2.t_wc
-    frustum_color2 = (0.0, 0.0, 1.0)  # 青
+    frustum_color2 = (0.0, 0.0, 1.0)
     camera2_frustum_verts, camera2_frustum_faces = create_camera_frustum_mesh(
         K=camera2.K,
         R_world2cam=R2,
@@ -635,19 +647,14 @@ def main():
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
     ##############################
-    # e.g. project onto camera1's view
-    if True:  # set to False if you don't want to do it
-        # 11) Optionally render 3D Gaussians to 2D
+    if True:
         print("\n--- Rendering 3D Gaussians back into camera1's 2D image (alpha-blend) ---")
 
         R_cam = np.eye(3)
         t_cam = np.zeros(3)
 
-        # Output image resolution => e.g. match camera1's size
-        out_width  = int(camera1.K[0,2]*2)  # if center is at K[0,2]
+        out_width  = int(camera1.K[0,2]*2)
         out_height = int(camera1.K[1,2]*2)
-
-        # Now call the splat function
 
         mixture_img, coverage_img = render_gaussians_pure_mixture(
             points_3d=reconstructor.points_3d,
@@ -660,37 +667,26 @@ def main():
             out_width=out_width,
             out_height=out_height,
         )
-
-        # # Convert float RGBA [0..1] => 8-bit BGRA or RGBA
-        # rendered_8u = np.clip(rendered_rgba*255.0, 0, 255).astype(np.uint8)
-        
         
         rendered_rgba = np.zeros((out_height, out_width, 4), dtype=np.float32)
-        rendered_rgba[..., :3] = mixture_img  # RGB channels
-        rendered_rgba[..., 3] = coverage_img  # Alpha channel
+        rendered_rgba[..., :3] = mixture_img
+        rendered_rgba[..., 3] = coverage_img
 
-        # 8ビット画像に変換
         rendered_8u = np.clip(rendered_rgba*255.0, 0, 255).astype(np.uint8)
         
-        # # If using OpenCV, typically BGR or BGRA => let's do RGBA->BGRA for saving
-        # # Make sure we have 4 channels => shape(H,W,4)
-        # # Then convert RGBA->BGRA so cv2 will not mix color
         rendered_8u_bgra = rendered_8u.copy()
-        rendered_8u_bgra[...,0] = rendered_8u[...,2]  # swap R,B
+        rendered_8u_bgra[...,0] = rendered_8u[...,2]
         rendered_8u_bgra[...,2] = rendered_8u[...,0]
 
         cv2.imwrite("results/rendered_splats.png", rendered_8u_bgra)
         print("Saved alpha-blended splatting to results/rendered_splats.png")
-
-        # done
         print("\nDone.")
 
     ##############################
     # 12) Save final results
     ##############################
     results = {
-        # 'homography_matrix': H_optimized,
-        'fundamental_matrix': F_optimized,   # new
+        'fundamental_matrix': F_optimized,
         'cost_matrix': cost_matrix.cpu().numpy(),
         'transport_matrix': transport_matrix_np,
         'camera1_K': K1,
