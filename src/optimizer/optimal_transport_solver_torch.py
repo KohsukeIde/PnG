@@ -25,7 +25,7 @@ class OptimalTransportSolver:
         lambda_mean: float = 1.0,
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
-        lambda_epipolar: float = 0.0,
+        lambda_epipolar: float = 1e-3,
         device: Optional[torch.device] = None,
     ):
         """Initialize the OptimalTransportSolver.
