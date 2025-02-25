@@ -12,134 +12,23 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-########################
-# 0) Import modules
-########################
+# インポート部分を更新: 共通ユーティリティ関数を使用
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 from utils.gs_pkl_loader import load_gaussians_torch
+from utils.saving.geometry_utils import save_ellipsoids_as_ply
+
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
 # Import your reconstructor that can compute 3D covariances (with volume prior, color, alpha)
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
-########################
-# Helper function: sample_ellipsoid_vertices_and_faces
-########################
-def sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta=12, n_phi=12):
-    """
-    Approximate the surface of a 3D ellipsoid (Gaussian) by sampling a sphere
-    and applying sqrt(Sigma_3).
+# 元のsample_ellipsoid_vertices_and_faces, create_camera_frustum_mesh, save_ellipsoids_as_plyの実装を削除し、
+# 代わりにutilsからインポートしたものを使用
 
-    Args:
-        Sigma_3 (np.ndarray): 3x3 positive semi-definite covariance matrix
-        center (np.ndarray): shape (3,), 3D center
-        n_theta (int): number subdivisions for azimuth
-        n_phi (int): number subdivisions for polar angle
-
-    Returns:
-        vertices (list of [x,y,z]): approximated ellipsoid vertices in 3D
-        faces (list of [v1,v2,v3]): triangular faces (indices into vertices)
-    """
-    eigvals, eigvecs = np.linalg.eigh(Sigma_3)
-    eigvals = np.clip(eigvals, 1e-12, None)
-    scales = np.sqrt(eigvals)
-    sqrtSigma = eigvecs @ np.diag(scales) @ eigvecs.T
-
-    vertices = []
-    faces = []
-    for i in range(n_theta+1):
-        theta = 2.0 * np.pi * i / n_theta
-        for j in range(n_phi+1):
-            phi = np.pi * j / n_phi
-            x_sph = np.sin(phi) * np.cos(theta)
-            y_sph = np.sin(phi) * np.sin(theta)
-            z_sph = np.cos(phi)
-            unit_vec = np.array([x_sph, y_sph, z_sph])
-            xyz_ellip = sqrtSigma @ unit_vec
-            xyz_ellip += center
-            vertices.append(xyz_ellip)
-
-    def idx(ii, jj):
-        return ii*(n_phi+1) + jj
-
-    for i in range(n_theta):
-        for j in range(n_phi):
-            v1 = idx(i,   j)
-            v2 = idx(i+1, j)
-            v3 = idx(i,   j+1)
-            v4 = idx(i+1, j+1)
-            faces.append([v1, v2, v3])
-            faces.append([v2, v4, v3])
-
-    return vertices, faces
-
-
-########################
-# Helper function: Save ellipsoids as PLY (with color, alpha optional)
-########################
-def save_ellipsoids_as_ply(all_vertices, all_faces, filename, use_alpha=True):
-    """
-    Merge all ellipsoids' geometry and save as a single PLY.
-
-    Args:
-        all_vertices: list of lists of shape (num_gaussians, [N_verts, 7]) if including color+alpha
-        all_faces: list of lists of triangle indices
-        filename: output ply path
-        use_alpha (bool): if True, interpret the 7th dimension as alpha
-    """
-    merged_vertices = []
-    merged_faces = []
-    v_offset = 0
-
-    for (vertices, faces) in zip(all_vertices, all_faces):
-        for v in vertices:
-            merged_vertices.append(v)
-        for f in faces:
-            merged_faces.append([f[0] + v_offset, f[1] + v_offset, f[2] + v_offset])
-        v_offset += len(vertices)
-
-    with open(filename, 'w') as f:
-        f.write('ply\n')
-        f.write('format ascii 1.0\n')
-        f.write(f'element vertex {len(merged_vertices)}\n')
-        f.write('property float x\n')
-        f.write('property float y\n')
-        f.write('property float z\n')
-        f.write('property uchar red\n')
-        f.write('property uchar green\n')
-        f.write('property uchar blue\n')
-        if use_alpha:
-            f.write('property uchar alpha\n')
-        f.write(f'element face {len(merged_faces)}\n')
-        f.write('property list uchar int vertex_indices\n')
-        f.write('end_header\n')
-
-        for mv in merged_vertices:
-            x, y, z = mv[0], mv[1], mv[2]
-            r_f, g_f, b_f = mv[3], mv[4], mv[5]
-            r = int(np.clip(r_f * 255, 0, 255))
-            g = int(np.clip(g_f * 255, 0, 255))
-            b = int(np.clip(b_f * 255, 0, 255))
-
-            if use_alpha:
-                a_f = mv[6]
-                a = int(np.clip(a_f * 255, 0, 255))
-                f.write(f"{x:.5f} {y:.5f} {z:.5f} {r} {g} {b} {a}\n")
-            else:
-                f.write(f"{x:.5f} {y:.5f} {z:.5f} {r} {g} {b}\n")
-
-        for face in merged_faces:
-            f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
-
-    print(f"Saved {len(all_vertices)} ellipsoids => {len(merged_vertices)} vertices, {len(merged_faces)} faces to {filename}")
-
-
-########################
-# Helper function: Save 3D points as PLY
-########################
+# 以下の関数は残す（ジオメトリ保存とは無関係のため）
 def save_point_cloud_as_ply(points, filename):
     """
     Save 3D points as a PLY file.
@@ -161,9 +50,6 @@ def save_point_cloud_as_ply(points, filename):
     print(f"Saved {points.shape[0]} points to {filename}")
 
 
-########################
-#(WIP): Project 3D Gaussians back to 2D
-########################
 def render_gaussians_pure_mixture(
     points_3d,
     covariances_3d,
@@ -271,104 +157,6 @@ def render_gaussians_pure_mixture(
     return mixture_img, weight_buffer
 
 
-def create_camera_frustum_mesh(
-    K,
-    R_world2cam,
-    t_world2cam,
-    color=(1.0, 0.0, 0.0),
-    alpha=1.0,
-    near_z=0.1,
-    far_z=0.5,
-    scale_fov=1.0
-):
-    """
-    Create a simple triangular mesh representing the camera frustum (pyramid).
-    - K: Intrinsic (3x3), typically [fx, 0, cx; 0, fy, cy; 0,0,1]
-    - R_world2cam, t_world2cam: The extrinsic that maps world->camera. 
-      If you have camera1.R, camera1.t as world->cam, 
-      then the camera center in world coords is C = -R^T * t.
-    - color, alpha: color in [0..1], alpha in [0..1]
-    - near_z, far_z: position of near-plane and far-plane in camera coords (z>0)
-    - scale_fov: to scale the pyramid size if you want bigger/smaller frustum
-
-    Returns:
-        frustum_vertices: list of np.array([x,y,z,r,g,b,a]) shape=(N,)
-        frustum_faces   : list of [v1,v2,v3] index triplets
-    """
-
-    # 1) Invert (R,t) to get camera pose as cam->world
-    R_cam2world = R_world2cam.T
-    t_cam2world = -R_world2cam.T @ t_world2cam
-
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
-
-    # 2) Define corners in camera coords
-    corners_cam = []
-    for zval in [near_z, far_z]:
-        # 4 corners in pixel coords (u,v)
-        uvs = [
-            (0, 0),
-            (2*cx, 0),
-            (2*cx, 2*cy),
-            (0, 2*cy),
-        ]
-        for (u,v) in uvs:
-            x = (u - cx)/fx * zval
-            y = (v - cy)/fy * zval
-            corners_cam.append(np.array([x, y, zval], dtype=np.float32))
-
-    corners_cam = np.array(corners_cam)
-    # optionally scale the FOV:
-    corners_cam[:, :2] *= scale_fov
-
-    # 3) Transform corners_cam to world coords
-    corners_world = []
-    for cc in corners_cam:
-        cw = R_cam2world @ cc + t_cam2world
-        corners_world.append(cw)
-
-    corners_world = np.array(corners_world)  # shape (8,3)
-
-    # Also define the camera center itself
-    camera_center = t_cam2world  # shape (3,)
-
-    def make_vert_xyzrgba(xyz):
-        return np.array([xyz[0], xyz[1], xyz[2], color[0], color[1], color[2], alpha], dtype=np.float32)
-
-    frustum_vertices = []
-    frustum_vertices.append(make_vert_xyzrgba(camera_center))  # index 0
-    for i in range(8):
-        frustum_vertices.append(make_vert_xyzrgba(corners_world[i]))  # index i+1
-
-    # 5) Build faces
-    frustum_faces = []
-    # center -> near-plane
-    for i in range(4):
-        i0 = 0
-        i1 = 1 + i
-        i2 = 1 + ((i+1) % 4)
-        frustum_faces.append([i0, i1, i2])
-
-    # center -> far-plane
-    for i in range(4):
-        i0 = 0
-        i1 = 5 + i
-        i2 = 5 + ((i+1) % 4)
-        frustum_faces.append([i0, i1, i2])
-
-    # near-plane ring => 2 triangles
-    frustum_faces.append([1,2,3])
-    frustum_faces.append([1,3,4])
-
-    # far-plane ring => 2 triangles
-    frustum_faces.append([5,6,7])
-    frustum_faces.append([5,7,8])
-
-    return frustum_vertices, frustum_faces
-
-
-
 def parse_args():
     """Parse command-line arguments for path configuration.
     """
@@ -419,11 +207,9 @@ def parse_args():
 
     return parser.parse_args()
 
-########################
-# Main pipeline function
-########################
+# メイン部分は基本的に変更なし
 def main():
-    args = parse_args()  # 追加
+    args = parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -493,15 +279,6 @@ def main():
     )
 
     ##############################
-    # 5) (Homography optimization is commented out)
-    ##############################
-    # solver.h = torch.eye(3, dtype=torch.float32, device=device)
-    # print("\n--- Optimizing Homography ---")
-    # solver.optimize_with_homography(max_iter=500, tol=1e-6)
-    # H_optimized = solver.h.detach().cpu().numpy()
-    # print("\nOptimized Homography matrix:\n", H_optimized)
-    
-    ##############################
     # 5) Fundamental matrix optimization (using R,t)
     ##############################
     print("\n--- Optimizing Fundamental Matrix ---")
@@ -563,67 +340,38 @@ def main():
     ##############################
     # 10) Build ellipsoids => PLY
     ##############################
-    all_vertices = []
-    all_faces = []
-    n_theta, n_phi = 12, 12
-
-    for i in range(points_3d.shape[0]):
-        center = points_3d[i]
-        Sigma_3 = reconstructor.covariances_3d[i]
-        c3 = reconstructor.color_3d[i]
-        a3 = reconstructor.alpha_3d[i]
-
-        raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
-        extended_vertices = []
-        for vert in raw_vertices:
-            combo = np.concatenate([vert, c3, [a3]])
-            extended_vertices.append(combo)
-
-        all_vertices.append(extended_vertices)
-        all_faces.append(faces)
-
     ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
-    save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
+    save_ellipsoids_as_ply(
+        points_3d=reconstructor.points_3d,
+        covariances_3d=reconstructor.covariances_3d,
+        colors_3d=reconstructor.color_3d,
+        alphas_3d=reconstructor.alpha_3d,
+        filename=ply_out,
+        use_alpha=True
+    )
     
     ##############################
     # 10) Build ellipsoids => PLY (with camera frustums)
     ##############################
-    # === ADDED for camera frustum ===
+    # カメラフラスタム付きのPLYを生成 - 共通ユーティリティ関数を使用
     R1 = camera1.R_wc  # world->camera
     t1 = camera1.t_wc
-    frustum_color = (0.0, 1.0, 0.0)
-    frustum_alpha = 1.0
-    camera1_frustum_verts, camera1_frustum_faces = create_camera_frustum_mesh(
-        K=camera1.K,
-        R_world2cam=R1,
-        t_world2cam=t1,
-        color=frustum_color,
-        alpha=frustum_alpha,
-        near_z=0.1,
-        far_z=0.4,
-        scale_fov=100.0  
-    )
-    all_vertices.append(camera1_frustum_verts)
-    all_faces.append(camera1_frustum_faces)
-
     R2 = camera2.R_wc
     t2 = camera2.t_wc
-    frustum_color2 = (0.0, 0.0, 1.0)
-    camera2_frustum_verts, camera2_frustum_faces = create_camera_frustum_mesh(
-        K=camera2.K,
-        R_world2cam=R2,
-        t_world2cam=t2,
-        color=frustum_color2,
-        alpha=frustum_alpha,
-        near_z=0.1,
-        far_z=0.4,
-        scale_fov=100.0
-    )
-    all_vertices.append(camera2_frustum_verts)
-    all_faces.append(camera2_frustum_faces)
-
+    
+    # カメラパラメータリスト
+    camera_params = [(R1, t1), (R2, t2)]
+    
     ply_out = os.path.join('results', '3d_gaussians_ellipsoids_withCams.ply')
-    save_ellipsoids_as_ply(all_vertices, all_faces, ply_out, use_alpha=True)
+    save_ellipsoids_as_ply(
+        points_3d=reconstructor.points_3d,
+        covariances_3d=reconstructor.covariances_3d,
+        colors_3d=reconstructor.color_3d,
+        alphas_3d=reconstructor.alpha_3d,
+        filename=ply_out,
+        camera_params=camera_params,
+        use_alpha=True
+    )
 
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
@@ -685,8 +433,5 @@ def main():
     print("\nDone.")
 
 
-########################
-# 6) Run main if needed
-########################
 if __name__ == '__main__':
     main()
