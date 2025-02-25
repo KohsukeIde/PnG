@@ -17,7 +17,7 @@ from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 from utils.gs_pkl_loader import load_gaussians_torch
-from utils.saving.geometry_utils import save_ellipsoids_as_ply
+from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_point_cloud_as_ply
 
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
@@ -25,31 +25,8 @@ sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 # Import your reconstructor that can compute 3D covariances (with volume prior, color, alpha)
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
-# 元のsample_ellipsoid_vertices_and_faces, create_camera_frustum_mesh, save_ellipsoids_as_plyの実装を削除し、
-# 代わりにutilsからインポートしたものを使用
 
 # 以下の関数は残す（ジオメトリ保存とは無関係のため）
-def save_point_cloud_as_ply(points, filename):
-    """
-    Save 3D points as a PLY file.
-
-    Args:
-        points (np.ndarray): shape (N,3).
-        filename (str): Output PLY file path.
-    """
-    with open(filename, 'w') as f:
-        f.write('ply\n')
-        f.write('format ascii 1.0\n')
-        f.write(f'element vertex {points.shape[0]}\n')
-        f.write('property float x\n')
-        f.write('property float y\n')
-        f.write('property float z\n')
-        f.write('end_header\n')
-        for point in points:
-            f.write(f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f}\n")
-    print(f"Saved {points.shape[0]} points to {filename}")
-
-
 def render_gaussians_pure_mixture(
     points_3d,
     covariances_3d,
