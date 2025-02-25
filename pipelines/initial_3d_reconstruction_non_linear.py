@@ -588,25 +588,6 @@ def main():
     ##############################
     # 10) Build ellipsoids => PLY (with camera frustums)
     ##############################
-    all_vertices = []
-    all_faces = []
-    n_theta, n_phi = 12, 12
-
-    for i in range(points_3d.shape[0]):
-        center = points_3d[i]
-        Sigma_3 = reconstructor.covariances_3d[i]
-        c3 = reconstructor.color_3d[i]
-        a3 = reconstructor.alpha_3d[i]
-
-        raw_vertices, faces = sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta, n_phi)
-        extended_vertices = []
-        for vert in raw_vertices:
-            combo = np.concatenate([vert, c3, [a3]])
-            extended_vertices.append(combo)
-
-        all_vertices.append(extended_vertices)
-        all_faces.append(faces)
-
     # === ADDED for camera frustum ===
     R1 = camera1.R_wc  # world->camera
     t1 = camera1.t_wc
