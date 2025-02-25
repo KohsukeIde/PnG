@@ -1,6 +1,7 @@
 from typing import List, Optional, Tuple
 
 import cv2
+import torch
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.optimize import least_squares
@@ -115,6 +116,17 @@ def project_covariance_3d_to_2d(
     Returns:
         np.ndarray: Resulting 2D covariance (2x2).
     """
+    
+    if isinstance(sigma_3, torch.Tensor):
+        sigma_3 = sigma_3.detach().cpu().numpy()
+    if isinstance(point_3d, torch.Tensor):
+        point_3d = point_3d.detach().cpu().numpy()
+    if isinstance(k, torch.Tensor):
+        k = k.detach().cpu().numpy()
+    if isinstance(r_cam, torch.Tensor):
+        r_cam = r_cam.detach().cpu().numpy()
+    if isinstance(t_cam, torch.Tensor):
+        t_cam = t_cam.detach().cpu().numpy()
     # Project the 3D point to camera coordinates.
     x_c = r_cam @ point_3d + t_cam
     # Extract the x, y, z coordinates from the camera coordinates.
