@@ -21,7 +21,7 @@ class OptimalTransportSolver:
         gaussians2: TwoDGaussians,
         k1: Optional[np.ndarray] = None,
         k2: Optional[np.ndarray] = None,
-        epsilon: float = 0.1,
+        epsilon: float = 0.01,
         lambda_mean: float = 1.0,
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
@@ -689,8 +689,15 @@ class OptimalTransportSolver:
             f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # 8) （任意のスケーリング・調整）
-        epipolar_dist = epipolar_dist / 2.0  # 例: 大きさを半分にしておく
-        d_color = d_color / 3.0             # 例: 色差も軽く正規化
+        # epipolar_max = epipolar_dist.max() + 1e-12
+        # epipolar_dist = epipolar_dist / epipolar_max
+        # d_color = d_color / 3.0             # 例: 色差も軽く正規化
+        with torch.no_grad():
+            p95_epipolar = torch.quantile(epipolar_dist, 0.95)
+            p95_color = torch.quantile(d_color, 0.95)
+
+        epipolar_dist = torch.clamp(epipolar_dist, max=p95_epipolar) / p95_epipolar
+        d_color = torch.clamp(d_color, max=p95_color) / p95_color
 
         print("=== After Normalization ===")
         print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, "
