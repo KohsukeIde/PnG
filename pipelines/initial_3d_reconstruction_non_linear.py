@@ -133,6 +133,157 @@ def render_gaussians_pure_mixture(
 
     return mixture_img, weight_buffer
 
+import numpy as np
+import cv2
+from tqdm import tqdm
+
+def render_gaussians_alpha_blend(
+    points_3d,
+    covariances_3d,
+    color_3d,
+    alpha_3d,
+    R_cam,
+    t_cam,
+    K,
+    out_width,
+    out_height,
+    splat_radius_factor=3.0
+):
+    """
+    3Dガウスをアルファブレンド(Over)で2次元レンダリングする関数
+    
+    手順:
+      1) ガウスの中心深度 Z_c (カメラ座標系) が大きい順に並び替え (遠い->近い)
+      2) 後ろから順にガウスをレンダリングし、アルファブレンドする
+         alpha_composite: C_out = C_new * A_new + C_in * (1 - A_new)
+                          A_out = A_in + A_new * (1 - A_in)
+      3) 結果を (H,W,3) の color_img と (H,W) の alpha_img にして返す
+    
+    Args:
+        points_3d (N,3)          : 3Dガウスの中心 (world座標)
+        covariances_3d (N,3,3)   : 3Dガウスの共分散行列 (world座標)
+        color_3d (N,3)           : 各ガウスの色 (0~1)
+        alpha_3d (N,)            : 各ガウスのアルファ (0~1)
+        R_cam, t_cam             : ワールド->カメラ変換 (3x3, (3,))
+        K                        : カメラ内部パラメータ (3x3)
+        out_width, out_height    : 出力画像サイズ
+        splat_radius_factor (float): ガウス投影時の描画範囲を標準偏差の何倍にするか
+    
+    Returns:
+        color_img (H,W,3) : 最終的なカラー画像 (float32, 0~1)
+        alpha_img (H,W)   : 最終的なアルファ (float32, 0~1)
+    """
+    # 出力バッファ（カラー+アルファ）
+    color_buffer = np.zeros((out_height, out_width, 3), dtype=np.float32)
+    alpha_buffer = np.zeros((out_height, out_width),     dtype=np.float32)
+
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+
+    N = points_3d.shape[0]
+
+    #---------- (1) ガウスを「奥(大きいZ) -> 手前(小さいZ)」の順にソート ----------
+    #    カメラ座標系での Z_c を求め、降順に並べる (大→小)
+    #    ※手前から奥へ上書き(Over)するなら Z 小→大 でも可。ここでは奥->手前を想定。
+    z_list = []
+    for i in range(N):
+        X_w = points_3d[i]
+        X_c = R_cam @ X_w + t_cam
+        z_list.append((X_c[2], i))
+    # z(カメラ座標)でソート: 大きい順
+    z_list.sort(key=lambda x: x[0], reverse=True)
+
+    #---------- (2) ソート順にガウスを描画(アルファブレンド) ----------
+    for _, i in tqdm(z_list, desc="Rendering Gaussians (alpha blend)"):
+        X_w = points_3d[i]
+        Sigma_3 = covariances_3d[i]
+        rgb = color_3d[i]
+        alpha_i = alpha_3d[i]
+
+        # カメラ座標に変換
+        X_c = R_cam @ X_w + t_cam
+        # Zが正でないならスキップ
+        if X_c[2] <= 1e-8:
+            continue
+
+        # 中心の投影
+        u = fx*(X_c[0]/X_c[2]) + cx
+        v = fy*(X_c[1]/X_c[2]) + cy
+        
+        px_center = int(np.round(u))
+        py_center = int(np.round(v))
+        if not (0 <= px_center < out_width and 0 <= py_center < out_height):
+            # 画面外なら一応描画範囲を計算しても全部外の可能性があるのでチェック
+            pass
+
+        # カメラ系での共分散
+        Sigma_cam = R_cam @ Sigma_3 @ R_cam.T
+
+        # ヤコビアンによる 2D 共分散行列
+        X, Y, Z = X_c
+        J = np.array([
+            [fx/Z,   0.0,    -fx*X/(Z**2)],
+            [0.0,    fy/Z,   -fy*Y/(Z**2)]
+        ], dtype=np.float32)
+        
+        Sigma_2D = J @ Sigma_cam @ J.T
+        e_vals, e_vecs = np.linalg.eig(Sigma_2D)
+        e_vals = np.clip(e_vals, 1e-12, None)
+        std_x = np.sqrt(e_vals[0])
+        std_y = np.sqrt(e_vals[1])
+
+        # スプラット描画範囲
+        radius_x = int(np.ceil(std_x * splat_radius_factor))
+        radius_y = int(np.ceil(std_y * splat_radius_factor))
+
+        min_x = max(px_center - radius_x, 0)
+        max_x = min(px_center + radius_x, out_width - 1)
+        min_y = max(py_center - radius_y, 0)
+        max_y = min(py_center + radius_y, out_height - 1)
+
+        inv_Sigma_2D = np.linalg.inv(Sigma_2D)
+
+        # バウンディングボックス内のピクセルに対してガウス値を計算 → アルファブレンド
+        for py in range(min_y, max_y + 1):
+            for px in range(min_x, max_x + 1):
+                dx = px - u
+                dy = py - v
+                disp = np.array([dx, dy], dtype=np.float32)
+                val = disp @ inv_Sigma_2D @ disp
+                gauss_val = np.exp(-0.5 * val)
+
+                # 実際のアルファとして使用
+                # （例: gauss_valにalpha_3d[i]を掛け、0~1にクリップ）
+                # ここでは単純に gauss_val * alpha_i をアルファとみなす
+                blend_alpha = gauss_val * alpha_i
+                blend_alpha = np.clip(blend_alpha, 0.0, 1.0)
+
+                if blend_alpha <= 1e-8:
+                    continue
+
+                # アルファブレンド: Overオペレーション
+                # 現在のピクセルにある色: C_in, A_in
+                # 今回追加する色      : C_new=rgb, A_new=blend_alpha
+                # C_out = C_new * A_new + C_in * (1 - A_new)
+                # A_out = A_in + A_new * (1 - A_in)
+                C_in = color_buffer[py, px]
+                A_in = alpha_buffer[py, px]
+                A_new = blend_alpha
+                C_new = rgb
+
+                A_out = A_in + A_new * (1.0 - A_in)  # アルファの合成
+                if A_out > 1e-8:
+                    # 変化する場合のみ計算
+                    C_out = (C_new * A_new + C_in * A_in * (1.0 - A_new)) / A_out
+                else:
+                    C_out = C_in
+
+                color_buffer[py, px] = C_out
+                alpha_buffer[py, px] = A_out
+
+    return color_buffer, alpha_buffer
+
+
 
 def parse_args():
     """Parse command-line arguments for path configuration.
@@ -291,8 +442,9 @@ def main():
         r2=R_est, 
         t2=t_optimized
     )
-
-    threshold = 1e-6
+    
+    #dont delete single gaussian
+    threshold = 0.0
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold, top_k=100000)
     points_3d = reconstructor.points_3d
     print(f"\nTriangulated {points_3d.shape[0]} 3D points")
@@ -362,7 +514,7 @@ def main():
         out_width  = int(camera1.K[0,2]*2)
         out_height = int(camera1.K[1,2]*2)
 
-        mixture_img, coverage_img = render_gaussians_pure_mixture(
+        mixture_img, coverage_img = render_gaussians_alpha_blend(
             points_3d=reconstructor.points_3d,
             covariances_3d=reconstructor.covariances_3d,
             color_3d=reconstructor.color_3d,
@@ -402,7 +554,7 @@ def main():
         'color_3d': reconstructor.color_3d,
         'alpha_3d': reconstructor.alpha_3d,
     }
-    out_pkl = os.path.join('results', 'homography_optimization_results.pkl')
+    out_pkl = os.path.join('results', 'initial_3dgs_results.pkl')
     with open(out_pkl, 'wb') as f:
         pickle.dump(results, f)
 
