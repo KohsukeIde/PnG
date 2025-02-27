@@ -978,19 +978,45 @@ class OptimalTransportSolver:
                 print(f"Iter {iteration}, Loss={current_loss:.6f}, Grad_r={grad_r:.6f}, Grad_t={grad_t:.6f}")
 
                 # Transport matrix 可視化
-                with torch.no_grad():
-                    t_np = transport.detach().cpu().numpy()
-                    plt.figure(figsize=(8, 6))
-                    plt.imshow(t_np, cmap="hot", interpolation="nearest")
-                    plt.colorbar(label="Transport Plan Value")
-                    plt.title(f"Transport Plan at Iteration {iteration}")
-                    plt.xlabel("Image 2 Gaussians")
-                    plt.ylabel("Image 1 Gaussians")
-                    plt.tight_layout()
-                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-                    plt.savefig(plt_path)
-                    plt.close()
-                    print(f"Transport matrix heatmap saved to '{plt_path}'")
+                if iteration % 10 == 0 or iteration == max_iter - 1:
+                    with torch.no_grad():
+                        t_np = transport.detach().cpu().numpy()
+                        
+                        # 行列の次元に応じてフィギュアサイズとアスペクト比を調整
+                        rows, cols = t_np.shape
+                        aspect_ratio = cols / rows
+                        
+                        # 行列が縦長（rows > cols）の場合、適切なサイズ調整
+                        if rows > cols:
+                            fig_width = 8  # 基本の幅
+                            fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
+                        else:
+                            fig_height = 6  # 基本の高さ
+                            fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
+                        
+                        plt.figure(figsize=(fig_width, fig_height))
+                        
+                        # 大きな行列の場合はダウンサンプリングを考慮
+                        if rows > 1000 or cols > 1000:
+                            # 簡易的なダウンサンプリング（行列が非常に大きい場合）
+                            downsample_factor = max(1, int(max(rows, cols) / 1000))
+                            t_np_display = t_np[::downsample_factor, ::downsample_factor]
+                            plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+                            plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
+                        else:
+                            plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
+                            plt.title(f"Transport Plan at Iteration {iteration}")
+                        
+                        plt.colorbar(label="Transport Plan Value")
+                        plt.xlabel("Image 2 Gaussians")
+                        plt.ylabel("Image 1 Gaussians")
+                        
+                        # 軸ラベルの位置調整（必要に応じて）
+                        plt.tight_layout()
+                        plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+                        plt.savefig(plt_path, dpi=150)
+                        plt.close()
+                        print(f"Transport matrix heatmap saved to '{plt_path}'")
 
 
         print("Optimized rvec:", self.rvec)
