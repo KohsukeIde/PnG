@@ -147,7 +147,8 @@ def render_gaussians_alpha_blend(
     K,
     out_width,
     out_height,
-    splat_radius_factor=3.0
+    splat_radius_factor=3.0,
+    transport=None
 ):
     """
     3Dガウスをアルファブレンド(Over)で2次元レンダリングする関数
@@ -155,23 +156,29 @@ def render_gaussians_alpha_blend(
     手順:
       1) ガウスの中心深度 Z_c (カメラ座標系) が大きい順に並び替え (遠い->近い)
       2) 後ろから順にガウスをレンダリングし、アルファブレンドする
-         alpha_composite: C_out = C_new * A_new + C_in * (1 - A_new)
-                          A_out = A_in + A_new * (1 - A_in)
+         alpha_composite: 
+             C_out = C_new * A_new + C_in * (1 - A_new)
+             A_out = A_in + A_new * (1 - A_in)
       3) 結果を (H,W,3) の color_img と (H,W) の alpha_img にして返す
     
     Args:
         points_3d (N,3)          : 3Dガウスの中心 (world座標)
         covariances_3d (N,3,3)   : 3Dガウスの共分散行列 (world座標)
         color_3d (N,3)           : 各ガウスの色 (0~1)
-        alpha_3d (N,)            : 各ガウスのアルファ (0~1)
+        alpha_3d (N,)            : 各ガウスの基準アルファ (0~1)
         R_cam, t_cam             : ワールド->カメラ変換 (3x3, (3,))
         K                        : カメラ内部パラメータ (3x3)
         out_width, out_height    : 出力画像サイズ
-        splat_radius_factor (float): ガウス投影時の描画範囲を標準偏差の何倍にするか
+        splat_radius_factor (float):
+            ガウス投影時の描画範囲を標準偏差の何倍にするか
+        transport (N,) or None:
+            各3Dガウスの "輸送量" や "重み"。
+            Noneでない場合は alpha_3d に乗算してアルファを決定する。
+            例: final_alpha[i] = clip( alpha_3d[i] * transport[i], 0, 1 )
     
     Returns:
-        color_img (H,W,3) : 最終的なカラー画像 (float32, 0~1)
-        alpha_img (H,W)   : 最終的なアルファ (float32, 0~1)
+        color_img (H,W,3): 最終的なカラー画像 (float32, 0~1)
+        alpha_img (H,W)  : 最終的なアルファ画像 (float32, 0~1)
     """
     # 出力バッファ（カラー+アルファ）
     color_buffer = np.zeros((out_height, out_width, 3), dtype=np.float32)
@@ -182,44 +189,51 @@ def render_gaussians_alpha_blend(
 
     N = points_3d.shape[0]
 
-    #---------- (1) ガウスを「奥(大きいZ) -> 手前(小さいZ)」の順にソート ----------
-    #    カメラ座標系での Z_c を求め、降順に並べる (大→小)
-    #    ※手前から奥へ上書き(Over)するなら Z 小→大 でも可。ここでは奥->手前を想定。
+    #---------- (1) ガウスを「奥(Z大) -> 手前(Z小)」の順にソート ----------
     z_list = []
     for i in range(N):
         X_w = points_3d[i]
         X_c = R_cam @ X_w + t_cam
         z_list.append((X_c[2], i))
-    # z(カメラ座標)でソート: 大きい順
-    z_list.sort(key=lambda x: x[0], reverse=True)
+    z_list.sort(key=lambda x: x[0], reverse=True)  # Z降順(奥->手前)
+
+    # もしtransportが与えられたら alpha_3d に乗算しておく
+    # (クリップで [0,1] に収まるようにする)
+    if transport is not None:
+        alpha_final = np.minimum(alpha_3d * transport, 1.0)  # shape(N,)
+    else:
+        alpha_final = alpha_3d.copy()
 
     #---------- (2) ソート順にガウスを描画(アルファブレンド) ----------
     for _, i in tqdm(z_list, desc="Rendering Gaussians (alpha blend)"):
         X_w = points_3d[i]
         Sigma_3 = covariances_3d[i]
-        rgb = color_3d[i]
-        alpha_i = alpha_3d[i]
+        rgb     = color_3d[i]
+        alpha_i = alpha_final[i]  # 輸送量を掛けたアルファ
 
         # カメラ座標に変換
         X_c = R_cam @ X_w + t_cam
-        # Zが正でないならスキップ
-        if X_c[2] <= 1e-8:
+        z_c = X_c[2]
+        # Zが正でない(背面)はスキップ
+        if z_c <= 1e-8:
             continue
 
-        # 中心の投影
-        u = fx*(X_c[0]/X_c[2]) + cx
-        v = fy*(X_c[1]/X_c[2]) + cy
+        # 2D投影座標 (u,v)
+        u = fx*(X_c[0]/z_c) + cx
+        v = fy*(X_c[1]/z_c) + cy
         
         px_center = int(np.round(u))
         py_center = int(np.round(v))
+
+        # 画面外かどうかチェック
         if not (0 <= px_center < out_width and 0 <= py_center < out_height):
-            # 画面外なら一応描画範囲を計算しても全部外の可能性があるのでチェック
+            # bounding boxの一部が可視領域に入るかもしれないので、ここでは一応続行する
             pass
 
-        # カメラ系での共分散
+        # カメラ座標系でのガウス共分散
         Sigma_cam = R_cam @ Sigma_3 @ R_cam.T
 
-        # ヤコビアンによる 2D 共分散行列
+        # ヤコビアンで 2D共分散行列 Sigma_2D を算出
         X, Y, Z = X_c
         J = np.array([
             [fx/Z,   0.0,    -fx*X/(Z**2)],
@@ -227,7 +241,7 @@ def render_gaussians_alpha_blend(
         ], dtype=np.float32)
         
         Sigma_2D = J @ Sigma_cam @ J.T
-        e_vals, e_vecs = np.linalg.eig(Sigma_2D)
+        e_vals, _ = np.linalg.eig(Sigma_2D)
         e_vals = np.clip(e_vals, 1e-12, None)
         std_x = np.sqrt(e_vals[0])
         std_y = np.sqrt(e_vals[1])
@@ -237,51 +251,50 @@ def render_gaussians_alpha_blend(
         radius_y = int(np.ceil(std_y * splat_radius_factor))
 
         min_x = max(px_center - radius_x, 0)
-        max_x = min(px_center + radius_x, out_width - 1)
+        max_x = min(px_center + radius_x, out_width  - 1)
         min_y = max(py_center - radius_y, 0)
         max_y = min(py_center + radius_y, out_height - 1)
 
         inv_Sigma_2D = np.linalg.inv(Sigma_2D)
 
-        # バウンディングボックス内のピクセルに対してガウス値を計算 → アルファブレンド
+        # (min_x..max_x, min_y..max_y) のピクセルに対してガウス値を計算して Overブレンド
         for py in range(min_y, max_y + 1):
+            dy = py - v
             for px in range(min_x, max_x + 1):
                 dx = px - u
-                dy = py - v
                 disp = np.array([dx, dy], dtype=np.float32)
                 val = disp @ inv_Sigma_2D @ disp
                 gauss_val = np.exp(-0.5 * val)
 
-                # 実際のアルファとして使用
-                # （例: gauss_valにalpha_3d[i]を掛け、0~1にクリップ）
-                # ここでは単純に gauss_val * alpha_i をアルファとみなす
+                # blend_alpha = gauss_val * (輸送量を掛けたα_i)
                 blend_alpha = gauss_val * alpha_i
-                blend_alpha = np.clip(blend_alpha, 0.0, 1.0)
-
+                # 最大1にクリップ
+                if blend_alpha > 1.0:
+                    blend_alpha = 1.0
+                # ほとんど寄与しない場合はスキップ（高速化）
                 if blend_alpha <= 1e-8:
                     continue
 
-                # アルファブレンド: Overオペレーション
-                # 現在のピクセルにある色: C_in, A_in
-                # 今回追加する色      : C_new=rgb, A_new=blend_alpha
-                # C_out = C_new * A_new + C_in * (1 - A_new)
-                # A_out = A_in + A_new * (1 - A_in)
+                # 現状バッファの色(A_in, C_in)を取り出す
                 C_in = color_buffer[py, px]
                 A_in = alpha_buffer[py, px]
+
+                # Overブレンド
                 A_new = blend_alpha
                 C_new = rgb
-
-                A_out = A_in + A_new * (1.0 - A_in)  # アルファの合成
+                A_out = A_in + A_new * (1.0 - A_in)
                 if A_out > 1e-8:
-                    # 変化する場合のみ計算
-                    C_out = (C_new * A_new + C_in * A_in * (1.0 - A_new)) / A_out
+                    # C_out = (C_new*A_new + C_in*A_in*(1 - A_new)) / A_out
+                    C_out = (C_new * A_new + C_in * A_in * (1 - A_new)) / A_out
                 else:
                     C_out = C_in
 
+                # 書き戻し
                 color_buffer[py, px] = C_out
                 alpha_buffer[py, px] = A_out
 
     return color_buffer, alpha_buffer
+
 
 
 
@@ -489,7 +502,7 @@ def main():
     t2 = camera2.t_wc
     
     # カメラパラメータリスト
-    camera_params = [(R1, t1), (R2, t2)]
+    camera_params_list = [(R1, t1), (R2, t2)]
     
     ply_out = os.path.join('results', '3d_gaussians_ellipsoids_withCams.ply')
     save_ellipsoids_as_ply(
@@ -498,7 +511,7 @@ def main():
         colors_3d=reconstructor.color_3d,
         alphas_3d=reconstructor.alpha_3d,
         filename=ply_out,
-        camera_params=camera_params,
+        camera_params=camera_params_list,
         use_alpha=True
     )
 
@@ -542,7 +555,6 @@ def main():
 
     ##############################
     # 12) Save final results
-    ##############################
     results = {
         'fundamental_matrix': F_optimized,
         'cost_matrix': cost_matrix.cpu().numpy(),
@@ -553,7 +565,29 @@ def main():
         'covariances_3d': reconstructor.covariances_3d,
         'color_3d': reconstructor.color_3d,
         'alpha_3d': reconstructor.alpha_3d,
+        # Add camera parameters in various formats for compatibility
+        'camera_params_list': camera_params_list,  # Primary format expected by ViewpointExtender
+        'R1': R1,
+        't1': t1,
+        'R2': R2,
+        't2': t2,
+        'camera1_R': R1,
+        'camera1_t': t1,
+        'camera2_R': R2,
+        'camera2_t': t2,
+        # Also include the existing 3D Gaussians in the expected format for ViewpointExtender
+        'existing_3d_gaussians': [
+            {
+                "center": points_3d[i],
+                "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # Default unit quaternion
+                "scale3d": np.sqrt(np.maximum(np.linalg.eigvalsh(reconstructor.covariances_3d[i]), 1e-10)),
+                "color": reconstructor.color_3d[i],
+                "alpha": reconstructor.alpha_3d[i]
+            }
+            for i in range(len(points_3d))
+        ]
     }
+    
     out_pkl = os.path.join('results', 'initial_3dgs_results.pkl')
     with open(out_pkl, 'wb') as f:
         pickle.dump(results, f)
