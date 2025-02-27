@@ -434,14 +434,19 @@ def main():
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         transport_matrix_np = transport_matrix.cpu().numpy()
-
-    ##############################
-    # 7) Triangulate
-    ##############################
+        
     from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
     h_dummy = np.eye(3)
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
-
+    
+    print("\n--- Identifying Source Gaussians ---")
+    reconstructor.identify_source_gaussians(
+        transport_matrix=transport_matrix_np,
+        auto_threshold=True
+    )
+    ##############################
+    # 7) Triangulate
+    ##############################
     # Get R,t from solver
     r_optimized = solver.rvec.detach().cpu().numpy()
     t_optimized = solver.tvec.detach().cpu().numpy()
@@ -565,7 +570,12 @@ def main():
         'covariances_3d': reconstructor.covariances_3d,
         'color_3d': reconstructor.color_3d,
         'alpha_3d': reconstructor.alpha_3d,
-        # Add camera parameters in various formats for compatibility
+        # 以下の部分を追加 - 湧出ガウス情報の保存
+        'source_gaussians1': reconstructor.source_gaussians1,
+        'source_gaussians2': reconstructor.source_gaussians2,
+        'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
+        'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
+        # 既存の部分を続ける
         'camera_params_list': camera_params_list,  # Primary format expected by ViewpointExtender
         'R1': R1,
         't1': t1,
