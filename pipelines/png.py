@@ -107,8 +107,12 @@ def parse_args():
         help="Name of the new image to add (must be in COLMAP data)."
     )
     
-    parser.add_argument("--auto_threshold", action="store_true",
-                   help="Automatically determine optimal transport threshold")
+    parser.add_argument(
+        "--auto_threshold", 
+        action="store_true", 
+        default=True,
+        help="Automatically determine optimal transport threshold"
+    )
 
     return parser.parse_args()
 
@@ -221,11 +225,25 @@ def add_new_viewpoint():
         t2 = initial_data['camera2_t']
         camera_params_list = [(R1, t1), (R2, t2)]
     else:
-        # デフォルト
-        print("Warning: No camera parameters found in initial data. Using default.")
-        R1 = np.eye(3)
-        t1 = np.zeros(3)
-        camera_params_list = [(R1, t1)]
+        print("Error: No camera parameters found in initial data. Exiting...")
+        sys.exit(1)
+        
+    # 湧出ガウス情報を抽出
+    source_gaussians_data = {}
+    if 'source_gaussians1_data' in initial_data and initial_data['source_gaussians1_data'] is not None:
+        source_gaussians_data['source_gaussians1_data'] = initial_data['source_gaussians1_data']
+        print(f"Loaded source gaussians data for image 1: {len(initial_data['source_gaussians1_data'].get('indices', []))} gaussians")
+    
+    if 'source_gaussians2_data' in initial_data and initial_data['source_gaussians2_data'] is not None:
+        source_gaussians_data['source_gaussians2_data'] = initial_data['source_gaussians2_data']
+        print(f"Loaded source gaussians data for image 2: {len(initial_data['source_gaussians2_data'].get('indices', []))} gaussians")
+    
+    # 湧出ガウス情報がない場合は空の辞書に
+    if not source_gaussians_data:
+        print("No source gaussians data found in initial data.")
+        source_gaussians_data = None
+        sys.exit(1)
+    
     
     # 5. ViewpointExtenderを初期化
     print("Initializing ViewpointExtender...")
@@ -235,7 +253,8 @@ def add_new_viewpoint():
         K_new=K_new,
         reference_camera_idx=args.reference_idx,
         threshold_reprojection=args.transport_threshold,
-        device=device
+        device=device,
+        source_gaussians_data=source_gaussians_data
     )
     
     # 6. 一連の処理を実行: カメラ姿勢推定 + 新規3Dガウス追加
