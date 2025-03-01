@@ -403,7 +403,7 @@ class OptimalTransportSolver:
 
         # if exponent == 1, it's the balanced Sinkhorn algorithm
         exponent = rho / (rho + self.epsilon)
-        print(f"rho: {rho}, epsilon: {self.epsilon}, exponent: {exponent}")
+        # print(f"rho: {rho}, epsilon: {self.epsilon}, exponent: {exponent}")
 
         for iteration in range(max_iter):
             kv = kernel @ v
@@ -419,7 +419,7 @@ class OptimalTransportSolver:
                 torch.max(torch.abs(u_new - u)) < tol
                 and torch.max(torch.abs(v_new - v)) < tol
             ):
-                print(f"[Unbalanced] iteration {iteration} -> converged.")
+                # print(f"[Unbalanced] iteration {iteration} -> converged.")
                 break
 
             u, v = u_new, v_new
@@ -604,7 +604,6 @@ class OptimalTransportSolver:
 
         # ------------------------------------------
         # Example: Simple normalization or scaling
-        # (Adjust to taste based on your data ranges)
         # ------------------------------------------
         # e.g. Optional small scaling to keep values in a good range
         # sampson_error = sampson_error / 2.0
@@ -682,11 +681,11 @@ class OptimalTransportSolver:
         d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
 
         # - デバッグ出力（正規化前）
-        print("=== Before Normalization ===")
-        print(f"epipolar_dist: min={epipolar_dist.min():.6f}, "
-            f"max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
-        print(f"d_color:       min={d_color.min():.6f}, "
-            f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+        # print("=== Before Normalization ===")
+        # print(f"epipolar_dist: min={epipolar_dist.min():.6f}, "
+        #     f"max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
+        # print(f"d_color:       min={d_color.min():.6f}, "
+        #     f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # 8) （任意のスケーリング・調整）
         # epipolar_max = epipolar_dist.max() + 1e-12
@@ -699,12 +698,12 @@ class OptimalTransportSolver:
         epipolar_dist = torch.clamp(epipolar_dist, max=p95_epipolar) / p95_epipolar
         d_color = torch.clamp(d_color, max=p95_color) / p95_color
 
-        print("=== After Normalization ===")
-        print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, "
-            f"max={self.lambda_epipolar * epipolar_dist.max():.6f}, "
-            f"mean={self.lambda_epipolar * epipolar_dist.mean():.6f}")
-        print(f"d_color:       min={d_color.min():.6f}, "
-            f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+        # print("=== After Normalization ===")
+        # print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, "
+        #     f"max={self.lambda_epipolar * epipolar_dist.max():.6f}, "
+        #     f"mean={self.lambda_epipolar * epipolar_dist.mean():.6f}")
+        # print(f"d_color:       min={d_color.min():.6f}, "
+        #     f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # 9) 上記2種のコストを重み付けして合成
         #    cost_matrix(i,j) = lambda_epipolar * epipolar_dist(i,j)
@@ -942,7 +941,9 @@ class OptimalTransportSolver:
         transport_dir = os.path.join("results", "transport_RT")
         os.makedirs(transport_dir, exist_ok=True)
 
-        for iteration in range(max_iter):
+        pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
+        
+        for iteration in pbar:
             optimizer.zero_grad()
 
             # (1) rvec, tvec -> F
@@ -967,15 +968,15 @@ class OptimalTransportSolver:
             # (6) 収束判定
             loss_diff = abs(prev_loss_val - current_loss)
             if iteration > 5 and loss_diff < tol:
-                print(f"Converged at iteration {iteration} (loss_diff={loss_diff:.2e})")
+                pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
                 break
             prev_loss_val = current_loss
 
-            # ログ出力
+            # ログ出力 - tqdmのset_postfixを使って進捗バーに情報を追加
             if iteration % 10 == 0:
                 grad_r = self.rvec.grad.norm().item()
                 grad_t = self.tvec.grad.norm().item()
-                print(f"Iter {iteration}, Loss={current_loss:.6f}, Grad_r={grad_r:.6f}, Grad_t={grad_t:.6f}")
+                pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
 
                 # Transport matrix 可視化
                 if iteration % 10 == 0 or iteration == max_iter - 1:
@@ -1016,8 +1017,6 @@ class OptimalTransportSolver:
                         plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
                         plt.savefig(plt_path, dpi=150)
                         plt.close()
-                        print(f"Transport matrix heatmap saved to '{plt_path}'")
-
 
         print("Optimized rvec:", self.rvec)
         print("Optimized tvec:", self.tvec)
