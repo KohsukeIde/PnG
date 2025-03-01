@@ -86,13 +86,13 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan24",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63",
         help="Path to the base data directory."
     )
     parser.add_argument(
         "--data_dir_gmm",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/house_100gs_10kiter_masked",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked/",
         help="Path to the directory where the GMM data files are stored."
     )
     parser.add_argument(
@@ -184,7 +184,7 @@ def main():
         lambda_mean=3.0,
         lambda_cov=1.0,
         lambda_color=0.0,
-        lambda_epipolar=0.001,
+        lambda_epipolar=1.0,
         device=device
     )
 
