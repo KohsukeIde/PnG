@@ -469,7 +469,7 @@ class Initial3DReconstructor:
             self.p2 = self.k2 @ np.hstack((self.r2, self.t2.reshape(3, 1)))
 
     def triangulate_gaussian_centers(
-        self, transport_matrix: np.ndarray, threshold: float = 1e-3, top_k: int = 100
+        self, transport_matrix: np.ndarray, threshold: float = 1e-3, top_k: int = 1e9
     ) -> None:
         """Triangulate 3D points by extracting correspondences from the transport matrix."""
         if self.p1 is None or self.p2 is None:
