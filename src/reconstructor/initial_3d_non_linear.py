@@ -230,6 +230,115 @@ class Initial3DReconstructor:
         self.t2: Optional[np.ndarray] = None
 
         self.match_pairs: Optional[List[Tuple[int, int]]] = None
+        
+        # 湧出ガウス情報を保存するための新しいプロパティ
+        self.source_gaussians1 = None  # 第1画像の湧出ガウスインデックス
+        self.source_gaussians2 = None  # 第2画像の湧出ガウスインデックス
+        self.transport_matrix = None   # 最適輸送行列を保存
+        
+    def identify_source_gaussians(
+        self, 
+        transport_matrix: np.ndarray, 
+        threshold: float = 0.1,
+        auto_threshold: bool = True
+    ) -> None:
+        """
+        初期輸送行列から湧出ガウスを特定して保存する
+        
+        湧出ガウスは、行和または列和が閾値以下のガウスとして定義される。
+        - 行和が小さい: 第1画像(gaussians1)のガウスに対応する第2画像のガウスが少ない
+        - 列和が小さい: 第2画像(gaussians2)のガウスに対応する第1画像のガウスが少ない
+        
+        Args:
+            transport_matrix: 最適輸送行列 (shape: [k1, k2])
+            threshold: 湧出と判定する閾値 (auto_threshold=Falseの場合に使用)
+            auto_threshold: 閾値を自動的に決定するかどうか
+        """
+        self.transport_matrix = transport_matrix.copy()
+        
+        # 行和と列和を計算
+        row_sums = transport_matrix.sum(axis=1)  # 第1画像の各ガウスに対する総輸送量
+        col_sums = transport_matrix.sum(axis=0)  # 第2画像の各ガウスに対する総輸送量
+        
+        # 自動閾値決定ロジック
+        if auto_threshold:
+            # 行和の統計
+            mean_row = np.mean(row_sums)
+            std_row = np.std(row_sums)
+            min_row = np.min(row_sums)
+            
+            # 列和の統計
+            mean_col = np.mean(col_sums)
+            std_col = np.std(col_sums)
+            min_col = np.min(col_sums)
+            
+            # 統計情報を表示
+            print(f"Row sums statistics: Mean={mean_row:.4f}, Std={std_row:.4f}, Min={min_row:.4f}")
+            print(f"Column sums statistics: Mean={mean_col:.4f}, Std={std_col:.4f}, Min={min_col:.4f}")
+            
+            # 行と列それぞれの閾値を計算 (平均 - 1σ または 最小値の1.2倍)
+            if std_row > 1e-4:
+                threshold_row = max(mean_row - 1.0 * std_row, min_row * 1.2)
+            else:
+                threshold_row = min_row * 1.2
+                
+            if std_col > 1e-4:
+                threshold_col = max(mean_col - 1.0 * std_col, min_col * 1.2)
+            else:
+                threshold_col = min_col * 1.2
+                
+            print(f"Auto-determined thresholds: Row={threshold_row:.4f}, Col={threshold_col:.4f}")
+        else:
+            # 手動指定の閾値を使用
+            threshold_row = threshold
+            threshold_col = threshold
+        
+        # 閾値以下の行/列インデックスを湧出ガウスとして特定
+        self.source_gaussians1 = np.where(row_sums < threshold_row)[0]
+        self.source_gaussians2 = np.where(col_sums < threshold_col)[0]
+        
+        print(f"Identified {len(self.source_gaussians1)} source gaussians in image 1")
+        print(f"Identified {len(self.source_gaussians2)} source gaussians in image 2")
+        
+        # 湧出ガウスの詳細情報を格納
+        if hasattr(self.gaussians1, 'means') and len(self.source_gaussians1) > 0:
+            self.source_gaussians1_data = {
+                'indices': self.source_gaussians1,
+                'means': self.gaussians1.means[self.source_gaussians1],
+                'covs': self.gaussians1.covs[self.source_gaussians1],
+                'rotations': self.gaussians1.rotations[self.source_gaussians1],
+                'scales': self.gaussians1.scales[self.source_gaussians1],
+                'rgb': self.gaussians1.rgb[self.source_gaussians1],
+                'alpha': self.gaussians1.alpha[self.source_gaussians1]
+            }
+        
+        if hasattr(self.gaussians2, 'means') and len(self.source_gaussians2) > 0:
+            self.source_gaussians2_data = {
+                'indices': self.source_gaussians2,
+                'means': self.gaussians2.means[self.source_gaussians2],
+                'covs': self.gaussians2.covs[self.source_gaussians2],
+                'rotations': self.gaussians2.rotations[self.source_gaussians2],
+                'scales': self.gaussians2.scales[self.source_gaussians2],
+                'rgb': self.gaussians2.rgb[self.source_gaussians2],
+                'alpha': self.gaussians2.alpha[self.source_gaussians2]
+            }
+
+    # 湧出ガウスのデータを取得するメソッド
+    def get_source_gaussians_data(self, image_idx: int = 1):
+        """湧出ガウスのデータを取得
+        
+        Args:
+            image_idx: 画像のインデックス (1 または 2)
+            
+        Returns:
+            dict: 湧出ガウスの特徴量データ
+        """
+        if image_idx == 1 and hasattr(self, 'source_gaussians1_data'):
+            return self.source_gaussians1_data
+        elif image_idx == 2 and hasattr(self, 'source_gaussians2_data'):
+            return self.source_gaussians2_data
+        else:
+            return None
 
     def compute_camera_matrices_from_homography(self) -> None:
         """Compute camera projection matrices p1 and p2 from the homography matrix.
