@@ -515,56 +515,52 @@ class Initial3DReconstructor:
         
         
         correspondences = []
-
+        transport_values = []  # 追加: transport値を保存するリスト
+        
         for idx in range(top_k_limited):
-            # (x,y) in image 1 and image 2.
+            # 既存のコード（変更なし）
             i_val = i_coords[idx]
             j_val = j_coords[idx]
             
-            # Convert to homogeneous coordinates (x,y,1) in image 1 and image 2.
+            # 追加: 対応点のtransport値を保存
+            transport_val = transport_matrix[i_val, j_val]
+            
+            # 既存のコード（変更なし）
             x1_h = np.array([centers1[i_val, 0], centers1[i_val, 1], 1.0], dtype=float)
             x2_h = np.array([centers2[j_val, 0], centers2[j_val, 1], 1.0], dtype=float)
-
-            print(f"p1 {self.p1}")
-            print(f"p2 {self.p2}")
-
-            print(f"p1 shape {self.p1.shape}")
-            print(f"p2 shape {self.p2.shape}")
-            print(f"p1[2] {self.p1[2]}")
-            print(f"p2[2] {self.p2[2]}")
-        
-            # Direct linear triangulation.
+            
+            # （以下の三角測量コードは変更なし）
             a_mat = np.zeros((4, 4), dtype=float)
             a_mat[0, :] = x1_h[0] * self.p1[2, :] - self.p1[0, :]
             a_mat[1, :] = x1_h[1] * self.p1[2, :] - self.p1[1, :]
             a_mat[2, :] = x2_h[0] * self.p2[2, :] - self.p2[0, :]
             a_mat[3, :] = x2_h[1] * self.p2[2, :] - self.p2[1, :]
             
-            print(f"a_mat shape {a_mat.shape}")
-            # sys.exit()
-
-
             _, _, vt = np.linalg.svd(a_mat)
-            # Get the last singular vector.
             x_val = vt[-1]
-            # Homogeneous coordinates (X,Y,Z,W) -> (X/W, Y/W, Z/W).
             x_val /= x_val[3]
-            # Extract the 3D point (X/W, Y/W, Z/W).
             point_3d = x_val[:3]
-            # Append the correspondence.    
+            
+            # 対応点とtransport値を追加
             correspondences.append((point_3d, i_val, j_val))
+            transport_values.append(transport_val)  # 追加: transport値を保存
 
         if len(correspondences) == 0:
             print("No valid correspondences after filtering & top_k.")
             self.points_3d = np.zeros((0, 3), dtype=float)
             self.match_pairs = []
+            self.transport_values = np.array([])  # 追加: 空のtransport値配列
         else:
             self.points_3d = np.array([c[0] for c in correspondences], dtype=np.float64)
             self.match_pairs = [(c[1], c[2]) for c in correspondences]
+            self.transport_values = np.array(transport_values, dtype=np.float64)  # 追加: transport値を配列として保存
 
         print(
             f"Selected {len(correspondences)} 3D points (threshold={threshold}, top_k={top_k})."
         )
+        # 追加: transport値の統計情報を表示
+        if len(transport_values) > 0:
+            print(f"Transport values - min: {min(transport_values):.6f}, max: {max(transport_values):.6f}, mean: {sum(transport_values)/len(transport_values):.6f}")
 
     def compute_3d_gaussian_covariances(
         self, lambda_volume: float = 1.0, target_volume: float = 1.0, n_jobs: int = -1

@@ -25,118 +25,6 @@ sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 # Import your reconstructor that can compute 3D covariances (with volume prior, color, alpha)
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
-
-# 以下の関数は残す（ジオメトリ保存とは無関係のため）
-def render_gaussians_pure_mixture(
-    points_3d,
-    covariances_3d,
-    color_3d,
-    alpha_3d,
-    R_cam,
-    t_cam,
-    K,
-    out_width,
-    out_height,
-    splat_radius_factor=3.0
-):
-    """
-    Render 3D Gaussians into a 2D image with a 'pure mixture' approach.
-    Instead of alpha compositing, we accumulate:
-       weight_buffer[py, px] += gauss_val
-       color_buffer[py, px] += gauss_val * color_i
-    Then final_pixel_color = color_buffer / weight_buffer (if weight_buffer>0).
-    
-    Args:
-        points_3d      : shape (N,3)
-        covariances_3d: shape (N,3,3)
-        color_3d       : shape (N,3) in [0..1]
-        alpha_3d       : shape (N,) in [0..1] – you can also incorporate alpha if desired
-        R_cam, t_cam   : extrinsic transform from world->camera
-        K             : intrinsics
-        out_width, out_height: image size
-        splat_radius_factor  : # std dev radius for bounding region
-    Returns:
-        mixture_img (H,W,3) float32 in [0..1]  # pure mixture of colors
-        coverage_img (H,W)  float32 in [0..something]  # sum of Gauss weights
-    """
-
-    # Buffers for accumulation
-    weight_buffer = np.zeros((out_height, out_width), dtype=np.float32)
-    color_buffer  = np.zeros((out_height, out_width, 3), dtype=np.float32)
-
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
-
-    for i in tqdm(range(points_3d.shape[0]), desc="Rendering Gaussians (pure mixture)"):
-        X_w = points_3d[i]
-        Sigma_3 = covariances_3d[i]
-        rgb = color_3d[i]  # [r,g,b] in [0..1]
-        # alpha can be used if you want to scale the amplitude or ignore it.
-
-        # Transform to camera coords
-        X_c = R_cam @ X_w + t_cam
-        if X_c[2] <= 1e-6:
-            continue
-
-        # Project center
-        u = fx*(X_c[0]/X_c[2]) + cx
-        v = fy*(X_c[1]/X_c[2]) + cy
-
-        px_center = int(np.round(u))
-        py_center = int(np.round(v))
-        if px_center<0 or px_center>=out_width or py_center<0 or py_center>=out_height:
-            continue
-
-        # Sigma_3 -> Sigma_cam
-        Sigma_cam = R_cam @ Sigma_3 @ R_cam.T
-
-        # local Jacobian
-        X, Y, Z = X_c
-        J = np.array([
-            [fx/Z,     0.0,   -fx*X/(Z**2)],
-            [0.0,     fy/Z,   -fy*Y/(Z**2)]
-        ], dtype=np.float32)
-
-        Sigma_2D = J @ Sigma_cam @ J.T
-        e_vals, e_vecs = np.linalg.eig(Sigma_2D)
-        e_vals = np.clip(e_vals, 1e-12, None)
-        std_x = np.sqrt(e_vals[0])
-        std_y = np.sqrt(e_vals[1])
-
-        radius_x = int(np.ceil(std_x * splat_radius_factor))
-        radius_y = int(np.ceil(std_y * splat_radius_factor))
-
-        min_x = max(px_center - radius_x, 0)
-        max_x = min(px_center + radius_x, out_width-1)
-        min_y = max(py_center - radius_y, 0)
-        max_y = min(py_center + radius_y, out_height-1)
-
-        inv_Sigma_2D = np.linalg.inv(Sigma_2D)
-
-        for py in range(min_y, max_y+1):
-            for px in range(min_x, max_x+1):
-                dx = px - u
-                dy = py - v
-                disp = np.array([dx, dy], dtype=np.float32)
-                val = disp @ inv_Sigma_2D @ disp
-                gauss_val = np.exp(-0.5*val)
-                # If you'd like to incorporate alpha as amplitude, do gauss_val *= alpha_3d[i]
-
-                # Accumulate in the mixture sense
-                weight_buffer[py, px] += gauss_val
-                color_buffer[py, px]  += (gauss_val * rgb)
-
-    # finalize
-    mixture_img = np.zeros((out_height, out_width, 3), dtype=np.float32)
-    mask = (weight_buffer > 1e-12)
-    mixture_img[mask] = color_buffer[mask] / weight_buffer[mask][...,None]  # broadcast
-
-    return mixture_img, weight_buffer
-
-import numpy as np
-import cv2
-from tqdm import tqdm
-
 def render_gaussians_alpha_blend(
     points_3d,
     covariances_3d,
@@ -150,8 +38,7 @@ def render_gaussians_alpha_blend(
     splat_radius_factor=3.0,
     transport=None
 ):
-    """
-    3Dガウスをアルファブレンド(Over)で2次元レンダリングする関数
+    """3Dガウスをアルファブレンド(Over)でレンダリングする関数
     
     手順:
       1) ガウスの中心深度 Z_c (カメラ座標系) が大きい順に並び替え (遠い->近い)
@@ -201,7 +88,9 @@ def render_gaussians_alpha_blend(
     # (クリップで [0,1] に収まるようにする)
     if transport is not None:
         alpha_final = np.minimum(alpha_3d * transport, 1.0)  # shape(N,)
+        print("transport matrix used!")
     else:
+        print("no transport!")
         alpha_final = alpha_3d.copy()
 
     #---------- (2) ソート順にガウスを描画(アルファブレンド) ----------
@@ -227,7 +116,7 @@ def render_gaussians_alpha_blend(
 
         # 画面外かどうかチェック
         if not (0 <= px_center < out_width and 0 <= py_center < out_height):
-            # bounding boxの一部が可視領域に入るかもしれないので、ここでは一応続行する
+            # bounding boxの一部が可視領域に入るかもしれないので、ここでは一応続行
             pass
 
         # カメラ座標系でのガウス共分散
@@ -294,7 +183,6 @@ def render_gaussians_alpha_blend(
                 alpha_buffer[py, px] = A_out
 
     return color_buffer, alpha_buffer
-
 
 
 
@@ -523,6 +411,7 @@ def main():
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
     ##############################
+    # 11) (Optional) Project 3D Gaussians back to 2D for debug
     if True:
         print("\n--- Rendering 3D Gaussians back into camera1's 2D image (alpha-blend) ---")
 
@@ -531,6 +420,16 @@ def main():
 
         out_width  = int(camera1.K[0,2]*2)
         out_height = int(camera1.K[1,2]*2)
+
+        # 追加: transport値があれば使用する
+        transport_values = None
+        if hasattr(reconstructor, 'transport_values') and len(reconstructor.transport_values) > 0:
+            transport_values = reconstructor.transport_values
+            print(f"Using transport values from triangulation: min={transport_values.min():.4f}, "
+                f"max={transport_values.max():.4f}, mean={transport_values.mean():.4f}")
+        else:
+            print("No transport values available, using default alpha values only.")
+            sys.exit(1)
 
         mixture_img, coverage_img = render_gaussians_alpha_blend(
             points_3d=reconstructor.points_3d,
@@ -542,8 +441,9 @@ def main():
             K=camera1.K,
             out_width=out_width,
             out_height=out_height,
+            transport=transport_values  # ここでtransport値を渡す
         )
-        
+            
         rendered_rgba = np.zeros((out_height, out_width, 4), dtype=np.float32)
         rendered_rgba[..., :3] = mixture_img
         rendered_rgba[..., 3] = coverage_img
@@ -570,6 +470,8 @@ def main():
         'covariances_3d': reconstructor.covariances_3d,
         'color_3d': reconstructor.color_3d,
         'alpha_3d': reconstructor.alpha_3d,
+        'transport_values': getattr(reconstructor, 'transport_values', None),  # 追加: transport値の保存
+
         # 以下の部分を追加 - 湧出ガウス情報の保存
         'source_gaussians1': reconstructor.source_gaussians1,
         'source_gaussians2': reconstructor.source_gaussians2,
