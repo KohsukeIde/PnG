@@ -30,7 +30,6 @@ class ViewpointExtender:
         reference_camera_idx: int,
         threshold_reprojection: float = 1e-3,
         device: Optional[torch.device] = None,
-        # 追加するパラメータ
         source_gaussians_data: Optional[Dict[str, Dict]] = None,
     ):
         """
@@ -43,7 +42,7 @@ class ViewpointExtender:
             reference_camera_idx: Index of the reference camera for projection
             threshold_reprojection: Threshold for filtering outliers
             device: Device to run computations on (CPU/GPU)
-            source_gaussians_data: 初期画像間の湧出ガウス情報 (image1, image2の各ガウスデータを含む辞書)
+            source_gaussians_data: 既存視点の湧出ガウス情報を含む辞書
         """
         self.existing_3d_gaussians = existing_3d_gaussians
         self.camera_params_list = camera_params_list
@@ -64,7 +63,7 @@ class ViewpointExtender:
         self.tvec = None
         
         # 湧出ガウス情報を保存
-        self.source_gaussians_data = source_gaussians_data
+        self.source_gaussians_data = source_gaussians_data if source_gaussians_data else {}
         
         # Validate camera parameters
         if len(self.camera_params_list) <= reference_camera_idx:
@@ -234,16 +233,15 @@ class ViewpointExtender:
         self.rvec = self.transport_solver.rvec
         self.tvec = self.transport_solver.tvec
 
-
     def integrate_new_view(
         self, new_image_2d_gaussians: TwoDGaussians, max_iterations: int = 1000
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Integrate a new viewpoint into the 3D reconstruction.
+        新視点のカメラパラメータ（姿勢）を推定する.
         
         Args:
-            new_image_2d_gaussians: 2D Gaussians from the new viewpoint
-            max_iterations: Maximum optimization iterations
+            new_image_2d_gaussians: 新視点の2Dガウス分布
+            max_iterations: 最大最適化イテレーション数
             
         Returns:
             Tuple of (R_new, t_new) for the new camera viewpoint
@@ -271,39 +269,25 @@ class ViewpointExtender:
         # 6. Return the new camera parameters
         return R_est, t_est
 
-    
-    def add_new_gaussians(
+    def detect_new_source_gaussians(
         self,
-        projected_2d: TwoDGaussians,
         new_image_2d_gaussians: TwoDGaussians,
         transport_matrix: np.ndarray,
         threshold: float = 1e-3,
-        target_volume: float = 1.0,
         auto_threshold: bool = True
-    ) -> None:
+    ) -> Dict:
         """
-        トランスポート行列を用いて新しい3Dガウスを追加する。
-        不均衡最適輸送で湧出量が大きい箇所に新規ガウスを追加。
-        既存のガウスは更新・削除しない。
+        新視点の湧出ガウスを検出し、保存する
         
         Args:
-            projected_2d: 投影された2Dガウス分布
-            new_image_2d_gaussians: 新しい視点の2Dガウス分布
+            new_image_2d_gaussians: 新視点の2Dガウス分布
             transport_matrix: 最適輸送行列
-            threshold: 輸送閾値（auto_threshold=Falseの場合に使用）
-            target_volume: 目標体積
+            threshold: 閾値（auto_threshold=Falseの場合に使用）
             auto_threshold: 閾値を自動的に決定するかどうか
+            
+        Returns:
+            Dict: 新規湧出ガウスのデータを含む辞書
         """
-        if len(self.camera_params_list) < 2:
-            raise ValueError("At least two cameras are needed for triangulation")
-        
-        # 最新のカメラパラメータを取得
-        R_new, t_new = self.camera_params_list[-1]
-        
-        # 参照カメラのパラメータを取得
-        R_ref, t_ref = self.camera_params_list[self.reference_camera_idx]
-        
-        # 輸送行列から湧出量の大きい箇所を特定
         # 各列（新視点のガウス）の合計が小さい = 湧出量が大きい
         col_sums = transport_matrix.sum(axis=0)
         
@@ -317,7 +301,6 @@ class ViewpointExtender:
             # 輸送量の分布情報を表示
             print(f"Transport column sums statistics:")
             print(f"  Mean: {mean_transport:.4f}, Std: {std_transport:.4f}, Min: {min_transport:.4f}")
-            print(f"  Histogram: {np.histogram(col_sums, bins=5)[0]}")
             
             # 閾値を自動計算：平均から一定のσ下回る値か、最小値を基準に
             if std_transport > 1e-4:  # 標準偏差が意味を持つ場合
@@ -330,110 +313,41 @@ class ViewpointExtender:
             print(f"Auto-determined threshold: {threshold:.4f}")
         
         # 湧出量の大きいガウスのインデックス（輸送量が閾値以下）
-        target_indices = np.where(col_sums < threshold)[0]
+        source_indices = np.where(col_sums < threshold)[0]
         
-        if len(target_indices) == 0:
-            print("No significant source/sink detected. No new Gaussians added.")
-            return
-                
-        print(f"Adding {len(target_indices)} new Gaussians from transport sinks...")
-        
-        # ダミーのホモグラフィ（使わないが必要）
-        h_dummy = np.eye(3)
-        
-        # Initial3DReconstructorを初期化
-        reconstructor = Initial3DReconstructor(
-            gaussians1=projected_2d,
-            gaussians2=new_image_2d_gaussians,
-            k1=self.K_new.cpu().numpy() if isinstance(self.K_new, torch.Tensor) else self.K_new,
-            k2=self.K_new.cpu().numpy() if isinstance(self.K_new, torch.Tensor) else self.K_new,
-            h=h_dummy
-        )
-        
-        # カメラパラメータを設定
-        reconstructor.set_camera_matrices_explicitly(
-            r1=R_ref,
-            t1=t_ref,
-            r2=R_new,
-            t2=t_new
-        )
-        
-        # 湧出量の大きいガウス間のみを考慮した輸送行列を作成
-        # シャープな対応関係にするため1.0とする
-        focused_transport = np.zeros_like(transport_matrix)
-        
-        # 各湧出ガウスに対し、最も近い投影ガウスを対応付ける
-        for idx in target_indices:
-            new_point = new_image_2d_gaussians.means[idx]
+        if len(source_indices) == 0:
+            print("No significant source Gaussians detected.")
+            return {}
             
-            if isinstance(new_point, torch.Tensor):
-                new_point = new_point.detach().cpu().numpy()    
-            distances = np.linalg.norm(projected_2d.means - new_point, axis=1)
-            closest_proj_idx = np.argmin(distances)
-            focused_transport[closest_proj_idx, idx] = 1.0
+        print(f"Detected {len(source_indices)} new source Gaussians")
         
-        # 三角測量
-        reconstructor.triangulate_gaussian_centers(
-            focused_transport, threshold=0.0, top_k=len(target_indices)
-        )
+        # 湧出ガウスの特徴量を保存
+        source_data = {
+            'indices': source_indices,
+            'means': new_image_2d_gaussians.means[source_indices],
+            'covs': new_image_2d_gaussians.covs[source_indices],
+            'rotations': new_image_2d_gaussians.rotations[source_indices],
+            'scales': new_image_2d_gaussians.scales[source_indices],
+            'rgb': new_image_2d_gaussians.rgb[source_indices],
+            'alpha': new_image_2d_gaussians.alpha[source_indices],
+        }
         
-        if len(reconstructor.points_3d) > 0:
-            # 3D共分散を計算
-            print(f"Computing covariances for {len(reconstructor.points_3d)} new points...")
-            reconstructor.compute_3d_gaussian_covariances(
-                lambda_volume=1.0, target_volume=target_volume
-            )
-            
-            # 色と不透明度を計算
-            reconstructor.compute_3d_gaussian_colors(color_mode="average")
-            reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
-            
-            # 新しい3Dガウスを既存のリストに追加
-            for i in range(len(reconstructor.points_3d)):
-                point_3d = reconstructor.points_3d[i]
-                cov_3d = reconstructor.covariances_3d[i]
-                color = reconstructor.color_3d[i]
-                alpha = reconstructor.alpha_3d[i]
-                
-                # 共分散から四元数とスケールを推定
-                eigvals, eigvecs = np.linalg.eigh(cov_3d)
-                eigvals = np.maximum(eigvals, 1e-10)
-                scales = np.sqrt(eigvals)
-                
-                # 単位四元数を使用
-                quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                
-                # 新しい3Dガウスを作成
-                new_gauss = {
-                    "center": point_3d,
-                    "quat": quat,
-                    "scale3d": scales,
-                    "color": color,
-                    "alpha": alpha
-                }
-                
-                # 既存の3Dガウスリストに追加
-                self.existing_3d_gaussians.append(new_gauss)
-            
-            print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians.")
-        else:
-            print("No new 3D Gaussians were triangulated.")
+        return source_data
 
-    # 以下は湧出ガウスを活用する新しいメソッド
-    def add_new_gaussians_from_sources(
+    def triangulate_source_gaussians(
         self,
+        source_camera_idx: int,
         new_image_2d_gaussians: TwoDGaussians,
-        source_camera_idx: int = 0,
         target_volume: float = 1.0,
         distance_threshold: float = 30.0,
         color_threshold: float = 0.3
     ) -> int:
         """
-        初期画像の湧出ガウスと新しい視点の2Dガウスを対応付けて、新しい3Dガウスを追加する
+        既存の湧出ガウスと新視点の2Dガウスを対応付けて三角測量し、新しい3Dガウスを追加する
         
         Args:
-            new_image_2d_gaussians: 新しい視点の2Dガウス分布
-            source_camera_idx: 湧出ガウスが属する初期カメラのインデックス (0 または 1)
+            source_camera_idx: 湧出ガウスが属する既存カメラのインデックス
+            new_image_2d_gaussians: 新視点の2Dガウス分布
             target_volume: 新規ガウスの目標体積
             distance_threshold: 対応付けの距離閾値（ピクセル単位）
             color_threshold: 対応付けの色差閾値 (RGB差のL2ノルム)
@@ -602,7 +516,6 @@ class ViewpointExtender:
         print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians from source gaussians.")
         return len(reconstructor.points_3d)
 
-
     def integrate_new_view_and_gaussians(
         self,
         new_image_2d_gaussians: TwoDGaussians,
@@ -612,12 +525,11 @@ class ViewpointExtender:
         auto_threshold: bool = True
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        新しい視点を統合し、3Dガウスを追加する。
-        既存の3Dガウスは更新せず、消去も行わない。
+        新しい視点のカメラパラメータを推定し、湧出ガウスの処理を行う.
         
         Args:
-            new_image_2d_gaussians: 新しい視点の2Dガウス分布
-            max_iterations: 最適化の最大イテレーション回数
+            new_image_2d_gaussians: 新視点の2Dガウス分布
+            max_iterations: 最適化の最大イテレーション数
             transport_threshold: 最適輸送の閾値
             target_volume: 新規3Dガウスの目標体積
             auto_threshold: 閾値を自動的に決定するかどうか
@@ -632,7 +544,7 @@ class ViewpointExtender:
             max_iterations=max_iterations
         )
         
-        # 2. 最適輸送行列を計算
+        # 2. 輸送行列を計算（湧出ガウス検出用）
         print("Computing optimal transport matrix...")
         projected_2d = self.project_3d_gaussians()
         
@@ -647,38 +559,40 @@ class ViewpointExtender:
         
         transport_matrix = transport.detach().cpu().numpy()
         
-        # 3. 輸送行列から新規3Dガウスを追加（湧出量の大きい箇所）
-        print("Adding new 3D Gaussians from current sinks...")
-        self.add_new_gaussians(
-            projected_2d=projected_2d,
+        # 3. 過去の湧出ガウスから3Dガウスを追加
+        total_added = 0
+        if self.source_gaussians_data:
+            print("\nProcessing source gaussians from previous views...")
+            
+            # 各カメラの湧出ガウスから追加
+            for source_idx in range(len(self.camera_params_list) - 1):  # 新しく追加したカメラは除く
+                added = self.triangulate_source_gaussians(
+                    source_camera_idx=source_idx,
+                    new_image_2d_gaussians=new_image_2d_gaussians,
+                    target_volume=target_volume
+                )
+                total_added += added
+                
+            print(f"Total added 3D Gaussians from previous sources: {total_added}")
+        
+        # 4. 新視点の湧出ガウスを検出して保存
+        print("\nDetecting new source Gaussians...")
+        new_source_data = self.detect_new_source_gaussians(
             new_image_2d_gaussians=new_image_2d_gaussians,
             transport_matrix=transport_matrix,
             threshold=transport_threshold,
-            target_volume=target_volume,
             auto_threshold=auto_threshold
         )
         
-        # 4. 湧出ガウス情報がある場合は、それを使って追加の3Dガウスを追加
-        if self.source_gaussians_data is not None:
-            print("\nProcessing source gaussians from initial images...")
+        # 5. 湧出ガウス情報を更新
+        if new_source_data and len(new_source_data.get('indices', [])) > 0:
+            # 新しいソースキーを作成（既存のキー数+1）
+            existing_keys = [k for k in self.source_gaussians_data.keys() if k.startswith('source_gaussians')]
+            next_idx = len(existing_keys) + 1
+            new_source_key = f'source_gaussians{next_idx}_data'
             
-            # 初期画像1の湧出ガウスから追加
-            added_from_img1 = self.add_new_gaussians_from_sources(
-                new_image_2d_gaussians=new_image_2d_gaussians,
-                source_camera_idx=0,
-                target_volume=target_volume
-            )
-            
-            # 初期画像2の湧出ガウスから追加（カメラが2つ以上ある場合）
-            added_from_img2 = 0
-            if len(self.camera_params_list) >= 2:
-                added_from_img2 = self.add_new_gaussians_from_sources(
-                    new_image_2d_gaussians=new_image_2d_gaussians,
-                    source_camera_idx=1,
-                    target_volume=target_volume
-                )
-                
-            print(f"Added {added_from_img1 + added_from_img2} Gaussians from source gaussians: " 
-                  f"{added_from_img1} from image 1, {added_from_img2} from image 2")
+            # 辞書に追加
+            self.source_gaussians_data[new_source_key] = new_source_data
+            print(f"Added {len(new_source_data['indices'])} new source Gaussians as '{new_source_key}'")
         
         return R_new, t_new
