@@ -12,7 +12,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-# インポート部分を更新: 共通ユーティリティ関数を使用
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
@@ -22,7 +21,6 @@ from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_point_cloud
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
-# Import your reconstructor that can compute 3D covariances (with volume prior, color, alpha)
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
 def render_gaussians_alpha_blend(
@@ -84,7 +82,7 @@ def render_gaussians_alpha_blend(
         z_list.append((X_c[2], i))
     z_list.sort(key=lambda x: x[0], reverse=True)  # Z降順(奥->手前)
 
-    # もしtransportが与えられたら alpha_3d に乗算しておく
+    # transportが与えられたら alpha_3d に乗算しておく
     # (クリップで [0,1] に収まるようにする)
     if transport is not None:
         alpha_final = np.minimum(alpha_3d * transport, 1.0)  # shape(N,)
@@ -236,7 +234,6 @@ def parse_args():
 
     return parser.parse_args()
 
-# メイン部分は基本的に変更なし
 def main():
     args = parse_args()
 
@@ -270,7 +267,7 @@ def main():
     print(f"Calculated target volume: {target_volume:.2f}")
 
     ##############################
-    # 3) Load camera + COLMAP info
+    # 3) Load camera + COLMAP(内部パラメータ) info
     ##############################
     cameras = load_cameras_from_colmap(colmap_dir)
     images_data = load_images_from_colmap(colmap_dir)
@@ -349,7 +346,7 @@ def main():
         t2=t_optimized
     )
     
-    #dont delete single gaussian
+    #dont delete any gaussian (UOTの枠組みでthresholdは必要なくなったので)
     threshold = 0.0
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold, top_k=100000)
     points_3d = reconstructor.points_3d
@@ -388,13 +385,12 @@ def main():
     ##############################
     # 10) Build ellipsoids => PLY (with camera frustums)
     ##############################
-    # カメラフラスタム付きのPLYを生成 - 共通ユーティリティ関数を使用
+    # camera frustum 付きのPLYを生成 
     R1 = camera1.R_wc  # world->camera
     t1 = camera1.t_wc
     R2 = camera2.R_wc
     t2 = camera2.t_wc
-    
-    # カメラパラメータリスト
+
     camera_params_list = [(R1, t1), (R2, t2)]
     
     ply_out = os.path.join('results', '3d_gaussians_ellipsoids_withCams.ply')
@@ -411,7 +407,6 @@ def main():
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
     ##############################
-    # 11) (Optional) Project 3D Gaussians back to 2D for debug
     if True:
         print("\n--- Rendering 3D Gaussians back into camera1's 2D image (alpha-blend) ---")
 
@@ -421,7 +416,6 @@ def main():
         out_width  = int(camera1.K[0,2]*2)
         out_height = int(camera1.K[1,2]*2)
 
-        # 追加: transport値があれば使用する
         transport_values = None
         if hasattr(reconstructor, 'transport_values') and len(reconstructor.transport_values) > 0:
             transport_values = reconstructor.transport_values
@@ -441,7 +435,7 @@ def main():
             K=camera1.K,
             out_width=out_width,
             out_height=out_height,
-            transport=transport_values  # ここでtransport値を渡す
+            transport=transport_values 
         )
             
         rendered_rgba = np.zeros((out_height, out_width, 4), dtype=np.float32)
@@ -460,6 +454,7 @@ def main():
 
     ##############################
     # 12) Save final results
+    ##############################
     results = {
         'fundamental_matrix': F_optimized,
         'cost_matrix': cost_matrix.cpu().numpy(),
@@ -470,15 +465,12 @@ def main():
         'covariances_3d': reconstructor.covariances_3d,
         'color_3d': reconstructor.color_3d,
         'alpha_3d': reconstructor.alpha_3d,
-        'transport_values': getattr(reconstructor, 'transport_values', None),  # 追加: transport値の保存
-
-        # 以下の部分を追加 - 湧出ガウス情報の保存
+        'transport_values': getattr(reconstructor, 'transport_values', None), 
         'source_gaussians1': reconstructor.source_gaussians1,
         'source_gaussians2': reconstructor.source_gaussians2,
         'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
         'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
-        # 既存の部分を続ける
-        'camera_params_list': camera_params_list,  # Primary format expected by ViewpointExtender
+        'camera_params_list': camera_params_list,  
         'R1': R1,
         't1': t1,
         'R2': R2,
@@ -487,11 +479,10 @@ def main():
         'camera1_t': t1,
         'camera2_R': R2,
         'camera2_t': t2,
-        # Also include the existing 3D Gaussians in the expected format for ViewpointExtender
         'existing_3d_gaussians': [
             {
                 "center": points_3d[i],
-                "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # Default unit quaternion
+                "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # Default unit quaternion (これいらないかも)
                 "scale3d": np.sqrt(np.maximum(np.linalg.eigvalsh(reconstructor.covariances_3d[i]), 1e-10)),
                 "color": reconstructor.color_3d[i],
                 "alpha": reconstructor.alpha_3d[i]
