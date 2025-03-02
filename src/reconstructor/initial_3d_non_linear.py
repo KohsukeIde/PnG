@@ -49,23 +49,6 @@ def quaternion_to_rotation(q: np.ndarray) -> np.ndarray:
     return r_mat
 
 
-# def build_covariance_3d(q: np.ndarray, s: np.ndarray) -> np.ndarray:
-#     """Build a 3D covariance from quaternion q and scales s=[s1, s2, s3].
-
-#     Sigma_3 = R * diag(s^2) * R^T.
-
-#     Args:
-#         q (np.ndarray): Quaternion [qw, qx, qy, qz].
-#         s (np.ndarray): Scales [s1, s2, s3].
-
-#     Returns:
-#         np.ndarray: The 3D covariance matrix (3x3).
-#     """
-#     r_mat = quaternion_to_rotation(q)
-#     s_diag = np.diag(s**2)
-#     sigma_3 = r_mat @ s_diag @ r_mat.T
-#     return np.array(sigma_3, dtype=float)
-
 def build_covariance_3d(q: np.ndarray, s: np.ndarray) -> np.ndarray:
     """Build a 3D covariance from quaternion q and scales s=[s1, s2, s3].
 
