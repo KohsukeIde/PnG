@@ -227,53 +227,187 @@ def select_initial_pair(
         feature_scores = feature_scores / max_features
     
     # Find valid pairs (within overlap range)
-    valid_pairs = []
-    pair_scores = []
+    # valid_pairs = []
+    # pair_scores = []
     
+    # for i in range(len(available_images)):
+    #     for j in range(i+1, len(available_images)):
+    #         similarity = similarity_matrix[i, j]
+            
+    #         # Check if within desired overlap range
+    #         if min_overlap <= similarity <= max_overlap:
+    #             # Combined score: similarity + feature richness of both images
+    #             score = similarity + 0.5 * (feature_scores[i] + feature_scores[j])
+    #             valid_pairs.append((i, j))
+    #             pair_scores.append(score)
+    
+    # if not valid_pairs:
+    #     print("No pairs within specified overlap range, using best available pair")
+    #     # Take pair with highest combined feature score
+    #     best_pair = None
+    #     best_score = -1
+        
+    #     for i in range(len(available_images)):
+    #         for j in range(i+1, len(available_images)):
+    #             combined_score = feature_scores[i] + feature_scores[j]
+    #             if combined_score > best_score:
+    #                 best_score = combined_score
+    #                 best_pair = (i, j)
+        
+    #     if best_pair is None:
+    #         # Fallback: just take the first two images
+    #         best_pair = (0, 1)
+            
+    #     selected_idx = best_pair
+    # else:
+    #     # Select the best pair based on score
+    #     best_idx = np.argmax(pair_scores)
+    #     selected_idx = valid_pairs[best_idx]
+    
+    # Get the selected image names
+    # img1 = available_images[selected_idx[0]]
+    # img2 = available_images[selected_idx[1]]
+    
+    best_pair = None
+    best_similarity = -1
+
     for i in range(len(available_images)):
         for j in range(i+1, len(available_images)):
             similarity = similarity_matrix[i, j]
             
-            # Check if within desired overlap range
-            if min_overlap <= similarity <= max_overlap:
-                # Combined score: similarity + feature richness of both images
-                score = similarity + 0.5 * (feature_scores[i] + feature_scores[j])
-                valid_pairs.append((i, j))
-                pair_scores.append(score)
-    
-    if not valid_pairs:
-        print("No pairs within specified overlap range, using best available pair")
-        # Take pair with highest combined feature score
-        best_pair = None
-        best_score = -1
-        
-        for i in range(len(available_images)):
-            for j in range(i+1, len(available_images)):
-                combined_score = feature_scores[i] + feature_scores[j]
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_pair = (i, j)
-        
-        if best_pair is None:
-            # Fallback: just take the first two images
-            best_pair = (0, 1)
+            # 類似度が最大のペアを常に探す
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_pair = (i, j)
+
+    # best_pair が見つからなかった場合のフォールバック処理（ありえないが一応）
+    if best_pair is None:
+        best_pair = (0, 1)
+
+    # best_pair を取り出す
+    img1 = available_images[best_pair[0]]
+    img2 = available_images[best_pair[1]]
             
-        selected_idx = best_pair
-    else:
-        # Select the best pair based on score
-        best_idx = np.argmax(pair_scores)
-        selected_idx = valid_pairs[best_idx]
-        
-    # Get the selected image names
-    img1 = available_images[selected_idx[0]]
-    img2 = available_images[selected_idx[1]]
+
     
     print(f"Selected initial pair: {img1} and {img2}")
-    print(f"Similarity: {similarity_matrix[selected_idx[0], selected_idx[1]]:.4f}")
+    print(f"Similarity: {similarity_matrix[best_pair[0], best_pair[1]]:.4f}")
     print(f"Feature counts: {len(selector.image_features[os.path.join(image_dir, img1)]['keypoints'])} and "
           f"{len(selector.image_features[os.path.join(image_dir, img2)]['keypoints'])}")
     
     return img1, img2
+
+# def select_initial_pair_2dgs(
+#     image_dir: str,
+#     gaussian_files: Dict[str, str],
+#     vocab_size: int = 200,
+#     feature_type: str = "sift",
+#     min_overlap: float = 0.3,
+#     max_overlap: float = 0.7,
+#     device: str = "cpu"
+# ) -> Tuple[str, str]:
+#     """
+#     2D Gaussianの params 考慮して最適な初期画像ペアを選択
+    
+#     Args:
+#         image_dir: 画像ディレクトリ
+#         gaussian_files: 画像名→ガウスファイルパスの辞書
+#         vocab_size: BoVWの語彙サイズ
+#         feature_type: 特徴抽出タイプ
+#         min_overlap: 最小重なり率
+#         max_overlap: 最大重なり率
+#         device: 計算デバイス
+        
+#     Returns:
+#         Tuple[str, str]: 選択された初期画像ペア
+#     """
+#     print("\n--- Selecting Initial Image Pair ---")
+    
+#     # 利用可能な画像を取得
+#     all_images = get_image_names(image_dir)
+#     available_images = [img for img in all_images if img in gaussian_files]
+    
+#     if len(available_images) < 2:
+#         raise ValueError(f"Need at least 2 images with fitted Gaussians, found {len(available_images)}")
+    
+#     # ViewSelectorの初期化
+#     selector = ViewSelector(
+#         image_dir=image_dir,
+#         vocab_size=vocab_size,
+#         feature_type=feature_type,
+#         min_overlap_ratio=min_overlap,
+#         max_overlap_ratio=max_overlap
+#     )
+    
+#     # 特徴量抽出とコードブック構築
+#     image_paths = [os.path.join(image_dir, img) for img in available_images]
+#     selector.initialize_from_images(image_paths)
+    
+#     # BoVW類似度行列の計算
+#     similarity_matrix = np.zeros((len(available_images), len(available_images)))
+    
+#     for i, img1 in enumerate(available_images):
+#         hist1 = selector.image_histograms[os.path.join(image_dir, img1)]
+#         for j, img2 in enumerate(available_images):
+#             if i >= j:  # 冗長計算とセルフ比較を避ける
+#                 continue
+#             hist2 = selector.image_histograms[os.path.join(image_dir, img2)]
+#             # コサイン類似度の計算
+#             similarity = np.sum(hist1 * hist2) / (np.sqrt(np.sum(hist1**2)) * np.sqrt(np.sum(hist2**2)) + 1e-10)
+#             similarity_matrix[i, j] = similarity
+#             similarity_matrix[j, i] = similarity
+    
+#     torch_device = torch.device(device)
+#     valid_pairs = []
+#     pair_scores = []
+    
+#     print("Evaluating image pairs based on both BoVW and Gaussian characteristics...")
+    
+#     # すべてのペアを評価
+#     for i in range(len(available_images)):
+#         img1 = available_images[i]
+#         for j in range(i+1, len(available_images)):
+#             img2 = available_images[j]
+            
+#             # BoVW類似度
+#             feature_sim = similarity_matrix[i, j]
+            
+#             # 重なり範囲のチェック (緩和: 最小重なりのみチェック)
+#             if feature_sim >= min_overlap:
+#                 try:
+#                     gaussians1_path = gaussian_files[img1]
+#                     gaussians2_path = gaussian_files[img2]
+                    
+#                     _, gaussians1, _, _ = load_gaussians_torch(gaussians1_path, torch_device)
+#                     _, gaussians2, _, _ = load_gaussians_torch(gaussians2_path, torch_device)
+                    
+#                     # 2dgs params を考慮したスコア計算
+#                     score = selector.compute_initial_pair_score_gs(
+#                         img1, img2, gaussians1, gaussians2, feature_sim
+#                     )
+                    
+#                     valid_pairs.append((i, j))
+#                     pair_scores.append(score)
+#                 except Exception as e:
+#                     print(f"Error processing pair {img1}-{img2}: {e}")
+    
+#     if not valid_pairs:
+#         print("No valid pairs found. Falling back to standard similarity.")
+#         # フォールバック: 最も類似度の高いペアを選択
+#         i, j = np.unravel_index(np.argmax(similarity_matrix + np.eye(len(available_images)) * -1), similarity_matrix.shape)
+#         selected_idx = (i, j)
+#     else:
+#         # 最高スコアのペアを選択
+#         best_idx = np.argmax(pair_scores)
+#         selected_idx = valid_pairs[best_idx]
+    
+#     img1 = available_images[selected_idx[0]]
+#     img2 = available_images[selected_idx[1]]
+    
+#     print(f"Selected initial pair: {img1} and {img2}")
+#     print(f"BoVW Similarity: {similarity_matrix[selected_idx[0], selected_idx[1]]:.4f}")
+    
+#     return img1, img2
 
 def perform_initial_reconstruction(
     img1_name: str,
@@ -351,8 +485,8 @@ def perform_initial_reconstruction(
         epsilon=0.01,
         lambda_mean=0.0,
         lambda_cov=0.0,
-        lambda_color=0.0,
-        lambda_epipolar=1e-3,
+        lambda_color=0.2,
+        lambda_epipolar=1.0,
         device=device
     )
     
@@ -402,6 +536,9 @@ def perform_initial_reconstruction(
     # Compute 3D covariances, colors, and alphas
     print("Computing 3D Gaussian properties...")
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
+    if len(reconstructor.points_3d) == 0:
+        raise ValueError("No valid 3D Gaussians after covariance optimization. Try different initial images.")
+
     reconstructor.compute_3d_gaussian_colors(color_mode="average")
     reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
     
@@ -471,6 +608,11 @@ def perform_initial_reconstruction(
         "covariances_3d": reconstructor.covariances_3d,
         "color_3d": reconstructor.color_3d,
         "alpha_3d": reconstructor.alpha_3d,
+        'source_gaussians1': reconstructor.source_gaussians1,
+        'source_gaussians2': reconstructor.source_gaussians2,
+        'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
+        'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
+        'cov_failed_gaussians_included': True,  # Covに失敗したガウスが湧出ガウスに含まれていることを示すフラグ
         "transport_values": getattr(reconstructor, 'transport_values', None),
         "source_gaussians_data": source_gaussians_data,
         "camera_params_list": camera_params_list,
@@ -667,13 +809,14 @@ def run_complete_pipeline(args):
     else:
         # Select initial pair
         img1, img2 = select_initial_pair(
-            image_dir=image_dir,
-            gaussian_files=gaussian_files,
-            vocab_size=args.vocab_size,
-            feature_type=args.feature_type,
-            min_overlap=args.min_overlap,
-            max_overlap=args.max_overlap
-        )
+        image_dir=image_dir,
+        gaussian_files=gaussian_files,
+        vocab_size=args.vocab_size,
+        feature_type=args.feature_type,
+        min_overlap=args.min_overlap,
+        max_overlap=args.max_overlap,
+        # device="cuda" if torch.cuda.is_available() else "cpu" 
+    )
         
         # Perform initial reconstruction
         reconstruction_data = perform_initial_reconstruction(
