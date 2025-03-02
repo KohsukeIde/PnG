@@ -25,7 +25,7 @@ class OptimalTransportSolver:
         lambda_mean: float = 1.0,
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
-        lambda_epipolar: float = 1e-3,
+        lambda_epipolar: float = 1.0,
         device: Optional[torch.device] = None,
     ):
         """Initialize the OptimalTransportSolver.
@@ -376,7 +376,7 @@ class OptimalTransportSolver:
     def unbalanced_sinkhorn_algorithm(
         self,
         cost_matrix: torch.Tensor,
-        rho: float = 1.0,
+        rho: float = 0.1,
         max_iter: int = 1000,
         tol: float = 1e-6,
     ) -> torch.Tensor:
