@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-
 import os
 import sys
+import traceback
 import argparse
 import pickle
 import glob
@@ -28,9 +27,10 @@ from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_co
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from utils.gs_pkl_loader import load_gaussians_torch
 from utils.saving.geometry_utils import save_ellipsoids_as_ply
+from src.optimizer.bundle_adjuster import BundleAdjuster
 
 # Fix module import issues
-sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
+sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians']
 
 def parse_args():
     """Parse command-line arguments for the complete pipeline."""
@@ -160,13 +160,12 @@ def select_initial_pair(
     min_overlap: float = 0.3,
     max_overlap: float = 0.7
 ) -> Tuple[str, str]:
-    """
-    Select the best initial pair of images using Bag of Visual Words.
+    """Select the best initial pair of images using Bag of Visual Words.
     
     The best pair should have:
     1. Good feature overlap (within min/max range)
     2. Rich features in both images
-    3. Good spatial distribution of features
+    3. Good spatial distribution of features → this is debatable (視差がありすぎると3D covが求められない可能性ありそう)
     
     Args:
         image_dir: Directory containing images
@@ -181,7 +180,7 @@ def select_initial_pair(
     """
     print("\n--- Selecting Initial Image Pair ---")
     
-    # Get available images that have fitted Gaussians
+    # Get available images that have fitted Gaussians (ここの処理はパイプライン最初と同じ)
     all_images = get_image_names(image_dir)
     available_images = [img for img in all_images if img in gaussian_files]
     
@@ -205,9 +204,10 @@ def select_initial_pair(
     similarity_matrix = np.zeros((len(available_images), len(available_images)))
     
     for i, img1 in enumerate(available_images):
+        # hist = ヒストグラムベクトル（dim = vocab_size）
         hist1 = selector.image_histograms[os.path.join(image_dir, img1)]
         for j, img2 in enumerate(available_images):
-            if i >= j:  # Avoid redundant computation and self-comparison
+            if i >= j:  # Avoid redundant computation and self-comparison (対称行列なのでi < jのみでおけ)
                 continue
             hist2 = selector.image_histograms[os.path.join(image_dir, img2)]
             # Compute cosine similarity
@@ -275,16 +275,15 @@ def select_initial_pair(
         for j in range(i+1, len(available_images)):
             similarity = similarity_matrix[i, j]
             
-            # 類似度が最大のペアを常に探す
+            # 類似度が最大のペアを探す
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_pair = (i, j)
 
-    # best_pair が見つからなかった場合のフォールバック処理（ありえないが一応）
+    # best_pair が見つからなかった場合のフォールバック処理（全く特徴点が取れないケースとかのため）
     if best_pair is None:
         best_pair = (0, 1)
 
-    # best_pair を取り出す
     img1 = available_images[best_pair[0]]
     img2 = available_images[best_pair[1]]
             
@@ -292,122 +291,9 @@ def select_initial_pair(
     
     print(f"Selected initial pair: {img1} and {img2}")
     print(f"Similarity: {similarity_matrix[best_pair[0], best_pair[1]]:.4f}")
-    print(f"Feature counts: {len(selector.image_features[os.path.join(image_dir, img1)]['keypoints'])} and "
-          f"{len(selector.image_features[os.path.join(image_dir, img2)]['keypoints'])}")
+    print(f"Feature counts: {len(selector.image_features[os.path.join(image_dir, img1)]['keypoints'])} and "f"{len(selector.image_features[os.path.join(image_dir, img2)]['keypoints'])}")
     
-    return img1, img2
-
-# def select_initial_pair_2dgs(
-#     image_dir: str,
-#     gaussian_files: Dict[str, str],
-#     vocab_size: int = 200,
-#     feature_type: str = "sift",
-#     min_overlap: float = 0.3,
-#     max_overlap: float = 0.7,
-#     device: str = "cpu"
-# ) -> Tuple[str, str]:
-#     """
-#     2D Gaussianの params 考慮して最適な初期画像ペアを選択
-    
-#     Args:
-#         image_dir: 画像ディレクトリ
-#         gaussian_files: 画像名→ガウスファイルパスの辞書
-#         vocab_size: BoVWの語彙サイズ
-#         feature_type: 特徴抽出タイプ
-#         min_overlap: 最小重なり率
-#         max_overlap: 最大重なり率
-#         device: 計算デバイス
-        
-#     Returns:
-#         Tuple[str, str]: 選択された初期画像ペア
-#     """
-#     print("\n--- Selecting Initial Image Pair ---")
-    
-#     # 利用可能な画像を取得
-#     all_images = get_image_names(image_dir)
-#     available_images = [img for img in all_images if img in gaussian_files]
-    
-#     if len(available_images) < 2:
-#         raise ValueError(f"Need at least 2 images with fitted Gaussians, found {len(available_images)}")
-    
-#     # ViewSelectorの初期化
-#     selector = ViewSelector(
-#         image_dir=image_dir,
-#         vocab_size=vocab_size,
-#         feature_type=feature_type,
-#         min_overlap_ratio=min_overlap,
-#         max_overlap_ratio=max_overlap
-#     )
-    
-#     # 特徴量抽出とコードブック構築
-#     image_paths = [os.path.join(image_dir, img) for img in available_images]
-#     selector.initialize_from_images(image_paths)
-    
-#     # BoVW類似度行列の計算
-#     similarity_matrix = np.zeros((len(available_images), len(available_images)))
-    
-#     for i, img1 in enumerate(available_images):
-#         hist1 = selector.image_histograms[os.path.join(image_dir, img1)]
-#         for j, img2 in enumerate(available_images):
-#             if i >= j:  # 冗長計算とセルフ比較を避ける
-#                 continue
-#             hist2 = selector.image_histograms[os.path.join(image_dir, img2)]
-#             # コサイン類似度の計算
-#             similarity = np.sum(hist1 * hist2) / (np.sqrt(np.sum(hist1**2)) * np.sqrt(np.sum(hist2**2)) + 1e-10)
-#             similarity_matrix[i, j] = similarity
-#             similarity_matrix[j, i] = similarity
-    
-#     torch_device = torch.device(device)
-#     valid_pairs = []
-#     pair_scores = []
-    
-#     print("Evaluating image pairs based on both BoVW and Gaussian characteristics...")
-    
-#     # すべてのペアを評価
-#     for i in range(len(available_images)):
-#         img1 = available_images[i]
-#         for j in range(i+1, len(available_images)):
-#             img2 = available_images[j]
-            
-#             # BoVW類似度
-#             feature_sim = similarity_matrix[i, j]
-            
-#             # 重なり範囲のチェック (緩和: 最小重なりのみチェック)
-#             if feature_sim >= min_overlap:
-#                 try:
-#                     gaussians1_path = gaussian_files[img1]
-#                     gaussians2_path = gaussian_files[img2]
-                    
-#                     _, gaussians1, _, _ = load_gaussians_torch(gaussians1_path, torch_device)
-#                     _, gaussians2, _, _ = load_gaussians_torch(gaussians2_path, torch_device)
-                    
-#                     # 2dgs params を考慮したスコア計算
-#                     score = selector.compute_initial_pair_score_gs(
-#                         img1, img2, gaussians1, gaussians2, feature_sim
-#                     )
-                    
-#                     valid_pairs.append((i, j))
-#                     pair_scores.append(score)
-#                 except Exception as e:
-#                     print(f"Error processing pair {img1}-{img2}: {e}")
-    
-#     if not valid_pairs:
-#         print("No valid pairs found. Falling back to standard similarity.")
-#         # フォールバック: 最も類似度の高いペアを選択
-#         i, j = np.unravel_index(np.argmax(similarity_matrix + np.eye(len(available_images)) * -1), similarity_matrix.shape)
-#         selected_idx = (i, j)
-#     else:
-#         # 最高スコアのペアを選択
-#         best_idx = np.argmax(pair_scores)
-#         selected_idx = valid_pairs[best_idx]
-    
-#     img1 = available_images[selected_idx[0]]
-#     img2 = available_images[selected_idx[1]]
-    
-#     print(f"Selected initial pair: {img1} and {img2}")
-#     print(f"BoVW Similarity: {similarity_matrix[selected_idx[0], selected_idx[1]]:.4f}")
-    
-#     return img1, img2
+    return img1, img2, selector
 
 def perform_initial_reconstruction(
     img1_name: str,
@@ -420,8 +306,7 @@ def perform_initial_reconstruction(
     target_volume: float = 1.0,
     device: torch.device = None
 ) -> Dict:
-    """
-    Perform initial 3D reconstruction from two views.
+    """Perform initial 3D reconstruction from two views.
     
     Args:
         img1_name: First image name
@@ -570,7 +455,6 @@ def perform_initial_reconstruction(
     
     if hasattr(reconstructor, 'source_gaussians2_data'):
         source_gaussians_data['source_gaussians2_data'] = reconstructor.source_gaussians2_data
-        # Add the image name to the data
         source_gaussians_data['source_gaussians2_data']['image_name'] = img2_name
     
     # Create 3D Gaussians in the expected format for ViewpointExtender
@@ -581,18 +465,9 @@ def perform_initial_reconstruction(
         color = reconstructor.color_3d[i]
         alpha = reconstructor.alpha_3d[i]
         
-        # Compute quaternion and scales from covariance
-        eigvals, eigvecs = np.linalg.eigh(cov_3d)
-        eigvals = np.maximum(eigvals, 1e-10)
-        scales = np.sqrt(eigvals)
-        
-        # Use identity quaternion for simplicity
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        
         gauss = {
             "center": point_3d,
-            "quat": quat,
-            "scale3d": scales,
+            "covariance": cov_3d,  
             "color": color,
             "alpha": alpha
         }
@@ -612,7 +487,7 @@ def perform_initial_reconstruction(
         'source_gaussians2': reconstructor.source_gaussians2,
         'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
         'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
-        'cov_failed_gaussians_included': True,  # Covに失敗したガウスが湧出ガウスに含まれていることを示すフラグ
+        'cov_failed_gaussians_included': True,  # Cov最適化に失敗したガウスが湧出ガウスに含まれていることを示すフラグ
         "transport_values": getattr(reconstructor, 'transport_values', None),
         "source_gaussians_data": source_gaussians_data,
         "camera_params_list": camera_params_list,
@@ -645,27 +520,9 @@ def add_new_viewpoint(
     auto_threshold: bool = True,
     device: torch.device = None
 ) -> Dict:
-    """
-    Add a new viewpoint to the existing 3D reconstruction.
-    
-    Args:
-        reconstruction_data: Current reconstruction data
-        new_image_name: Name of the new image to add
-        fitted_gaussians_dir: Directory with fitted Gaussians
-        output_dir: Output directory
-        max_iterations: Maximum optimization iterations
-        transport_threshold: Threshold for transport values
-        target_volume: Target volume for new 3D Gaussians
-        auto_threshold: Whether to automatically determine threshold
-        device: Computation device
-    
-    Returns:
-        Updated reconstruction data
-    """
     print(f"\n--- Adding New Viewpoint: {new_image_name} ---")
     
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -688,8 +545,8 @@ def add_new_viewpoint(
         if "K" in reconstruction_data:
             K_new = reconstruction_data["K"]
         elif "camera1_K" in reconstruction_data:
+            # Fall back to using K1 if no K provided
             K_new = reconstruction_data["camera1_K"]
-        # Fall back to using K1 if no K provided
     
     # Get source Gaussians data
     source_gaussians_data = reconstruction_data.get("source_gaussians_data", {})
@@ -705,7 +562,7 @@ def add_new_viewpoint(
         source_gaussians_data=source_gaussians_data
     )
     
-    # *** ここで ViewpointExtender.integrate_new_view_and_gaussians メソッドを使用 ***
+    # 新視点のカメラパラメータ推定と3Dガウス分布の更新
     R_new, t_new = extender.integrate_new_view_and_gaussians(
         new_image_2d_gaussians=new_2d_gaussians,
         max_iterations=max_iterations,
@@ -714,13 +571,36 @@ def add_new_viewpoint(
         auto_threshold=auto_threshold
     )
     
+    # 新しい視点との対応関係を抽出
+    # ViewpointExtender内のtransport_solverから輸送行列を取得
+    if extender.transport_solver is not None and hasattr(extender.transport_solver, 'f'):
+        with torch.no_grad():
+            cost_matrix = extender.transport_solver.compute_cost_matrix_fundamental(
+                extender.transport_solver.f
+            )
+            transport_matrix = extender.transport_solver.unbalanced_sinkhorn_algorithm(cost_matrix)
+            transport_matrix_np = transport_matrix.cpu().numpy()
+            
+            # 観測情報を追跡
+            observations = extender.track_observations(transport_matrix_np)
+            
+            # reconstruction_dataに保存
+            if 'all_matches' not in reconstruction_data:
+                reconstruction_data['all_matches'] = [[] for _ in range(len(camera_params_list))]
+            
+            # 新しいカメラの観測情報を追加
+            reconstruction_data['all_matches'].append(observations)
+            
+            # 最適輸送行列自体も保存（後でBundle Adjustmentに使うため）
+            if 'transport_matrices' not in reconstruction_data:
+                reconstruction_data['transport_matrices'] = []
+            reconstruction_data['transport_matrices'].append(transport_matrix_np)
+    
     # Extract updated data
     points_3d, covariances_3d, colors_3d, alphas_3d = [], [], [], []
     for gauss in extender.existing_3d_gaussians:
         points_3d.append(gauss["center"])
-        # Reconstruct covariance matrix
-        sigma_3d = build_covariance_3d(gauss["quat"], gauss["scale3d"])
-        covariances_3d.append(sigma_3d)
+        covariances_3d.append(gauss["covariance"])
         colors_3d.append(gauss["color"])
         alphas_3d.append(gauss["alpha"])
     
@@ -773,22 +653,19 @@ def add_new_viewpoint(
 
 def run_complete_pipeline(args):
     """Run the complete Perspective-n-Gaussian pipeline."""
-    
-    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Ensure output directory exists
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Get image and fitted Gaussian information
+    # Get image and fitted Gaussian info
     image_dir = os.path.join(args.data_dir, "images")
     colmap_dir = os.path.join(args.data_dir, args.colmap_dir)
     
     all_images = get_image_names(image_dir)
     gaussian_files = get_fitted_gaussians_info(args.fitted_gaussians_dir)
     
-    # Filter to only images with fitted Gaussians
+    # Filter to only images with fitted Gaussians (まあいらんかもしれない)
     available_images = [img for img in all_images if img in gaussian_files]
     
     if len(available_images) < 2:
@@ -808,7 +685,7 @@ def run_complete_pipeline(args):
         print(f"Used images: {used_images}")
     else:
         # Select initial pair
-        img1, img2 = select_initial_pair(
+        img1, img2, selector = select_initial_pair(
         image_dir=image_dir,
         gaussian_files=gaussian_files,
         vocab_size=args.vocab_size,
@@ -833,20 +710,7 @@ def run_complete_pipeline(args):
         
         # Get used images
         used_images = [img1, img2]
-    
-    # Initialize ViewSelector for subsequent image selection
-    selector = ViewSelector(
-        image_dir=image_dir,
-        vocab_size=args.vocab_size,
-        feature_type=args.feature_type,
-        min_overlap_ratio=args.min_overlap,
-        max_overlap_ratio=args.max_overlap
-    )
-    
-    # Process all images to extract features and build codebook
-    image_paths = [os.path.join(image_dir, img) for img in available_images]
-    selector.initialize_from_images(image_paths)
-    
+
     # Set reference images (already used images)
     selector.add_reference_images(used_images)
     
@@ -868,47 +732,47 @@ def run_complete_pipeline(args):
         print(f"\n--- Iteration {iteration}/{total_remaining} ---")
         
         # Select next best view
-        next_image = selector.select_next_view(remaining_images, n_select=1)[0]
+        next_image = selector.select_next_view_simple(remaining_images, n_select=1)[0]
         
         # Process the selected image
         iter_output_dir = os.path.join(args.output_dir, f"iteration_{iteration}")
         os.makedirs(iter_output_dir, exist_ok=True)
         
         # Add the new viewpoint
-        try:
-            updated_data = add_new_viewpoint(
-                reconstruction_data=reconstruction_data,
-                new_image_name=next_image,
-                fitted_gaussians_dir=args.fitted_gaussians_dir,
-                output_dir=iter_output_dir,
-                max_iterations=args.max_iterations,
-                transport_threshold=args.transport_threshold,
-                target_volume=args.target_volume,
-                auto_threshold=args.auto_threshold,
-                device=device
-            )
+        # try:
+        updated_data = add_new_viewpoint(
+            reconstruction_data=reconstruction_data,
+            new_image_name=next_image,
+            fitted_gaussians_dir=args.fitted_gaussians_dir,
+            output_dir=iter_output_dir,
+            max_iterations=args.max_iterations,
+            transport_threshold=args.transport_threshold,
+            target_volume=args.target_volume,
+            auto_threshold=args.auto_threshold,
+            device=device
+        )
+        
+        # Update reconstruction data for next iteration
+        reconstruction_data = updated_data
+        
+        # Remove processed image from remaining images
+        remaining_images.remove(next_image)
+        
+        # Add the new image to reference images for ViewSelector
+        selector.add_reference_images([next_image])
+        
+        # Update source Gaussians data in selector
+        if "source_gaussians_data" in updated_data:
+            selector.set_source_gaussians_data(updated_data["source_gaussians_data"])
             
-            # Update reconstruction data for next iteration
-            reconstruction_data = updated_data
+        # except Exception as e:
+        #     print(f"Error processing {next_image}: {e}")
+
+        #     traceback.print_exc()
             
-            # Remove processed image from remaining images
-            remaining_images.remove(next_image)
-            
-            # Add the new image to reference images for ViewSelector
-            selector.add_reference_images([next_image])
-            
-            # Update source Gaussians data in selector
-            if "source_gaussians_data" in updated_data:
-                selector.set_source_gaussians_data(updated_data["source_gaussians_data"])
-            
-        except Exception as e:
-            print(f"Error processing {next_image}: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Remove problematic image and continue
-            remaining_images.remove(next_image)
-            print(f"Skipping problematic image {next_image}")
+        #     # Remove problematic image and continue
+        #     remaining_images.remove(next_image)
+        #     print(f"Skipping problematic image {next_image}")
         
         # Increment iteration counter
         iteration += 1
@@ -949,6 +813,71 @@ def run_complete_pipeline(args):
     print(f"Total 3D Gaussians: {len(reconstruction_data['existing_3d_gaussians'])}")
     print(f"Final results saved to {final_output_dir}")
     print(f"Total execution time: {time.time() - start_time:.2f} seconds")
+    
+    
+    # # Final Bundle Adjustment
+    # if len(reconstruction_data["points_3d"]) > 0:
+    #     print("\n--- Performing Bundle Adjustment ---")
+        
+    #     # 1. Build observation map from all accumulated data
+    #     from src.optimizer.observation_builder import ObservationBuilder
+        
+    #     # ObservationBuilderはall_matchesまたはtransport_matricesから観測情報を構築
+    #     observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
+    #     match_points_2d = ObservationBuilder.convert_to_match_points_2d(
+    #         observation_map, 
+    #         len(reconstruction_data["camera_params_list"])
+    #     )
+        
+    #     # 最低限必要な観測数をチェック
+    #     total_obs = sum(len(obs) for obs in match_points_2d)
+    #     if total_obs < 10:
+    #         print(f"Not enough observations ({total_obs}) for meaningful Bundle Adjustment. Skipping.")
+    #     else:
+    #         # Initialize Bundle Adjuster
+            
+            
+    #         # 各カメラの内部パラメータリストを構築
+    #         intrinsics_list = []
+    #         for cam_idx in range(len(reconstruction_data["camera_params_list"])):
+    #             # カメラ固有のKがあればそれを使用
+    #             cam_key = f"camera{cam_idx+1}_K"
+    #             if cam_key in reconstruction_data:
+    #                 intrinsics_list.append(reconstruction_data[cam_key])
+    #             elif "K" in reconstruction_data:
+    #                 intrinsics_list.append(reconstruction_data["K"])
+    #             else:
+    #                 # Fallback to first camera's K
+    #                 intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
+            
+    #         # BundleAdjuster初期化/最適化
+    #         ba = BundleAdjuster(
+    #             points_3d=reconstruction_data["points_3d"],
+    #             camera_params_list=reconstruction_data["camera_params_list"],
+    #             match_points_2d=match_points_2d,
+    #             intrinsics_list=intrinsics_list,
+    #             use_robust_loss=True,
+    #             loss_scale=1.0
+    #         )
+            
+    #         ba_results = ba.optimize(n_iterations=1000, verbose=True)
+            
+    #         if ba_results["success"]:
+    #             reconstruction_data["camera_params_list"] = ba_results["optimized_cameras"]
+    #             reconstruction_data["points_3d"] = ba_results["optimized_points"]
+                
+    #             # 更新されたカメラパラメータと3D点をViewpointExtenderの既存3Dガウスにも反映
+    #             for i, point in enumerate(ba_results["optimized_points"]):
+    #                 if i < len(reconstruction_data["existing_3d_gaussians"]):
+    #                     reconstruction_data["existing_3d_gaussians"][i]["center"] = point
+                
+    #             # Export in COLMAP format
+    #             colmap_dir = os.path.join(args.output_dir, "colmap_ba")
+    #             ba.export_colmap_format(colmap_dir)
+                
+    #             print(f"Bundle Adjustment completed successfully. Results saved to {colmap_dir}")
+    #         else:
+    #             print(f"Bundle Adjustment failed: {ba_results.get('message', 'Unknown error')}")
 
 if __name__ == "__main__":
     args = parse_args()
