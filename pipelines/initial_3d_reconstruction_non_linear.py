@@ -303,7 +303,7 @@ def main():
         lambda_mean=0.0,
         lambda_cov=0.0,
         lambda_color=0.0,
-        lambda_epipolar=1e-3,
+        lambda_epipolar=1.0,
         device=device
     )
 
