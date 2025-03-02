@@ -566,57 +566,48 @@ class Initial3DReconstructor:
         self, lambda_volume: float = 1.0, target_volume: float = 1.0, n_jobs: int = -1
     ) -> None:
         """Compute 3D Gaussian covariances via non-linear optimization with volume prior."""
-        # Ensure that camera matrices and 3D points are available before proceeding
+        # 事前チェック（変更なし）
         if self.p1 is None or self.p2 is None:
-            raise ValueError(
-                "Camera matrices must be computed before computing covariances."
-            )
+            raise ValueError("Camera matrices must be computed before computing covariances.")
         if self.points_3d is None:
             raise ValueError("3D points must be computed before computing covariances.")
         if self.match_pairs is None:
-            raise ValueError(
-                "match_pairs not found. Did you call triangulate_gaussian_centers first?"
-            )
+            raise ValueError("match_pairs not found. Did you call triangulate_gaussian_centers first?")
         if len(self.points_3d) == 0:
             raise ValueError("No 3D points available for computing covariances.")
 
-        # Initialize an array to store the 3D covariance matrices for each point
+        # 初期化
         num_3d = self.points_3d.shape[0]
-        self.covariances_3d = np.zeros((num_3d, 3, 3), dtype=np.float64)
-
-        # Set up local camera parameters for the first camera (identity rotation and zero translation)
+        
+        # ★変更: None値を格納できるようにリスト型に変更
+        covariances_3d_list = [None] * num_3d
+        
+        # カメラパラメータ設定（変更なし）
         r1_local = np.eye(3, dtype=float)
         t1_local = np.zeros(3, dtype=float)
-
-        # Ensure the second camera matrix is not None
+        
         assert self.p2 is not None, "p2 must not be None."
-
-        # Decompose the second camera matrix to extract rotation and translation
         m_mat = self.p2[:, :3]
         u_mat, s_vals, vt_mat = np.linalg.svd(m_mat)
         r2_local = u_mat @ vt_mat
         t2_local = np.linalg.inv(self.k2) @ self.p2[:, 3]
 
-        def solve_cov_for_gaussian(idx: int) -> np.ndarray:
-            # Add assertions to satisfy type checker
+        def solve_cov_for_gaussian(idx: int) -> Optional[np.ndarray]:
+            """各ガウスの共分散行列を計算する関数"""
             assert self.points_3d is not None, "points_3d should not be None"
             assert self.match_pairs is not None, "match_pairs should not be None"
 
-            # Get the 3D point and corresponding 2D Gaussian indices
             point_3d_ = self.points_3d[idx]
             i_img1_, j_img2_ = self.match_pairs[idx]
 
-            # Retrieve observed 2D covariance matrices for the Gaussian
             sigma_2d_1_obs = self.gaussians1.covs[i_img1_]
             sigma_2d_2_obs = self.gaussians2.covs[j_img2_]
 
-            # Convert PyTorch tensors to NumPy arrays if necessary
             if hasattr(sigma_2d_1_obs, "detach"):
                 sigma_2d_1_obs = sigma_2d_1_obs.detach().cpu().numpy()
             if hasattr(sigma_2d_2_obs, "detach"):
                 sigma_2d_2_obs = sigma_2d_2_obs.detach().cpu().numpy()
 
-            # Compute the determinant of the 2D covariances and estimate a scale guess
             det_2d_1 = np.linalg.det(sigma_2d_1_obs)
             det_2d_2 = np.linalg.det(sigma_2d_2_obs)
             avg_det = np.sqrt(np.abs(det_2d_1 * det_2d_2))
@@ -625,15 +616,13 @@ class Initial3DReconstructor:
             )
 
             def two_view_resid(local_params: np.ndarray) -> np.ndarray:
-                # Extract quaternion and scale parameters
+                # 残差計算（変更なし）
                 qw, qx, qy, qz, ss1, ss2, ss3 = local_params
                 qq = np.array([qw, qx, qy, qz], dtype=float)
                 ss = np.array([ss1, ss2, ss3], dtype=float)
 
-                # Build the 3D covariance matrix from the parameters
                 sigma_3_ = build_covariance_3d(qq, ss)
 
-                # Compute residuals for each camera view
                 r1_val = single_view_cov_residual(
                     local_params, point_3d_, sigma_2d_1_obs, self.k1, r1_local, t1_local
                 )
@@ -641,7 +630,6 @@ class Initial3DReconstructor:
                     local_params, point_3d_, sigma_2d_2_obs, self.k2, r2_local, t2_local
                 )
 
-                # Compute volume residual using the log determinant of the 3D covariance
                 try:
                     log_det = np.log(np.linalg.det(sigma_3_))
                     volume_residual = (
@@ -651,44 +639,210 @@ class Initial3DReconstructor:
                     print("Singular matrix")
                     volume_residual = 1e-6
 
-                # Return concatenated residuals for optimization
                 return np.concatenate([r1_val, r2_val, [volume_residual]])
 
-            # Initialize parameters for optimization
             init_params = np.array(
                 [1.0, 0.0, 0.0, 0.0, scale_guess, scale_guess, scale_guess],
                 dtype=float,
             )
 
-            # Perform non-linear least squares optimization
             result = least_squares(
                 two_view_resid, x0=init_params, method="lm", max_nfev=20000
             )
 
-            # Check optimization result and return the final 3D covariance
+            #最適化が成功した場合のみ共分散行列を返し、失敗した場合はNoneを返す
             if result.success:
                 qq_final, ss_final = result.x[:4], result.x[4:]
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
-                return sigma_3_final
+                return sigma_3_final, True
             else:
-                print(
-                    f"Failed to optimize covariance for Gaussian {idx}, using fallback scale."
-                )
-                fallback_scale = target_volume
-                return np.diag([fallback_scale, fallback_scale, fallback_scale])
+                print(f"Failed to optimize covariance for Gaussian {idx}, adding to source gaussians.")
+                return None, False
 
-        # Use joblib to parallelize the optimization across multiple Gaussians
+        # 並列処理で共分散行列を計算
         results = Parallel(n_jobs=n_jobs, verbose=10)(
             delayed(solve_cov_for_gaussian)(idx) for idx in range(num_3d)
         )
+        
+        # 結果をリストに保存
+        covariances_3d_list = []
+        valid_indices = []
+        failed_indices = []
+        
+        for idx, (cov3_, success) in enumerate(results):
+            if success:
+                covariances_3d_list.append(cov3_)
+                valid_indices.append(idx)
+            else:
+                failed_indices.append(idx)
+        
+        # 失敗したガウスを湧出ガウスとして管理
+        self._add_failed_gaussians_to_sources(failed_indices)
+        
+        # 有効なガウスのみ保持
+        if len(valid_indices) == 0:
+            print("Warning: No valid Gaussians after covariance optimization.")
+            self.points_3d = np.zeros((0, 3), dtype=np.float64)
+            self.covariances_3d = np.zeros((0, 3, 3), dtype=np.float64)
+            # match_pairsなども更新
+            self.match_pairs = []
+            # 輸送値も更新
+            if hasattr(self, 'transport_values'):
+                self.transport_values = np.array([])
+            return
+        
+        # 有効なガウスのみを保持
+        self.points_3d = self.points_3d[valid_indices]
+        self.covariances_3d = np.array(covariances_3d_list)
+        
+        # match_pairsも更新
+        if self.match_pairs:
+            self.match_pairs = [self.match_pairs[idx] for idx in valid_indices]
+        
+        # 輸送値も更新
+        if hasattr(self, 'transport_values'):
+            self.transport_values = self.transport_values[valid_indices]
 
-        # Store the optimized 3D covariances
-        for idx_, cov3_ in enumerate(results):
-            self.covariances_3d[idx_] = cov3_
-
-        print(
-            f"Finished LM optimization for {num_3d} Gaussians with joblib parallelism."
-        )
+        print(f"Finished LM optimization: {len(valid_indices)} valid Gaussians out of {num_3d} total.")
+        print(f"Added {len(failed_indices)} Gaussians to source collections for future evaluation.")
+        
+    def _add_failed_gaussians_to_sources(self, failed_indices: List[int]) -> None:
+        """Cov計算に失敗したガウスを湧出ガウスとして追加"""
+        if not self.match_pairs or not failed_indices:
+            return
+        
+        # 湧出ガウスの初期化（存在しない場合）
+        if not hasattr(self, 'source_gaussians1') or self.source_gaussians1 is None:
+            self.source_gaussians1 = []
+        elif isinstance(self.source_gaussians1, np.ndarray):
+            # NumPy配列をリストに変換
+            self.source_gaussians1 = self.source_gaussians1.tolist()
+            
+        if not hasattr(self, 'source_gaussians2') or self.source_gaussians2 is None:
+            self.source_gaussians2 = []
+        elif isinstance(self.source_gaussians2, np.ndarray):
+            # NumPy配列をリストに変換
+            self.source_gaussians2 = self.source_gaussians2.tolist()
+        
+        # source_gaussians_dataの初期化（存在しない場合）
+        if not hasattr(self, 'source_gaussians1_data') or self.source_gaussians1_data is None:
+            self.source_gaussians1_data = {
+                'indices': [],
+                'means': [],
+                'covs': [],
+                'rgb': [],
+                'alpha': [],
+                'rotations': [],
+                'scales': []
+            }
+        else:
+            # 各フィールドがNumPy配列またはTensorの場合はリストに変換
+            for key in self.source_gaussians1_data:
+                if isinstance(self.source_gaussians1_data[key], np.ndarray):
+                    self.source_gaussians1_data[key] = self.source_gaussians1_data[key].tolist()
+                elif hasattr(self.source_gaussians1_data[key], 'detach'):
+                    self.source_gaussians1_data[key] = self.source_gaussians1_data[key].detach().cpu().numpy().tolist()
+        
+        if not hasattr(self, 'source_gaussians2_data') or self.source_gaussians2_data is None:
+            self.source_gaussians2_data = {
+                'indices': [],
+                'means': [],
+                'covs': [],
+                'rgb': [],
+                'alpha': [],
+                'rotations': [],
+                'scales': []
+            }
+        else:
+            # 各フィールドがNumPy配列またはTensorの場合はリストに変換
+            for key in self.source_gaussians2_data:
+                if isinstance(self.source_gaussians2_data[key], np.ndarray):
+                    self.source_gaussians2_data[key] = self.source_gaussians2_data[key].tolist()
+                elif hasattr(self.source_gaussians2_data[key], 'detach'):
+                    self.source_gaussians2_data[key] = self.source_gaussians2_data[key].detach().cpu().numpy().tolist()
+        
+        # 失敗したガウスごとに処理
+        for idx in failed_indices:
+            i_img1, j_img2 = self.match_pairs[idx]
+            
+            # 視点1の湧出ガウスに追加
+            if i_img1 not in self.source_gaussians1:
+                self.source_gaussians1.append(i_img1)
+                self.source_gaussians1_data['indices'].append(i_img1)
+                
+                # Tensorをnumpy配列に変換
+                means1 = self.gaussians1.means[i_img1]
+                if hasattr(means1, 'detach'):
+                    means1 = means1.detach().cpu().numpy()
+                self.source_gaussians1_data['means'].append(means1)
+                
+                covs1 = self.gaussians1.covs[i_img1]
+                if hasattr(covs1, 'detach'):
+                    covs1 = covs1.detach().cpu().numpy()
+                self.source_gaussians1_data['covs'].append(covs1)
+                
+                rgb1 = self.gaussians1.rgb[i_img1]
+                if hasattr(rgb1, 'detach'):
+                    rgb1 = rgb1.detach().cpu().numpy()
+                self.source_gaussians1_data['rgb'].append(rgb1)
+                
+                alpha1 = self.gaussians1.alpha[i_img1]
+                if hasattr(alpha1, 'detach'):
+                    alpha1 = alpha1.detach().cpu().numpy()
+                self.source_gaussians1_data['alpha'].append(alpha1)
+                
+                rotations1 = self.gaussians1.rotations[i_img1]
+                if hasattr(rotations1, 'detach'):
+                    rotations1 = rotations1.detach().cpu().numpy()
+                self.source_gaussians1_data['rotations'].append(rotations1)
+                
+                scales1 = self.gaussians1.scales[i_img1]
+                if hasattr(scales1, 'detach'):
+                    scales1 = scales1.detach().cpu().numpy()
+                self.source_gaussians1_data['scales'].append(scales1)
+            
+            # 視点2の湧出ガウスに追加
+            if j_img2 not in self.source_gaussians2:
+                self.source_gaussians2.append(j_img2)
+                self.source_gaussians2_data['indices'].append(j_img2)
+                
+                # Tensorをnumpy配列に変換
+                means2 = self.gaussians2.means[j_img2]
+                if hasattr(means2, 'detach'):
+                    means2 = means2.detach().cpu().numpy()
+                self.source_gaussians2_data['means'].append(means2)
+                
+                covs2 = self.gaussians2.covs[j_img2]
+                if hasattr(covs2, 'detach'):
+                    covs2 = covs2.detach().cpu().numpy()
+                self.source_gaussians2_data['covs'].append(covs2)
+                
+                rgb2 = self.gaussians2.rgb[j_img2]
+                if hasattr(rgb2, 'detach'):
+                    rgb2 = rgb2.detach().cpu().numpy()
+                self.source_gaussians2_data['rgb'].append(rgb2)
+                
+                alpha2 = self.gaussians2.alpha[j_img2]
+                if hasattr(alpha2, 'detach'):
+                    alpha2 = alpha2.detach().cpu().numpy()
+                self.source_gaussians2_data['alpha'].append(alpha2)
+                
+                rotations2 = self.gaussians2.rotations[j_img2]
+                if hasattr(rotations2, 'detach'):
+                    rotations2 = rotations2.detach().cpu().numpy()
+                self.source_gaussians2_data['rotations'].append(rotations2)
+                
+                scales2 = self.gaussians2.scales[j_img2]
+                if hasattr(scales2, 'detach'):
+                    scales2 = scales2.detach().cpu().numpy()
+                self.source_gaussians2_data['scales'].append(scales2)
+        
+        # NumPy配列に変換（便宜上）
+        for key in ['means', 'covs', 'rgb', 'alpha', 'rotations', 'scales']:
+            if self.source_gaussians1_data[key]:
+                self.source_gaussians1_data[key] = np.array(self.source_gaussians1_data[key])
+            if self.source_gaussians2_data[key]:
+                self.source_gaussians2_data[key] = np.array(self.source_gaussians2_data[key])
 
     def compute_3d_gaussian_colors(self, color_mode: str = "average") -> None:
         """Compute a single RGB color for each 3D Gaussian by combining matched 2D Gaussians' colors."""
