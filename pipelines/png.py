@@ -17,7 +17,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-# Import custom modules
+
 from src.reconstructor.view_selector import ViewSelector
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor, build_covariance_3d
 from src.reconstructor.viewpoint_extender import ViewpointExtender
@@ -30,7 +30,7 @@ from utils.saving.geometry_utils import save_ellipsoids_as_ply
 from src.optimizer.bundle_adjuster import BundleAdjuster
 
 # Fix module import issues
-sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians']
+sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
 def parse_args():
     """Parse command-line arguments for the complete pipeline."""
