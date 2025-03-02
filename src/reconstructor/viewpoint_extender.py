@@ -388,6 +388,16 @@ class ViewpointExtender:
         
         print(f"Finding matches between {len(source_means)} source gaussians and {len(new_image_2d_gaussians.means)} new gaussians...")
         
+        # 新しい視点の2Dガウスの座標をnumpy配列に変換
+        new_means = new_image_2d_gaussians.means
+        if isinstance(new_means, torch.Tensor):
+            new_means = new_means.detach().cpu().numpy()
+            
+        # 新しい視点の2Dガウスの色情報をnumpy配列に変換
+        new_rgb = new_image_2d_gaussians.rgb
+        if isinstance(new_rgb, torch.Tensor):
+            new_rgb = new_rgb.detach().cpu().numpy()
+        
         # 各湧出ガウスについて、新しい視点の2Dガウスとの対応を探す
         for i, source_mean in enumerate(source_means):
             source_color = source_rgb[i]
@@ -396,14 +406,14 @@ class ViewpointExtender:
             min_dist = float('inf')
             best_match_idx = -1
             
-            for j, new_mean in enumerate(new_image_2d_gaussians.means):
+            for j, new_mean in enumerate(new_means):
                 # 空間距離
                 dist = np.linalg.norm(source_mean - new_mean)
                 
                 # 距離が閾値未満の場合のみ色差をチェック
                 if dist < distance_threshold:
                     # 色差
-                    color_diff = np.linalg.norm(source_color - new_image_2d_gaussians.rgb[j])
+                    color_diff = np.linalg.norm(source_color - new_rgb[j])
                     
                     # 色差が閾値未満かつ現時点での最小距離であれば更新
                     if color_diff < color_threshold and dist < min_dist:
