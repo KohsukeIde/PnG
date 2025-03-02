@@ -242,8 +242,7 @@ class Initial3DReconstructor:
         threshold: float = 0.1,
         auto_threshold: bool = True
     ) -> None:
-        """
-        初期輸送行列から湧出ガウスを特定して保存する
+        """初期輸送行列から湧出ガウスを特定して保存する
         
         湧出ガウスは、行和または列和が閾値以下のガウスとして定義される。
         - 行和が小さい: 第1画像(gaussians1)のガウスに対応する第2画像のガウスが少ない
@@ -260,7 +259,7 @@ class Initial3DReconstructor:
         row_sums = transport_matrix.sum(axis=1)  # 第1画像の各ガウスに対する総輸送量
         col_sums = transport_matrix.sum(axis=0)  # 第2画像の各ガウスに対する総輸送量
         
-        # 自動閾値決定ロジック
+        # Autot threshold
         if auto_threshold:
             # 行和の統計
             mean_row = np.mean(row_sums)
@@ -300,7 +299,7 @@ class Initial3DReconstructor:
         print(f"Identified {len(self.source_gaussians1)} source gaussians in image 1")
         print(f"Identified {len(self.source_gaussians2)} source gaussians in image 2")
         
-        # 湧出ガウスの詳細情報を格納
+        # 湧出ガウスのパラメータを保存
         if hasattr(self.gaussians1, 'means') and len(self.source_gaussians1) > 0:
             self.source_gaussians1_data = {
                 'indices': self.source_gaussians1,
@@ -323,7 +322,6 @@ class Initial3DReconstructor:
                 'alpha': self.gaussians2.alpha[self.source_gaussians2]
             }
 
-    # 湧出ガウスのデータを取得するメソッド
     def get_source_gaussians_data(self, image_idx: int = 1):
         """湧出ガウスのデータを取得
         
@@ -522,14 +520,12 @@ class Initial3DReconstructor:
             i_val = i_coords[idx]
             j_val = j_coords[idx]
             
-            # 追加: 対応点のtransport値を保存
+            # 対応点のtransport値を保存
             transport_val = transport_matrix[i_val, j_val]
             
-            # 既存のコード（変更なし）
             x1_h = np.array([centers1[i_val, 0], centers1[i_val, 1], 1.0], dtype=float)
             x2_h = np.array([centers2[j_val, 0], centers2[j_val, 1], 1.0], dtype=float)
             
-            # （以下の三角測量コードは変更なし）
             a_mat = np.zeros((4, 4), dtype=float)
             a_mat[0, :] = x1_h[0] * self.p1[2, :] - self.p1[0, :]
             a_mat[1, :] = x1_h[1] * self.p1[2, :] - self.p1[1, :]
@@ -543,17 +539,17 @@ class Initial3DReconstructor:
             
             # 対応点とtransport値を追加
             correspondences.append((point_3d, i_val, j_val))
-            transport_values.append(transport_val)  # 追加: transport値を保存
+            transport_values.append(transport_val)  # 輸送量保存
 
         if len(correspondences) == 0:
-            print("No valid correspondences after filtering & top_k.")
+            print("No valid correspondences")
             self.points_3d = np.zeros((0, 3), dtype=float)
             self.match_pairs = []
-            self.transport_values = np.array([])  # 追加: 空のtransport値配列
+            self.transport_values = np.array([])
         else:
             self.points_3d = np.array([c[0] for c in correspondences], dtype=np.float64)
             self.match_pairs = [(c[1], c[2]) for c in correspondences]
-            self.transport_values = np.array(transport_values, dtype=np.float64)  # 追加: transport値を配列として保存
+            self.transport_values = np.array(transport_values, dtype=np.float64)  
 
         print(
             f"Selected {len(correspondences)} 3D points (threshold={threshold}, top_k={top_k})."
@@ -566,7 +562,6 @@ class Initial3DReconstructor:
         self, lambda_volume: float = 1.0, target_volume: float = 1.0, n_jobs: int = -1
     ) -> None:
         """Compute 3D Gaussian covariances via non-linear optimization with volume prior."""
-        # 事前チェック（変更なし）
         if self.p1 is None or self.p2 is None:
             raise ValueError("Camera matrices must be computed before computing covariances.")
         if self.points_3d is None:
@@ -579,10 +574,10 @@ class Initial3DReconstructor:
         # 初期化
         num_3d = self.points_3d.shape[0]
         
-        # ★変更: None値を格納できるようにリスト型に変更
+        # None値を格納できるようにリスト作成　（最適化失敗時に使用）
         covariances_3d_list = [None] * num_3d
         
-        # カメラパラメータ設定（変更なし）
+        # カメラパラメータ設定
         r1_local = np.eye(3, dtype=float)
         t1_local = np.zeros(3, dtype=float)
         
@@ -650,7 +645,7 @@ class Initial3DReconstructor:
                 two_view_resid, x0=init_params, method="lm", max_nfev=20000
             )
 
-            #最適化が成功した場合のみ共分散行列を返し、失敗した場合はNoneを返す
+            #最適化が成功した場合のみ共分散行列を返し，失敗した場合はNoneを返す
             if result.success:
                 qq_final, ss_final = result.x[:4], result.x[4:]
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
@@ -664,7 +659,6 @@ class Initial3DReconstructor:
             delayed(solve_cov_for_gaussian)(idx) for idx in range(num_3d)
         )
         
-        # 結果をリストに保存
         covariances_3d_list = []
         valid_indices = []
         failed_indices = []
