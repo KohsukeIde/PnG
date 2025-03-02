@@ -8,14 +8,12 @@ from typing import List, Optional, Tuple, Dict, Any
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from src.reconstructor.initial_3d_non_linear import (
-    build_covariance_3d, 
     project_covariance_3d_to_2d,
     Initial3DReconstructor
 )
 
 class ViewpointExtender:
-    """
-    Extends an existing 3D Gaussian scene by adding a new viewpoint.
+    """Extends an existing 3D Gaussian scene by adding a new viewpoint.
     
     Takes an existing 3D Gaussian distribution, projects it onto a reference viewpoint,
     matches it to a new image's 2D Gaussians, and solves for the new viewpoint's camera
@@ -101,17 +99,13 @@ class ViewpointExtender:
         for idx, gauss in enumerate(self.existing_3d_gaussians):
             # Extract 3D Gaussian parameters
             center_3d = gauss["center"]
-            quat = gauss["quat"]
-            scale_3d = gauss["scale3d"]
+            sigma_3d = gauss["covariance"]
             color = gauss["color"]
             alpha = gauss["alpha"]
             
             # Convert to torch tensors if needed
             if not isinstance(center_3d, torch.Tensor):
                 center_3d = torch.tensor(center_3d, dtype=torch.float32, device=self.device)
-            
-            # Build 3D covariance matrix from quaternion and scale
-            sigma_3d = build_covariance_3d(quat, scale_3d)
             
             # Project center to camera coordinates
             x_cam = R_ref @ center_3d + t_ref
@@ -121,7 +115,10 @@ class ViewpointExtender:
                 continue  # Skip points behind the camera
                 
             # Project to image coordinates
-            px_hom = self.K_new @ x_cam
+            K_new = self.K_new.to(dtype=torch.float32) if isinstance(self.K_new, torch.Tensor) else torch.tensor(self.K_new, dtype=torch.float32, device=self.device)
+            x_cam = x_cam.to(dtype=torch.float32)
+            
+            px_hom = K_new @ x_cam
             center_2d = px_hom[:2] / px_hom[2]
             
             # Project 3D covariance to 2D
@@ -221,7 +218,7 @@ class ViewpointExtender:
             device=self.device
         )
         
-        # rvecとtvecを明示的に初期化
+        # rvecとtvec初期化
         self.transport_solver.rvec = torch.nn.Parameter(
             torch.zeros(3, dtype=torch.float32, device=self.device)
         )
@@ -236,37 +233,36 @@ class ViewpointExtender:
     def integrate_new_view(
         self, new_image_2d_gaussians: TwoDGaussians, max_iterations: int = 1000
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        新視点のカメラパラメータ（姿勢）を推定する.
+        """新視点のカメラ外部パラメータを推定.
         
         Args:
-            new_image_2d_gaussians: 新視点の2Dガウス分布
-            max_iterations: 最大最適化イテレーション数
+            new_image_2d_gaussians: 新視点の2DGS
+            max_iterations: Maximum iteration for optimization
             
         Returns:
             Tuple of (R_new, t_new) for the new camera viewpoint
         """
-        # 1. Project existing 3D Gaussians to 2D
+        # Project existing 3D Gaussians to 2D
         projected_2d = self.project_3d_gaussians()
         
-        # 2. Initialize transport solver
+        # Initialize transport solver
         self.initialize_transport_solver(
             projected_2d_gaussians=projected_2d,
             new_2d_gaussians=new_image_2d_gaussians
         )
         
-        # 3. Optimize camera pose (R,t)
+        # Optimize camera pose (R,t)
         self.transport_solver.optimize_with_RT(max_iter=max_iterations, tol=1e-6)
         
-        # 4. Extract optimized R, t
+        # Extract optimized R, t
         with torch.no_grad():
             R_est = self.transport_solver.rodrigues(self.rvec).detach().cpu().numpy()
             t_est = self.tvec.detach().cpu().numpy()
             
-        # 5. Add to camera_params_list
+        # Add to camera_params_list
         self.camera_params_list.append((R_est, t_est))
         
-        # 6. Return the new camera parameters
+        # Return the new camera parameters
         return R_est, t_est
 
     def detect_new_source_gaussians(
@@ -342,8 +338,7 @@ class ViewpointExtender:
         distance_threshold: float = 30.0,
         color_threshold: float = 0.3
     ) -> int:
-        """
-        既存の湧出ガウスと新視点の2Dガウスを対応付けて三角測量し、新しい3Dガウスを追加する
+        """既存の湧出ガウスと新視点の2Dガウスを対応付けて三角測量し、新しい3Dガウスを追加する
         
         Args:
             source_camera_idx: 湧出ガウスが属する既存カメラのインデックス
@@ -355,7 +350,7 @@ class ViewpointExtender:
         Returns:
             int: 追加された3Dガウスの数
         """
-        # 湧出ガウス情報がない場合は処理終了
+        
         if self.source_gaussians_data is None:
             print("No source gaussians data available.")
             return 0
@@ -371,7 +366,7 @@ class ViewpointExtender:
             print(f"Empty source gaussians data for camera {source_camera_idx}.")
             return 0
             
-        # 湧出ガウスの特徴量を取得
+        # 湧出ガウスのパラメータ取得
         source_means = source_data['means']
         source_covs = source_data['covs']
         source_rgb = source_data['rgb']
@@ -483,14 +478,13 @@ class ViewpointExtender:
         if len(reconstructor.points_3d) == 0:
             print("No 3D points were triangulated from source gaussians.")
             return 0
-            
-        # 3D共分散を計算
+        
+        # 3D cov
         print(f"Computing covariances for {len(reconstructor.points_3d)} source-derived points...")
         reconstructor.compute_3d_gaussian_covariances(
             lambda_volume=1.0, target_volume=target_volume
         )
         
-        # 色と不透明度を計算
         reconstructor.compute_3d_gaussian_colors(color_mode="average")
         reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
         
@@ -501,26 +495,15 @@ class ViewpointExtender:
             color = reconstructor.color_3d[i]
             alpha = reconstructor.alpha_3d[i]
             
-            # 共分散から四元数とスケールを推定
-            eigvals, eigvecs = np.linalg.eigh(cov_3d)
-            eigvals = np.maximum(eigvals, 1e-10)
-            scales = np.sqrt(eigvals)
-            
-            # 単位四元数を使用
-            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-            
-            # 新しい3Dガウスを作成
             new_gauss = {
                 "center": point_3d,
-                "quat": quat,
-                "scale3d": scales,
+                "covariance": cov_3d,
                 "color": color,
                 "alpha": alpha,
-                # 湧出ガウス由来であることを示すフラグ（オプション）
                 "from_source": True
             }
             
-            # 既存の3Dガウスリストに追加
+            # 既存の3DGSリストに追加
             self.existing_3d_gaussians.append(new_gauss)
         
         print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians from source gaussians.")
@@ -534,8 +517,7 @@ class ViewpointExtender:
         target_volume: float = 1.0,
         auto_threshold: bool = True
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        新しい視点のカメラパラメータを推定し、湧出ガウスの処理を行う.
+        """新しい視点のカメラパラメータを推定し、湧出ガウスの処理を行う.
         
         Args:
             new_image_2d_gaussians: 新視点の2Dガウス分布
@@ -547,16 +529,12 @@ class ViewpointExtender:
         Returns:
             Tuple[np.ndarray, np.ndarray]: 新しいカメラパラメータ(R, t)
         """
-        # 1. 新しい視点のカメラパラメータを推定
+        # 新規視点のカメラパラメータ推定
         print("Estimating camera parameters for new viewpoint...")
         R_new, t_new = self.integrate_new_view(
             new_image_2d_gaussians=new_image_2d_gaussians,
             max_iterations=max_iterations
         )
-        
-        # 2. 輸送行列を計算（湧出ガウス検出用）
-        print("Computing optimal transport matrix...")
-        projected_2d = self.project_3d_gaussians()
         
         # F行列を使って再計算
         cost_matrix = self.transport_solver.compute_cost_matrix_fundamental(
@@ -569,7 +547,7 @@ class ViewpointExtender:
         
         transport_matrix = transport.detach().cpu().numpy()
         
-        # 3. 過去の湧出ガウスから3Dガウスを追加
+        # 過去の湧出ガウスから3Dガウスを追加
         total_added = 0
         if self.source_gaussians_data:
             print("\nProcessing source gaussians from previous views...")
@@ -585,7 +563,7 @@ class ViewpointExtender:
                 
             print(f"Total added 3D Gaussians from previous sources: {total_added}")
         
-        # 4. 新視点の湧出ガウスを検出して保存
+        # 新視点の湧出ガウスを検出して保存
         print("\nDetecting new source Gaussians...")
         new_source_data = self.detect_new_source_gaussians(
             new_image_2d_gaussians=new_image_2d_gaussians,
@@ -594,7 +572,7 @@ class ViewpointExtender:
             auto_threshold=auto_threshold
         )
         
-        # 5. 湧出ガウス情報を更新
+        # 湧出ガウス情報を更新
         if new_source_data and len(new_source_data.get('indices', [])) > 0:
             # 新しいソースキーを作成（既存のキー数+1）
             existing_keys = [k for k in self.source_gaussians_data.keys() if k.startswith('source_gaussians')]
@@ -606,3 +584,36 @@ class ViewpointExtender:
             print(f"Added {len(new_source_data['indices'])} new source Gaussians as '{new_source_key}'")
         
         return R_new, t_new
+    
+    def track_observations(self, transport_matrix: np.ndarray) -> List[Tuple[int, np.ndarray]]:
+        """最適輸送行列から新しいカメラの観測情報を抽出
+        
+        Args:
+            transport_matrix: 最適輸送行列
+                
+        Returns:
+            List[Tuple[int, np.ndarray]]: (point3d_idx, [x, y]) の形式の観測リスト
+        """
+        observations = []
+        
+        # 新規視点の2Dガウス情報へのアクセスを確保
+        if not hasattr(self, 'transport_solver') or self.transport_solver is None:
+            print("Warning: Transport solver not initialized, cannot track observations")
+            return observations
+            
+        # 新規視点の2Dガウス平均位置
+        new_means = self.transport_solver.means2
+        if isinstance(new_means, torch.Tensor):
+            new_means = new_means.detach().cpu().numpy()
+        
+        for point_idx in range(transport_matrix.shape[0]):
+            # 各3Dポイントに対して最大の輸送値を持つ2Dガウスを見つける
+            if np.sum(transport_matrix[point_idx]) > 1e-6:  # 有意な輸送がある場合
+                best_idx = np.argmax(transport_matrix[point_idx])
+                if transport_matrix[point_idx, best_idx] > 0.1:  # 閾値
+                    # 対応する2D座標
+                    point_2d = new_means[best_idx]
+                    observations.append((point_idx, point_2d))
+        
+        print(f"Found {len(observations)} observations for new camera")
+        return observations
