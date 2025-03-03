@@ -428,10 +428,10 @@ def perform_initial_reconstruction(
     reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
     
     # Camera poses for PLY export
-    R1 = np.eye(3)  # world->camera
+    R1 = np.eye(3)  # world->camera1
     t1 = np.zeros(3)
-    R2 = R_est @ R1
-    t2 = R_est @ t1+ t_optimized 
+    R2 = R_est      # world->camera2 (R_estはworld->camera2の回転)
+    t2 = t_optimized  # world->camera2 (t_optimizedはworld->camera2の並進)
     camera_params_list = [(R1, t1), (R2, t2)]
     print(f"camera_params_list {camera_params_list}")
 
