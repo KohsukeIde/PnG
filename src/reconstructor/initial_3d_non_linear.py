@@ -520,9 +520,14 @@ class Initial3DReconstructor:
             x_val /= x_val[3]
             point_3d = x_val[:3]
             
-            # 対応点とtransport値を追加
-            correspondences.append((point_3d, i_val, j_val))
-            transport_values.append(transport_val)  # 輸送量保存
+            # カメラ座標系での点の位置を計算
+            point_cam1 = self.r1 @ point_3d + self.t1
+            point_cam2 = self.r2 @ point_3d + self.t2
+            
+            # 両方のカメラから見て前方にある場合のみ追加
+            if point_cam1[2] > 0 and point_cam2[2] > 0:
+                correspondences.append((point_3d, i_val, j_val))
+                transport_values.append(transport_val)
 
         if len(correspondences) == 0:
             print("No valid correspondences")
