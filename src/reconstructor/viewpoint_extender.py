@@ -78,7 +78,7 @@ class ViewpointExtender:
         Returns:
             TwoDGaussians: Projected 2D Gaussians
         """
-        # Get reference camera parameters
+        # Get reference camera parameters - R_ref, t_ref は世界座標系→カメラ座標系への変換
         R_ref, t_ref = self.camera_params_list[self.reference_camera_idx]
         
         # Convert to torch tensors if they're not already
@@ -107,7 +107,7 @@ class ViewpointExtender:
             if not isinstance(center_3d, torch.Tensor):
                 center_3d = torch.tensor(center_3d, dtype=torch.float32, device=self.device)
             
-            # Project center to camera coordinates
+            # x_cam = R_ref @ center_3d + t_ref は世界座標系→カメラ座標系の正しい変換
             x_cam = R_ref @ center_3d + t_ref
             
             # Check if point is in front of camera
@@ -254,7 +254,7 @@ class ViewpointExtender:
         # Optimize camera pose (R,t)
         self.transport_solver.optimize_with_RT(max_iter=max_iterations, tol=1e-6)
         
-        # Extract optimized R, t
+        # Extract optimized R, t - これは参照カメラに対する相対変換
         with torch.no_grad():
             R_est = self.transport_solver.rodrigues(self.rvec).detach().cpu().numpy()
             t_est = self.tvec.detach().cpu().numpy()
@@ -262,6 +262,11 @@ class ViewpointExtender:
         R_ref, t_ref = self.camera_params_list[self.reference_camera_idx]
 
         # 相対変換→ワールド座標変換
+        # R_ref, t_ref は世界座標系→参照カメラ座標系の変換
+        # R_est, t_est は参照カメラ座標系→新カメラ座標系の変換
+        # 求めるのは世界座標系→新カメラ座標系の変換
+
+        # 世界座標系→参照カメラ→新カメラの合成変換を計算
         R_world = R_est @ R_ref  
         t_world = R_est @ t_ref + t_est  
 
@@ -386,6 +391,9 @@ class ViewpointExtender:
         # 対応の保存先
         matches = []  # (source_idx, new_idx) のリスト
         
+        # マッチングに成功した湧出ガウスインデックスを記録するリスト（追加）
+        successfully_triangulated_indices = []
+        
         print(f"Finding matches between {len(source_means)} source gaussians and {len(new_image_2d_gaussians.means)} new gaussians...")
         
         # 新しい視点の2Dガウスの座標をnumpy配列に変換
@@ -423,6 +431,8 @@ class ViewpointExtender:
             # 対応が見つかった場合、マッチリストに追加
             if best_match_idx != -1:
                 matches.append((i, best_match_idx))
+                # 成功した湧出ガウスのインデックスを記録（追加）
+                successfully_triangulated_indices.append(source_data['indices'][i])
         
         print(f"Found {len(matches)} matches between source gaussians and new gaussians.")
         
@@ -454,8 +464,7 @@ class ViewpointExtender:
         h_dummy = np.eye(3)
         
         # 湧出ガウスのカメラの内部パラメータを取得
-        # ここでは簡単のため、同じK_newを使っているが、
-        # 実際には湧出ガウスのカメラに対応するK値を使用するべき
+        # ここでは同じK_newを使っているが,実際には湧出ガウスのカメラに対応するK値を使用するべき
         K_source = self.K_new.cpu().numpy() if isinstance(self.K_new, torch.Tensor) else self.K_new
         
         # Initial3DReconstructorインスタンスを作成
@@ -511,8 +520,48 @@ class ViewpointExtender:
             # 既存の3DGSリストに追加
             self.existing_3d_gaussians.append(new_gauss)
         
+        # 処理済み湧出ガウスをマーク（追加）
+        if len(successfully_triangulated_indices) > 0:
+            self._mark_processed_source_gaussians(
+                source_camera_idx=source_camera_idx,
+                source_indices=successfully_triangulated_indices
+            )
+        
         print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians from source gaussians.")
+        print(f"Marked {len(successfully_triangulated_indices)} source gaussians as processed.")
         return len(reconstructor.points_3d)
+    
+    def _mark_processed_source_gaussians(
+        self,
+        source_camera_idx: int,
+        source_indices: List[int]
+    ) -> None:
+        """三角測量に成功した湧出ガウスを処理済みとしてマーク"""
+        # 湧出ガウスデータのキーを取得
+        source_key = f"source_gaussians{source_camera_idx+1}_data"
+        if source_key not in self.source_gaussians_data:
+            return
+        
+        source_data = self.source_gaussians_data[source_key]
+        if 'indices' not in source_data or len(source_data['indices']) == 0:
+            return
+        
+        # 処理済みフラグの初期化（なければ作成）
+        if 'processed' not in source_data:
+            source_data['processed'] = np.zeros(len(source_data['indices']), dtype=bool)
+        
+        # 成功したインデックスを処理済みとしてマーク
+        for idx in source_indices:
+            # データ内のインデックス位置を検索
+            data_idx = np.where(source_data['indices'] == idx)[0]
+            if len(data_idx) > 0:
+                source_data['processed'][data_idx[0]] = True
+        
+        # 処理済みの数を記録
+        processed_count = np.sum(source_data['processed'])
+        print(f"Source gaussians in camera {source_camera_idx+1}: "
+            f"{processed_count}/{len(source_data['indices'])} marked as processed")
+        
 
     def integrate_new_view_and_gaussians(
         self,
@@ -588,6 +637,7 @@ class ViewpointExtender:
             self.source_gaussians_data[new_source_key] = new_source_data
             print(f"Added {len(new_source_data['indices'])} new source Gaussians as '{new_source_key}'")
         
+        
         return R_new, t_new
     
     def track_observations(self, transport_matrix: np.ndarray) -> List[Tuple[int, np.ndarray]]:
@@ -610,7 +660,7 @@ class ViewpointExtender:
         new_means = self.transport_solver.means2
         if isinstance(new_means, torch.Tensor):
             new_means = new_means.detach().cpu().numpy()
-        
+         
         for point_idx in range(transport_matrix.shape[0]):
             # 各3Dポイントに対して最大の輸送値を持つ2Dガウスを見つける
             if np.sum(transport_matrix[point_idx]) > 1e-6:  # 有意な輸送がある場合
