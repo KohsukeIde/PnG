@@ -405,13 +405,14 @@ class OptimalTransportSolver:
         exponent = rho / (rho + self.epsilon)
         # print(f"rho: {rho}, epsilon: {self.epsilon}, exponent: {exponent}")
 
+        stabilization_const = 1e-16
         for iteration in range(max_iter):
             kv = kernel @ v
-            kv = kv + 1e-16
+            kv = kv + stabilization_const
             u_new = (alpha / kv).pow(exponent)
 
             ktu = kernel.t() @ u_new
-            ktu = ktu + 1e-16
+            ktu = ktu + stabilization_const
             v_new = (beta / ktu).pow(exponent)
 
             # Check convergence
