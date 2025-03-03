@@ -437,7 +437,7 @@ class ViewpointExtender:
         for src_idx, new_idx in matches:
             focused_transport[src_idx, new_idx] = 1.0
             
-        # 湧出ガウスからTwoDGaussiansオブジェクトを作成
+        # 一旦rot/scaleを追加しておく（これがないとTwoDGaussiansの初期化でエラー）
         source_rotations = source_data.get('rotations', np.zeros(len(source_means)))
         source_scales = source_data.get('scales', np.ones((len(source_means), 2)))
         
