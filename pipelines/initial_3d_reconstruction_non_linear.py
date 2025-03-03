@@ -385,11 +385,17 @@ def main():
     ##############################
     # 10) Build ellipsoids => PLY (with camera frustums)
     ##############################
-    # camera frustum 付きのPLYを生成 
-    R1 = camera1.R_wc  # world->camera
-    t1 = camera1.t_wc
-    R2 = camera2.R_wc
-    t2 = camera2.t_wc
+    # camera frustum from colmap 
+    # R1 = camera1.R_wc  # world->camera
+    # t1 = camera1.t_wc
+    # R2 = camera2.R_wc
+    # t2 = camera2.t_wc
+    
+    # actual camera frustum coord
+    R1 = np.eye(3)
+    t1= np.zeros(3)
+    R2 = R_est @ R1 
+    t2 = R_est @ t1 + t_optimized 
 
     camera_params_list = [(R1, t1), (R2, t2)]
     
