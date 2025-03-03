@@ -345,7 +345,10 @@ def main():
         r2=R_est, 
         t2=t_optimized
     )
-    
+    R1=np.eye(3), 
+    t1=np.zeros(3),
+    R2=R_est,
+    t2=t_optimized
     #dont delete any gaussian (UOTの枠組みでthresholdは必要なくなったので)
     threshold = 0.0
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold, top_k=100000)
@@ -360,7 +363,9 @@ def main():
 
     ply_points_out = os.path.join('results', 'triangulated_points.ply')
     os.makedirs('results', exist_ok=True)
-    save_point_cloud_as_ply(points_3d, ply_points_out)
+    
+    camera_params_list = [(np.eye(3), np.zeros(3)), (R_est, t_optimized)]
+    save_point_cloud_as_ply(points_3d, ply_points_out, camera_params=camera_params_list)
 
     ##############################
     # 9) Compute color & alpha
