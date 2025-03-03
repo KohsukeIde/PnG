@@ -496,10 +496,9 @@ class Initial3DReconstructor:
         
         
         correspondences = []
-        transport_values = []  # 追加: transport値を保存するリスト
+        transport_values = []
         
         for idx in range(top_k_limited):
-            # 既存のコード（変更なし）
             i_val = i_coords[idx]
             j_val = j_coords[idx]
             
@@ -561,21 +560,21 @@ class Initial3DReconstructor:
 
         # 初期化
         num_3d = self.points_3d.shape[0]
+        self.quaternions = []  
+        self.scales = []       
         
         # None値を格納できるようにリスト作成　（最適化失敗時に使用）
         covariances_3d_list = [None] * num_3d
         
         # カメラパラメータ設定
-        r1_local = np.eye(3, dtype=float)
-        t1_local = np.zeros(3, dtype=float)
+        r1_local = self.r1
+        t1_local = self.t1
         
-        assert self.p2 is not None, "p2 must not be None."
-        m_mat = self.p2[:, :3]
-        u_mat, s_vals, vt_mat = np.linalg.svd(m_mat)
-        r2_local = u_mat @ vt_mat
-        t2_local = np.linalg.inv(self.k2) @ self.p2[:, 3]
+        # カメラ2のパラメータを直接使用
+        r2_local = self.r2
+        t2_local = self.t2
 
-        def solve_cov_for_gaussian(idx: int) -> Optional[np.ndarray]:
+        def solve_cov_for_gaussian(idx: int) -> Tuple:
             """各ガウスの共分散行列を計算する関数"""
             assert self.points_3d is not None, "points_3d should not be None"
             assert self.match_pairs is not None, "match_pairs should not be None"
@@ -605,7 +604,7 @@ class Initial3DReconstructor:
                 ss = np.array([ss1, ss2, ss3], dtype=float)
 
                 sigma_3_ = build_covariance_3d(qq, ss)
-
+                # r1_local, t1_localとr2_local, t2_localはワールド座標系→カメラ座標系への変換
                 r1_val = single_view_cov_residual(
                     local_params, point_3d_, sigma_2d_1_obs, self.k1, r1_local, t1_local
                 )
@@ -633,14 +632,15 @@ class Initial3DReconstructor:
                 two_view_resid, x0=init_params, method="lm", max_nfev=20000
             )
 
-            #最適化が成功した場合のみ共分散行列を返し，失敗した場合はNoneを返す
+            #最適化が成功した場合covを返し，失敗した場合はNoneを返す
             if result.success:
                 qq_final, ss_final = result.x[:4], result.x[4:]
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
-                return sigma_3_final, True
+                # 四元数とスケールも返す
+                return (sigma_3_final, qq_final, ss_final, True)
             else:
                 print(f"Failed to optimize covariance for Gaussian {idx}, adding to source gaussians.")
-                return None, False
+                return (None, None, None, False)
 
         # 並列処理で共分散行列を計算
         results = Parallel(n_jobs=n_jobs, verbose=10)(
@@ -651,9 +651,11 @@ class Initial3DReconstructor:
         valid_indices = []
         failed_indices = []
         
-        for idx, (cov3_, success) in enumerate(results):
+        for idx, (cov3_, qq_, ss_, success) in enumerate(results):
             if success:
                 covariances_3d_list.append(cov3_)
+                self.quaternions.append(qq_)  
+                self.scales.append(ss_)      
                 valid_indices.append(idx)
             else:
                 failed_indices.append(idx)
@@ -666,6 +668,8 @@ class Initial3DReconstructor:
             print("Warning: No valid Gaussians after covariance optimization.")
             self.points_3d = np.zeros((0, 3), dtype=np.float64)
             self.covariances_3d = np.zeros((0, 3, 3), dtype=np.float64)
+            self.quaternions = np.zeros((0, 4), dtype=np.float64)
+            self.scales = np.zeros((0, 3), dtype=np.float64)
             # match_pairsなども更新
             self.match_pairs = []
             # 輸送値も更新
@@ -677,6 +681,14 @@ class Initial3DReconstructor:
         self.points_3d = self.points_3d[valid_indices]
         self.covariances_3d = np.array(covariances_3d_list)
         
+        # 共分散行列と一緒に四元数とスケールも配列に変換
+        if len(valid_indices) > 0:
+            self.quaternions = np.array(self.quaternions)
+            self.scales = np.array(self.scales)
+        else:
+            self.quaternions = np.zeros((0, 4), dtype=np.float64)
+            self.scales = np.zeros((0, 3), dtype=np.float64)
+        
         # match_pairsも更新
         if self.match_pairs:
             self.match_pairs = [self.match_pairs[idx] for idx in valid_indices]
@@ -687,7 +699,7 @@ class Initial3DReconstructor:
 
         print(f"Finished LM optimization: {len(valid_indices)} valid Gaussians out of {num_3d} total.")
         print(f"Added {len(failed_indices)} Gaussians to source collections for future evaluation.")
-        
+
     def _add_failed_gaussians_to_sources(self, failed_indices: List[int]) -> None:
         """Cov計算に失敗したガウスを湧出ガウスとして追加"""
         if not self.match_pairs or not failed_indices:
