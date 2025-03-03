@@ -197,8 +197,8 @@ def save_ellipsoids_as_ply(points_3d, covariances_3d, colors_3d, alphas_3d, file
     # Add camera frustums if provided
     if camera_params is not None:
         K_dummy = np.array([
-            [1000.0, 0.0, 960.0],
-            [0.0, 1000.0, 540.0],
+            [2892.33, 0.0, 777],
+            [0.0, 2883.18, 581],
             [0.0, 0.0, 1.0]
         ])
         
@@ -214,7 +214,7 @@ def save_ellipsoids_as_ply(points_3d, covariances_3d, colors_3d, alphas_3d, file
                 alpha=1.0,
                 near_z=0.1,
                 far_z=0.5,
-                scale_fov=100.0
+                scale_fov=70.0
             )
             
             all_vertices.append(camera_verts)
