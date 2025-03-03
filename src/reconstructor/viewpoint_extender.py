@@ -259,11 +259,16 @@ class ViewpointExtender:
             R_est = self.transport_solver.rodrigues(self.rvec).detach().cpu().numpy()
             t_est = self.tvec.detach().cpu().numpy()
             
-        # Add to camera_params_list
-        self.camera_params_list.append((R_est, t_est))
+        R_ref, t_ref = self.camera_params_list[self.reference_camera_idx]
+
+        # 相対変換→ワールド座標変換
+        R_world = R_est @ R_ref  
+        t_world = R_est @ t_ref + t_est  
+
+        self.camera_params_list.append((R_world, t_world))
         
         # Return the new camera parameters
-        return R_est, t_est
+        return R_world, t_world
 
     def detect_new_source_gaussians(
         self,
