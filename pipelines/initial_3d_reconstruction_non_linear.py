@@ -394,8 +394,8 @@ def main():
     # actual camera frustum coord
     R1 = np.eye(3)
     t1= np.zeros(3)
-    R2 = R_est @ R1 
-    t2 = R_est @ t1 + t_optimized 
+    R2 = R_est
+    t2 = t_optimized
 
     camera_params_list = [(R1, t1), (R2, t2)]
     
