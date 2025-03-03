@@ -928,7 +928,7 @@ class OptimalTransportSolver:
         最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
         """
 
-        # 1) R,tを最適化パラメータ設定
+        # R,tを最適化パラメータ設定  (これは相対変換)
         if not hasattr(self, 'rvec'):
             self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
         if not hasattr(self, 'tvec'):
@@ -946,33 +946,29 @@ class OptimalTransportSolver:
         for iteration in pbar:
             optimizer.zero_grad()
 
-            # (1) rvec, tvec -> F
             F = self.build_f_from_rt(self.rvec, self.tvec)
 
-            # (2) コスト行列計算
             cost_matrix = self.compute_cost_matrix_fundamental(F)
 
-            # (3) Unbalanced Sinkhorn
             transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
 
-            # (4) ロス計算 & 逆伝播
+            # ロス計算 + 逆伝播
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
 
-            # (5) パラメータ更新
+            # パラメータ更新
             optimizer.step()
 
             current_loss = loss.item()
             loss_history.append(current_loss)
 
-            # (6) 収束判定
+            # 収束判定
             loss_diff = abs(prev_loss_val - current_loss)
             if iteration > 5 and loss_diff < tol:
                 pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
                 break
             prev_loss_val = current_loss
 
-            # ログ出力 - tqdmのset_postfixを使って進捗バーに情報を追加
             if iteration % 10 == 0:
                 grad_r = self.rvec.grad.norm().item()
                 grad_t = self.tvec.grad.norm().item()
@@ -983,23 +979,21 @@ class OptimalTransportSolver:
                     with torch.no_grad():
                         t_np = transport.detach().cpu().numpy()
                         
-                        # 行列の次元に応じてフィギュアサイズとアスペクト比を調整
+                        # 行列の次元に応じてサイズとアスペクト比を調整
                         rows, cols = t_np.shape
                         aspect_ratio = cols / rows
                         
-                        # 行列が縦長（rows > cols）の場合、適切なサイズ調整
                         if rows > cols:
-                            fig_width = 8  # 基本の幅
+                            fig_width = 8  # 基本幅
                             fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
                         else:
-                            fig_height = 6  # 基本の高さ
+                            fig_height = 6  # 基本高さ
                             fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
                         
                         plt.figure(figsize=(fig_width, fig_height))
                         
-                        # 大きな行列の場合はダウンサンプリングを考慮
+                        # 大きな行列の場合はダウンサンプリング
                         if rows > 1000 or cols > 1000:
-                            # 簡易的なダウンサンプリング（行列が非常に大きい場合）
                             downsample_factor = max(1, int(max(rows, cols) / 1000))
                             t_np_display = t_np[::downsample_factor, ::downsample_factor]
                             plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
@@ -1012,7 +1006,7 @@ class OptimalTransportSolver:
                         plt.xlabel("Image 2 Gaussians")
                         plt.ylabel("Image 1 Gaussians")
                         
-                        # 軸ラベルの位置調整（必要に応じて）
+                        # 軸ラベルの位置調整
                         plt.tight_layout()
                         plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
                         plt.savefig(plt_path, dpi=150)
