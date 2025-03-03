@@ -26,7 +26,7 @@ from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from utils.gs_pkl_loader import load_gaussians_torch
-from utils.saving.geometry_utils import save_ellipsoids_as_ply
+from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_gaussians_as_ply
 from src.optimizer.bundle_adjuster import BundleAdjuster
 
 # Fix module import issues
@@ -325,7 +325,10 @@ def perform_initial_reconstruction(
     print("\n--- Performing Initial 3D Reconstruction ---")
     
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"Using device: {device}")
     
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -496,7 +499,9 @@ def perform_initial_reconstruction(
         "R2": R2,
         "t2": t2,
         "existing_3d_gaussians": existing_3d_gaussians,
-        "used_images": [img1_name, img2_name]
+        "used_images": [img1_name, img2_name],
+        "quaternions": getattr(reconstructor, 'quaternions', None),
+        "scales": getattr(reconstructor, 'scales', None)
     }
     
     # Save to pickle
@@ -508,6 +513,22 @@ def perform_initial_reconstruction(
     print(f"Results saved to {results_path}")
     
     return results
+
+def select_reference_camera(camera_params_list):
+    """視点拡張時の参照カメラを選択する
+    
+    Args:
+        camera_params_list: カメラパラメータのリスト
+        
+    Returns:
+        int: 参照カメラのインデックス
+    """
+    if len(camera_params_list) <= 1:
+        # カメラが1つしかなければそれを使用
+        return 0
+    
+    # 最新のカメラ（直前に追加されたカメラ）を参照として使用
+    return len(camera_params_list) - 1
 
 def add_new_viewpoint(
     reconstruction_data: Dict,
@@ -522,7 +543,10 @@ def add_new_viewpoint(
 ) -> Dict:
     print(f"\n--- Adding New Viewpoint: {new_image_name} ---")
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"Using device: {device}")
     
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -550,13 +574,16 @@ def add_new_viewpoint(
     
     # Get source Gaussians data
     source_gaussians_data = reconstruction_data.get("source_gaussians_data", {})
+    used_images = reconstruction_data.get("used_images", [])
+    reference_camera_idx = select_reference_camera(camera_params_list, used_images)
+    print(f"Using camera {reference_camera_idx} as reference for new viewpoint")
     
     # Initialize ViewpointExtender
     extender = ViewpointExtender(
         existing_3d_gaussians=existing_3d_gaussians,
         camera_params_list=camera_params_list,
         K_new=K_new,
-        reference_camera_idx=0,  # Use first camera as reference
+        reference_camera_idx=reference_camera_idx,  
         threshold_reprojection=transport_threshold,
         device=device,
         source_gaussians_data=source_gaussians_data
@@ -767,13 +794,12 @@ def run_complete_pipeline(args):
             
         # except Exception as e:
         #     print(f"Error processing {next_image}: {e}")
-
+        #     
         #     traceback.print_exc()
             
         #     # Remove problematic image and continue
         #     remaining_images.remove(next_image)
         #     print(f"Skipping problematic image {next_image}")
-        
         # Increment iteration counter
         iteration += 1
         
@@ -803,6 +829,94 @@ def run_complete_pipeline(args):
         use_alpha=True
     )
     
+    # Gaussian Splattingの初期値としてのPLY保存
+    gs_ply_path = os.path.join(final_output_dir, "gs_init_gaussians.ply")
+
+    # 四元数とスケールを取得
+    quaternions = reconstruction_data.get("quaternions", None)
+    scales = reconstruction_data.get("scales", None)
+
+    # ガウス情報の検証と正規化
+    if quaternions is None or len(quaternions) == 0 or quaternions.shape[0] != reconstruction_data["points_3d"].shape[0]:
+        print("Warning: Valid quaternions not found or count mismatch. Using default orientation.")
+        # 単位四元数を使用（回転なし）
+        quaternions = np.array([[1.0, 0.0, 0.0, 0.0]] * len(reconstruction_data["points_3d"]))
+    else:
+        # 四元数の正規化を確認
+        norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+        if np.any(np.abs(norms - 1.0) > 1e-5):
+            print("Warning: Normalizing quaternions to unit length.")
+            quaternions = quaternions / norms
+
+    if scales is None or len(scales) == 0 or scales.shape[0] != reconstruction_data["points_3d"].shape[0]:
+        print("Warning: Valid scales not found or count mismatch. Computing default scales.")
+        # 共分散行列の固有値からスケールを計算
+        scales = np.array([np.sqrt(np.clip(np.linalg.eigvalsh(cov), 1e-10, None)) 
+                           for cov in reconstruction_data["covariances_3d"]])
+    else:
+        # スケールの非負を確認
+        if np.any(scales < 0):
+            print("Warning: Found negative scales. Taking absolute values.")
+            scales = np.abs(scales)
+
+    # Gaussian Splatting用のPLY保存 - alpha値の検証を追加
+    alphas_3d = reconstruction_data["alpha_3d"]
+    # alpha値が0〜1の範囲内にあることを確認
+    if np.any(alphas_3d < 0) or np.any(alphas_3d > 1):
+        print("Warning: Alpha values outside [0,1] range. Clamping to valid range.")
+        alphas_3d = np.clip(alphas_3d, 0.0, 1.0)
+
+    save_gaussians_as_ply(
+        points_3d=reconstruction_data["points_3d"],
+        quaternions=quaternions,
+        scales=scales,
+        colors_3d=reconstruction_data["color_3d"],
+        alphas_3d=alphas_3d,
+        filename=gs_ply_path
+    )
+    print(f"Saved Gaussian Splatting initialization data to {gs_ply_path}")
+
+    # COLMAP形式でのエクスポート
+    colmap_output_dir = os.path.join(final_output_dir, "colmap")
+    os.makedirs(colmap_output_dir, exist_ok=True)
+
+    from src.optimizer.observation_builder import ObservationBuilder
+    from src.optimizer.bundle_adjuster import BundleAdjuster
+
+    # 観測データの構築
+    observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
+    match_points_2d = ObservationBuilder.convert_to_match_points_2d(
+        observation_map, 
+        len(reconstruction_data["camera_params_list"])
+    )
+
+    # 内部パラメータリストを構築
+    intrinsics_list = []
+    for cam_idx in range(len(reconstruction_data["camera_params_list"])):
+        # カメラ固有のKがあればそれを使用
+        cam_key = f"camera{cam_idx+1}_K"
+        if cam_key in reconstruction_data:
+            intrinsics_list.append(reconstruction_data[cam_key])
+        elif "K" in reconstruction_data:
+            intrinsics_list.append(reconstruction_data["K"])
+        else:
+            # Fallback
+            intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
+
+    # Bundle Adjusterを初期化（最適化せずエクスポートのみ）
+    ba = BundleAdjuster(
+        points_3d=reconstruction_data["points_3d"],
+        camera_params_list=reconstruction_data["camera_params_list"],
+        match_points_2d=match_points_2d,
+        intrinsics_list=intrinsics_list,
+        use_robust_loss=True,
+        loss_scale=1.0
+    )
+
+    # COLMAPフォーマットにエクスポート
+    ba.export_colmap_format(colmap_output_dir)
+    print(f"Exported reconstruction to COLMAP format in {colmap_output_dir}")
+    
     # Save final results
     final_results_path = os.path.join(final_output_dir, "final_reconstruction.pkl")
     with open(final_results_path, 'wb') as f:
@@ -814,29 +928,28 @@ def run_complete_pipeline(args):
     print(f"Final results saved to {final_output_dir}")
     print(f"Total execution time: {time.time() - start_time:.2f} seconds")
     
-    
     # # Final Bundle Adjustment
     # if len(reconstruction_data["points_3d"]) > 0:
     #     print("\n--- Performing Bundle Adjustment ---")
-        
+    #     
     #     # 1. Build observation map from all accumulated data
     #     from src.optimizer.observation_builder import ObservationBuilder
-        
+    #     
     #     # ObservationBuilderはall_matchesまたはtransport_matricesから観測情報を構築
     #     observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
     #     match_points_2d = ObservationBuilder.convert_to_match_points_2d(
     #         observation_map, 
     #         len(reconstruction_data["camera_params_list"])
     #     )
-        
+    #     
     #     # 最低限必要な観測数をチェック
     #     total_obs = sum(len(obs) for obs in match_points_2d)
     #     if total_obs < 10:
     #         print(f"Not enough observations ({total_obs}) for meaningful Bundle Adjustment. Skipping.")
     #     else:
     #         # Initialize Bundle Adjuster
-            
-            
+    #         
+    #         
     #         # 各カメラの内部パラメータリストを構築
     #         intrinsics_list = []
     #         for cam_idx in range(len(reconstruction_data["camera_params_list"])):
@@ -849,7 +962,7 @@ def run_complete_pipeline(args):
     #             else:
     #                 # Fallback to first camera's K
     #                 intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
-            
+    #         
     #         # BundleAdjuster初期化/最適化
     #         ba = BundleAdjuster(
     #             points_3d=reconstruction_data["points_3d"],
@@ -859,22 +972,22 @@ def run_complete_pipeline(args):
     #             use_robust_loss=True,
     #             loss_scale=1.0
     #         )
-            
+    #         
     #         ba_results = ba.optimize(n_iterations=1000, verbose=True)
-            
+    #         
     #         if ba_results["success"]:
     #             reconstruction_data["camera_params_list"] = ba_results["optimized_cameras"]
     #             reconstruction_data["points_3d"] = ba_results["optimized_points"]
-                
+    #             
     #             # 更新されたカメラパラメータと3D点をViewpointExtenderの既存3Dガウスにも反映
     #             for i, point in enumerate(ba_results["optimized_points"]):
     #                 if i < len(reconstruction_data["existing_3d_gaussians"]):
     #                     reconstruction_data["existing_3d_gaussians"][i]["center"] = point
-                
+    #             
     #             # Export in COLMAP format
     #             colmap_dir = os.path.join(args.output_dir, "colmap_ba")
     #             ba.export_colmap_format(colmap_dir)
-                
+    #             
     #             print(f"Bundle Adjustment completed successfully. Results saved to {colmap_dir}")
     #         else:
     #             print(f"Bundle Adjustment failed: {ba_results.get('message', 'Unknown error')}")
