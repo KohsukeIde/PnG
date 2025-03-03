@@ -420,7 +420,7 @@ def perform_initial_reconstruction(
     
     # Compute 3D covariances, colors, and alphas
     print("Computing 3D Gaussian properties...")
-    reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
+    reconstructor.compute_3d_gaussian_covariances(lambda_volume=10.0, target_volume=target_volume)
     if len(reconstructor.points_3d) == 0:
         raise ValueError("No valid 3D Gaussians after covariance optimization. Try different initial images.")
 
@@ -428,12 +428,13 @@ def perform_initial_reconstruction(
     reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
     
     # Camera poses for PLY export
-    R1 = camera1.R_wc  # world->camera
-    t1 = camera1.t_wc
-    R2 = camera2.R_wc
-    t2 = camera2.t_wc
+    R1 = np.eye(3)  # world->camera
+    t1 = np.zeros(3)
+    R2 = R_est @ R1
+    t2 = R_est @ t1+ t_optimized 
     camera_params_list = [(R1, t1), (R2, t2)]
-    
+    print(f"camera_params_list {camera_params_list}")
+
     # Save results as PLY
     ply_path = os.path.join(output_dir, "initial_3d_gaussians.ply")
     save_ellipsoids_as_ply(
@@ -445,7 +446,6 @@ def perform_initial_reconstruction(
         camera_params=camera_params_list,
         use_alpha=True
     )
-    
     # Prepare source Gaussians data for future use
     source_gaussians_data = {}
     if hasattr(reconstructor, 'source_gaussians1_data'):
