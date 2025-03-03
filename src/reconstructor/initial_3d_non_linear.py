@@ -823,12 +823,18 @@ class Initial3DReconstructor:
 
     def compute_3d_gaussian_colors(self, color_mode: str = "average") -> None:
         """Compute a single RGB color for each 3D Gaussian by combining matched 2D Gaussians' colors."""
-        if self.points_3d is None or len(self.points_3d) == 0:
-            raise ValueError("3D points must be computed before computing 3D colors.")
+        if self.points_3d is None:
+            print("Warning: No 3D points available. Skipping color computation.")
+            self.color_3d = np.zeros((0, 3), dtype=np.float32)
+            return
+        if len(self.points_3d) == 0:
+            print("Warning: Empty 3D points array. Skipping color computation.")
+            self.color_3d = np.zeros((0, 3), dtype=np.float32)
+            return
         if not self.match_pairs:
-            raise ValueError(
-                "match_pairs not found. Did you call triangulate_gaussian_centers first?"
-            )
+            print("Warning: No match pairs found. Skipping color computation.")
+            self.color_3d = np.zeros((0, 3), dtype=np.float32)
+            return
 
         num_3d = self.points_3d.shape[0]
         self.color_3d: np.ndarray = np.zeros((num_3d, 3), dtype=np.float32)
@@ -854,12 +860,18 @@ class Initial3DReconstructor:
 
     def compute_3d_gaussian_alphas(self, alpha_mode: str = "average") -> None:
         """Compute a single alpha value for each 3D Gaussian after triangulation."""
-        if self.points_3d is None or len(self.points_3d) == 0:
-            raise ValueError("3D points must be computed before computing 3D alpha.")
+        if self.points_3d is None:
+            print("Warning: No 3D points available. Skipping alpha computation.")
+            self.alpha_3d = np.zeros(0, dtype=np.float32)
+            return
+        if len(self.points_3d) == 0:
+            print("Warning: Empty 3D points array. Skipping alpha computation.")
+            self.alpha_3d = np.zeros(0, dtype=np.float32)
+            return
         if not self.match_pairs:
-            raise ValueError(
-                "match_pairs not found. Did you call triangulate_gaussian_centers first?"
-            )
+            print("Warning: No match pairs found. Skipping alpha computation.")
+            self.alpha_3d = np.zeros(0, dtype=np.float32)
+            return
 
         num_3d = self.points_3d.shape[0]
         self.alpha_3d: np.ndarray = np.zeros(num_3d, dtype=np.float32)
