@@ -806,12 +806,12 @@ class OptimalTransportSolver:
                         plt.savefig(plt_path, dpi=150)
                         plt.close()
 
-        print("Optimized rvec:", self.rvec)
-        print("Optimized tvec:", self.tvec)
+        # print("Optimized rvec:", self.rvec)
+        # print("Optimized tvec:", self.tvec)
 
         # build_f_from_rt から最終Fを取り出す
         final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
-        print("Final F:\n", final_F.cpu().numpy())
+        # print("Final F:\n", final_F.cpu().numpy())
 
         # solver.f にコピー
         with torch.no_grad():
