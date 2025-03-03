@@ -345,8 +345,7 @@ class ViewpointExtender:
         source_camera_idx: int,
         new_image_2d_gaussians: TwoDGaussians,
         target_volume: float = 1.0,
-        distance_threshold: float = 30.0,
-        color_threshold: float = 0.3
+        correspondence_threshold: float = 1e-6  # 対応付け閾値
     ) -> int:
         """既存の湧出ガウスと新視点の2Dガウスを対応付けて三角測量し、新しい3Dガウスを追加する
         
@@ -354,9 +353,8 @@ class ViewpointExtender:
             source_camera_idx: 湧出ガウスが属する既存カメラのインデックス
             new_image_2d_gaussians: 新視点の2Dガウス分布
             target_volume: 新規ガウスの目標体積
-            distance_threshold: 対応付けの距離閾値（ピクセル単位）
-            color_threshold: 対応付けの色差閾値 (RGB差のL2ノルム)
-            
+            correspondence_threshold: 対応付け閾値（これより大きい輸送量を持つガウスペアを対応とみなす）
+                
         Returns:
             int: 追加された3Dガウスの数
         """
@@ -364,107 +362,141 @@ class ViewpointExtender:
         if self.source_gaussians_data is None:
             print("No source gaussians data available.")
             return 0
-            
+                
         # カメラインデックスに応じた湧出ガウスデータを取得
         source_key = f"source_gaussians{source_camera_idx+1}_data"
         if source_key not in self.source_gaussians_data:
             print(f"No source gaussians data for camera {source_camera_idx}.")
             return 0
-            
+                
         source_data = self.source_gaussians_data[source_key]
         if source_data is None or len(source_data.get('indices', [])) == 0:
             print(f"Empty source gaussians data for camera {source_camera_idx}.")
             return 0
-            
-        # 湧出ガウスのパラメータ取得
-        source_means = source_data['means']
-        source_covs = source_data['covs']
-        source_rgb = source_data['rgb']
-        source_alpha = source_data['alpha']
         
-        # 湧出ガウスのカメラパラメータを取得
-        R_source, t_source = self.camera_params_list[source_camera_idx]
+        # 処理済みフラグを確認・初期化
+        if 'processed' not in source_data:
+            # 処理済みフラグがない場合は初期化
+            source_data['processed'] = np.zeros(len(source_data['indices']), dtype=bool)
         
-        # 新しい視点のカメラパラメータを取得
-        R_new, t_new = self.camera_params_list[-1]
-        
-        # 対応の保存先
-        matches = []  # (source_idx, new_idx) のリスト
-        
-        # マッチングに成功した湧出ガウスインデックスを記録するリスト（追加）
-        successfully_triangulated_indices = []
-        
-        print(f"Finding matches between {len(source_means)} source gaussians and {len(new_image_2d_gaussians.means)} new gaussians...")
-        
-        # 新しい視点の2Dガウスの座標をnumpy配列に変換
-        new_means = new_image_2d_gaussians.means
-        if isinstance(new_means, torch.Tensor):
-            new_means = new_means.detach().cpu().numpy()
-            
-        # 新しい視点の2Dガウスの色情報をnumpy配列に変換
-        new_rgb = new_image_2d_gaussians.rgb
-        if isinstance(new_rgb, torch.Tensor):
-            new_rgb = new_rgb.detach().cpu().numpy()
-        
-        # 各湧出ガウスについて、新しい視点の2Dガウスとの対応を探す
-        for i, source_mean in enumerate(source_means):
-            source_color = source_rgb[i]
-            
-            # ユークリッド距離と色差に基づいて最も近い新規ガウスを探す
-            min_dist = float('inf')
-            best_match_idx = -1
-            
-            for j, new_mean in enumerate(new_means):
-                # 空間距離
-                dist = np.linalg.norm(source_mean - new_mean)
-                
-                # 距離が閾値未満の場合のみ色差をチェック
-                if dist < distance_threshold:
-                    # 色差
-                    color_diff = np.linalg.norm(source_color - new_rgb[j])
-                    
-                    # 色差が閾値未満かつ現時点での最小距離であれば更新
-                    if color_diff < color_threshold and dist < min_dist:
-                        min_dist = dist
-                        best_match_idx = j
-            
-            # 対応が見つかった場合、マッチリストに追加
-            if best_match_idx != -1:
-                matches.append((i, best_match_idx))
-                # 成功した湧出ガウスのインデックスを記録（追加）
-                successfully_triangulated_indices.append(source_data['indices'][i])
-        
-        print(f"Found {len(matches)} matches between source gaussians and new gaussians.")
-        
-        if len(matches) == 0:
+        # 未処理のもののみ抽出
+        unprocessed_mask = ~source_data['processed']
+        if not np.any(unprocessed_mask):
+            print(f"All source gaussians for camera {source_camera_idx} are already processed.")
             return 0
-            
-        # 対応を使って三角測量するための簡易輸送行列を作成
-        source_size = len(source_means)
-        new_size = len(new_image_2d_gaussians.means)
-        focused_transport = np.zeros((source_size, new_size))
         
-        for src_idx, new_idx in matches:
-            focused_transport[src_idx, new_idx] = 1.0
-            
-        # 一旦rot/scaleを追加しておく（これがないとTwoDGaussiansの初期化でエラー）
-        source_rotations = source_data.get('rotations', np.zeros(len(source_means)))
-        source_scales = source_data.get('scales', np.ones((len(source_means), 2)))
+        # 未処理のガウスのみを取得
+        indices = np.array(source_data['indices'])[unprocessed_mask]
+        means = np.array(source_data['means'])[unprocessed_mask]
+        covs = np.array(source_data['covs'])[unprocessed_mask]
+        rgb = np.array(source_data['rgb'])[unprocessed_mask]
+        alpha = np.array(source_data['alpha'])[unprocessed_mask]
+        rotations = np.array(source_data.get('rotations', np.zeros(len(source_data['indices']))))[unprocessed_mask]
+        scales = np.array(source_data.get('scales', np.ones((len(source_data['indices']), 2))))[unprocessed_mask]
         
+        print(f"Processing {len(indices)} source gaussians from camera {source_camera_idx}")
+                
+        # 湧出ガウスのTwoDGaussiansを作成
         source_gaussians = TwoDGaussians(
-            means=source_means,
-            covs=source_covs,
-            rgb=source_rgb,
-            alpha=source_alpha,
-            rotations=source_rotations,
-            scales=source_scales
+            means=means,
+            covs=covs,
+            rgb=rgb,
+            alpha=alpha,
+            rotations=rotations,
+            scales=scales
         )
+        
+        # カメラパラメータを取得
+        R_source, t_source = self.camera_params_list[source_camera_idx]
+        R_new, t_new = self.camera_params_list[-1]  # 新視点のインデックスは最後のもの
+        
+        # カメラパラメータをTensorに変換
+        if not isinstance(R_source, torch.Tensor):
+            R_source_tensor = torch.tensor(R_source, dtype=torch.float32, device=self.device)
+        else:
+            R_source_tensor = R_source.to(self.device)
+            
+        if not isinstance(t_source, torch.Tensor):
+            t_source_tensor = torch.tensor(t_source, dtype=torch.float32, device=self.device)
+        else:
+            t_source_tensor = t_source.to(self.device)
+            
+        if not isinstance(R_new, torch.Tensor):
+            R_new_tensor = torch.tensor(R_new, dtype=torch.float32, device=self.device)
+        else:
+            R_new_tensor = R_new.to(self.device)
+            
+        if not isinstance(t_new, torch.Tensor):
+            t_new_tensor = torch.tensor(t_new, dtype=torch.float32, device=self.device)
+        else:
+            t_new_tensor = t_new.to(self.device)
+        
+        # 湧出ガウスと新視点の2Dガウスの間の最適輸送を計算
+        solver = OptimalTransportSolver(
+            gaussians1=source_gaussians,
+            gaussians2=new_image_2d_gaussians,
+            k1=self.K_new.cpu().numpy() if isinstance(self.K_new, torch.Tensor) else self.K_new,
+            k2=self.K_new.cpu().numpy() if isinstance(self.K_new, torch.Tensor) else self.K_new,
+            epsilon=0.01,
+            lambda_mean=0.0,
+            lambda_cov=0.0,
+            lambda_color=1.0, 
+            lambda_epipolar=1.0, 
+            device=self.device
+        )
+        
+        # 相対的な回転と並進を計算
+        # R_source, t_source は world->source カメラ座標変換
+        # R_new, t_new は world->new カメラ座標変換
+        # R_rel = R_new @ R_source.T は source->new の相対回転
+        R_rel = R_new_tensor @ R_source_tensor.transpose(0, 1)
+        t_rel = t_new_tensor - R_rel @ t_source_tensor
+        
+        # 相対回転から回転ベクトルを計算
+        # 回転ベクトルの近似値を設定（小さな値で初期化）
+        rvec = torch.zeros(3, dtype=torch.float32, device=self.device)
+        tvec = t_rel.clone()
+        
+        # OptimalTransportSolverのrvecとtvecを設定
+        solver.rvec = rvec
+        solver.tvec = tvec
+        
+        # カメラパラメータから直接F行列を構築
+        F = solver.build_f_from_rt(rvec, tvec)
+        
+        # F行列に基づくコスト行列と輸送行列を計算
+        cost_matrix = solver.compute_cost_matrix_fundamental(F)
+        transport_matrix = solver.unbalanced_sinkhorn_algorithm(
+            cost_matrix, rho=0.5, max_iter=1000, tol=1e-5
+        )
+        transport_np = transport_matrix.detach().cpu().numpy()
+        
+        # 輸送量が閾値以上のペアを抽出
+        valid_pairs = []
+        for i in range(transport_np.shape[0]):  # 湧出ガウス
+            # 各湧出ガウスに対して、最も輸送量の大きい新ガウスを見つける
+            best_j = np.argmax(transport_np[i])
+            max_transport = transport_np[i, best_j]
+            
+            if max_transport > correspondence_threshold:
+                valid_pairs.append((i, best_j))
+        
+        print(f"Found {len(valid_pairs)} valid pairs between source gaussians and new gaussians")
+        
+        # 対応が見つからなかった場合のフォールバック
+        if len(valid_pairs) == 0:
+            print("No valid pairs found through optimal transport. Unable to triangulate.")
+            return 0
+        
+        # 輸送行列を構築
+        focused_transport = np.zeros((len(means), len(new_image_2d_gaussians.means)))
+        for src_idx, new_idx in valid_pairs:
+            focused_transport[src_idx, new_idx] = 1.0
         
         # Initial3DReconstructorを初期化
         h_dummy = np.eye(3)
         
-        # 湧出ガウスのカメラの内部パラメータを取得
-        # ここでは同じK_newを使っているが,実際には湧出ガウスのカメラに対応するK値を使用するべき
+        # カメラの内部パラメータを取得
         K_source = self.K_new.cpu().numpy() if isinstance(self.K_new, torch.Tensor) else self.K_new
         
         # Initial3DReconstructorインスタンスを作成
@@ -486,21 +518,43 @@ class ViewpointExtender:
         
         # 三角測量
         reconstructor.triangulate_gaussian_centers(
-            focused_transport, threshold=0.0, top_k=len(matches)
+            focused_transport, threshold=0.0, top_k=len(valid_pairs)
         )
         
         if len(reconstructor.points_3d) == 0:
-            print("No 3D points were triangulated from source gaussians.")
+            print("Triangulation failed: no 3D points could be generated")
             return 0
         
-        # 3D cov
-        print(f"Computing covariances for {len(reconstructor.points_3d)} source-derived points...")
+        # 3D共分散行列を計算
+        print(f"Computing covariances for {len(reconstructor.points_3d)} triangulated points")
         reconstructor.compute_3d_gaussian_covariances(
             lambda_volume=1.0, target_volume=target_volume
         )
         
+        # 色と不透明度を計算
         reconstructor.compute_3d_gaussian_colors(color_mode="average")
         reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
+        
+        # match_pairs [(i, j), ...] の i は source_gaussiansのインデックス
+        successfully_triangulated_source_indices = []
+        
+        for match_pair in reconstructor.match_pairs:
+            src_idx = match_pair[0]  # source_gaussians内のインデックス
+            # unprocessed_maskを使用している場合は元のインデックスに戻す必要がある
+            orig_idx = np.where(unprocessed_mask)[0][src_idx]
+            orig_source_idx = source_data['indices'][orig_idx]
+            
+            successfully_triangulated_source_indices.append(orig_source_idx)
+        
+        # reconstructorから四元数とスケールを取得
+        if not hasattr(reconstructor, 'quaternions') or len(reconstructor.quaternions) == 0:
+            raise ValueError("Error: quaternions not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
+
+        if not hasattr(reconstructor, 'scales') or len(reconstructor.scales) == 0:
+            raise ValueError("Error: scales not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
+
+        reconstructor_quaternions = reconstructor.quaternions
+        reconstructor_scales = reconstructor.scales
         
         # 新しい3Dガウスを既存のリストに追加
         for i in range(len(reconstructor.points_3d)):
@@ -508,27 +562,32 @@ class ViewpointExtender:
             cov_3d = reconstructor.covariances_3d[i]
             color = reconstructor.color_3d[i]
             alpha = reconstructor.alpha_3d[i]
+            quaternion = reconstructor_quaternions[i] 
+            scale = reconstructor_scales[i]
             
             new_gauss = {
                 "center": point_3d,
                 "covariance": cov_3d,
                 "color": color,
                 "alpha": alpha,
+                "quaternion": quaternion,
+                "scale": scale,
                 "from_source": True
             }
             
             # 既存の3DGSリストに追加
             self.existing_3d_gaussians.append(new_gauss)
-        
-        # 処理済み湧出ガウスをマーク（追加）
-        if len(successfully_triangulated_indices) > 0:
+            
+        # 処理済み湧出ガウスをマーク
+        if successfully_triangulated_source_indices:
             self._mark_processed_source_gaussians(
                 source_camera_idx=source_camera_idx,
-                source_indices=successfully_triangulated_indices
+                source_indices=successfully_triangulated_source_indices
             )
         
-        print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians from source gaussians.")
-        print(f"Marked {len(successfully_triangulated_indices)} source gaussians as processed.")
+        print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians from source camera {source_camera_idx}")
+        print(f"Marked {len(successfully_triangulated_source_indices)} source gaussians as processed")
+        
         return len(reconstructor.points_3d)
     
     def _mark_processed_source_gaussians(
