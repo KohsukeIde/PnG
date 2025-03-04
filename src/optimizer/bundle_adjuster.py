@@ -19,6 +19,7 @@ class BundleAdjuster:
         camera_params_list: List[Tuple[np.ndarray, np.ndarray]],
         match_points_2d: List[List[Tuple[int, np.ndarray]]],
         intrinsics_list: List[np.ndarray],
+        image_names: Optional[List[str]] = None,
         use_robust_loss: bool = True,
         loss_scale: float = 1.0
     ):
@@ -30,6 +31,7 @@ class BundleAdjuster:
             camera_params_list: List of (R, t) camera parameters
             match_points_2d: For each camera, list of (point_idx, [x, y]) observations
             intrinsics_list: List of camera intrinsic matrices K
+            image_names: Optional list of image names for COLMAP export
             use_robust_loss: Whether to use robust loss function
             loss_scale: Scale parameter for robust loss
         """
@@ -37,6 +39,7 @@ class BundleAdjuster:
         self.camera_params_list = [(R.copy(), t.copy()) for R, t in camera_params_list]
         self.match_points_2d = match_points_2d
         self.intrinsics_list = intrinsics_list
+        self.image_names = image_names
         self.use_robust_loss = use_robust_loss
         self.loss_scale = loss_scale
         
@@ -269,16 +272,20 @@ class BundleAdjuster:
                         qy = (rot_mat[1, 2] + rot_mat[2, 1]) / s
                         qz = 0.25 * s
                 
-                # Image name
-                image_name = f"image_{i+1:06d}.jpg"
+                # Use provided image name if available, otherwise use generic name
+                if self.image_names and i < len(self.image_names):
+                    image_name = self.image_names[i]
+                else:
+                    image_name = f"image_{i+1:06d}.jpg"
                 
                 # Write image info
                 f.write(f"{i+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} {i+1} {image_name}\n")
                 
                 # Write point observations
                 points_str = ""
-                for point_idx, point_2d in self.match_points_2d[i]:
-                    points_str += f"{point_2d[0]:.6f} {point_2d[1]:.6f} {point_idx+1} "
+                if i < len(self.match_points_2d):
+                    for point_idx, point_2d in self.match_points_2d[i]:
+                        points_str += f"{point_2d[0]:.6f} {point_2d[1]:.6f} {point_idx+1} "
                 
                 f.write(f"{points_str}\n")
         
