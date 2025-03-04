@@ -531,6 +531,13 @@ class ViewpointExtender:
             lambda_volume=1.0, target_volume=target_volume
         )
         
+        # デバッグ情報
+        print(f"After compute_3d_gaussian_covariances:")
+        print(f"  points_3d shape: {reconstructor.points_3d.shape if hasattr(reconstructor, 'points_3d') else 'None'}")
+        print(f"  covariances_3d shape: {reconstructor.covariances_3d.shape if hasattr(reconstructor, 'covariances_3d') else 'None'}")
+        print(f"  quaternions shape: {reconstructor.quaternions.shape if hasattr(reconstructor, 'quaternions') else 'None'}")
+        print(f"  scales shape: {reconstructor.scales.shape if hasattr(reconstructor, 'scales') else 'None'}")
+        
         # 色と不透明度を計算
         reconstructor.compute_3d_gaussian_colors(color_mode="average")
         reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
@@ -547,14 +554,27 @@ class ViewpointExtender:
             successfully_triangulated_source_indices.append(orig_source_idx)
         
         # reconstructorから四元数とスケールを取得
-        if not hasattr(reconstructor, 'quaternions') or len(reconstructor.quaternions) == 0:
-            raise ValueError("Error: quaternions not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
+        if not hasattr(reconstructor, 'quaternions') or reconstructor.quaternions is None or len(reconstructor.quaternions) == 0:
+            print("Warning: quaternions not found or empty in reconstructor")
+            if len(reconstructor.points_3d) > 0:
+                # 点があるのに四元数がない場合はエラー
+                raise ValueError("Error: quaternions not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
+            else:
+                # 点がない場合は空の配列を作成
+                reconstructor_quaternions = np.zeros((0, 4), dtype=np.float64)
+        else:
+            reconstructor_quaternions = reconstructor.quaternions
 
-        if not hasattr(reconstructor, 'scales') or len(reconstructor.scales) == 0:
-            raise ValueError("Error: scales not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
-
-        reconstructor_quaternions = reconstructor.quaternions
-        reconstructor_scales = reconstructor.scales
+        if not hasattr(reconstructor, 'scales') or reconstructor.scales is None or len(reconstructor.scales) == 0:
+            print("Warning: scales not found or empty in reconstructor")
+            if len(reconstructor.points_3d) > 0:
+                # 点があるのにスケールがない場合はエラー
+                raise ValueError("Error: scales not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
+            else:
+                # 点がない場合は空の配列を作成
+                reconstructor_scales = np.zeros((0, 3), dtype=np.float64)
+        else:
+            reconstructor_scales = reconstructor.scales
         
         # 新しい3Dガウスを既存のリストに追加
         for i in range(len(reconstructor.points_3d)):
