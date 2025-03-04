@@ -28,6 +28,7 @@ from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from utils.gs_pkl_loader import load_gaussians_torch
 from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_gaussians_as_ply
 from src.optimizer.bundle_adjuster import BundleAdjuster
+from src.optimizer.observation_builder import ObservationBuilder
 
 # Fix module import issues
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
@@ -116,6 +117,182 @@ def parse_args():
     )
     
     return parser.parse_args()
+
+def export_gaussians_to_numpy(
+    output_path: str,
+    points_3d: np.ndarray,
+    covariances_3d: np.ndarray,
+    colors_3d: np.ndarray,
+    alphas_3d: np.ndarray,
+    quaternions: Optional[np.ndarray] = None,
+    scales: Optional[np.ndarray] = None
+) -> None:
+    """
+    Gaussian Splattingの初期値として使用できるnumpy形式でガウシアン情報を保存
+    
+    Args:
+        output_path: 出力ファイルパス (.npy)
+        points_3d: 3D点の位置 [N, 3]
+        covariances_3d: 3D共分散行列 [N, 3, 3]
+        colors_3d: RGB色 [N, 3]
+        alphas_3d: 不透明度 [N]
+        quaternions: 四元数 [N, 4] (オプション)
+        scales: スケール [N, 3] (オプション)
+    """
+    N = len(points_3d)
+    
+    # 四元数とスケールの有効性チェック
+    if quaternions is None or len(quaternions) != N or quaternions.shape[1] != 4:
+        print(f"Warning: Invalid quaternions (shape={None if quaternions is None else quaternions.shape}), expected ({N}, 4)")
+        print("Generating unit quaternions...")
+        quaternions = np.zeros((N, 4), dtype=np.float32)
+        quaternions[:, 0] = 1.0  # w成分を1に設定（単位四元数）
+    
+    if scales is None or len(scales) != N or scales.shape[1] != 3:
+        print(f"Warning: Invalid scales (shape={None if scales is None else scales.shape}), expected ({N}, 3)")
+        print("Computing scales from covariances...")
+        scales = np.zeros((N, 3), dtype=np.float32)
+        
+        # 各共分散行列から固有値を計算してスケールとする
+        for i in range(N):
+            try:
+                eigvals = np.linalg.eigvalsh(covariances_3d[i])
+                # 固有値がゼロ以下になることを防ぐ
+                eigvals = np.maximum(eigvals, 1e-6)
+                scales[i] = np.sqrt(eigvals)
+            except np.linalg.LinAlgError:
+                scales[i] = [0.01, 0.01, 0.01]  # デフォルト値
+    
+    # 四元数の正規化
+    quaternion_norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+    quaternions = quaternions / np.maximum(quaternion_norms, 1e-10)
+    
+    # スケールが非負であることを確認
+    scales = np.maximum(scales, 1e-6)
+    
+    # 球面調和関数(SH)係数を設定
+    # Gaussian Splattingでは色情報をSHで表現することが多い
+    # ここでは0次の係数のみを使用し、これはRGB値と同じ
+    sh_deg = 0  # 0次のSH
+    sh_dim = (sh_deg + 1) ** 2  # SHの次元数（0次なら1）
+    
+    # SH係数配列を作成
+    sh_coeffs = np.zeros((N, sh_dim, 3), dtype=np.float32)
+    
+    # 0次のSH係数はRGB値そのもの
+    sh_coeffs[:, 0, :] = colors_3d
+
+    # Gaussian Splatting用のデータ構造
+    gs_data = {
+        'xyz': points_3d.astype(np.float32),          # 位置
+        'quaternions': quaternions.astype(np.float32), # 回転
+        'scales': scales.astype(np.float32),           # スケール
+        'opacities': alphas_3d.astype(np.float32),     # 不透明度
+        'sh_coeffs': sh_coeffs,                        # SH係数
+        'covariances': covariances_3d.astype(np.float32)  # 共分散行列（オプション）
+    }
+    
+    # numpyファイルとして保存
+    np.save(output_path, gs_data)
+    print(f"Saved Gaussian Splatting numpy data to {output_path}")
+    
+    # メタデータファイルも生成（オプション）
+    meta_path = output_path.replace('.npy', '_meta.txt')
+    with open(meta_path, 'w') as f:
+        f.write(f"Total Gaussians: {N}\n")
+        f.write(f"SH degree: {sh_deg}\n")
+        f.write(f"Data format: xyz, quaternions, scales, opacities, sh_coeffs, covariances\n")
+        f.write(f"xyz shape: {points_3d.shape}\n")
+        f.write(f"quaternions shape: {quaternions.shape}\n")
+        f.write(f"scales shape: {scales.shape}\n")
+        f.write(f"opacities shape: {alphas_3d.shape}\n")
+        f.write(f"sh_coeffs shape: {sh_coeffs.shape}\n")
+        f.write(f"covariances shape: {covariances_3d.shape}\n")
+    
+    print(f"Saved metadata to {meta_path}")
+    
+def export_gaussians_to_colmap_dir(
+    colmap_dir: str,
+    points_3d: np.ndarray,
+    covariances_3d: np.ndarray,
+    colors_3d: np.ndarray,
+    alphas_3d: np.ndarray,
+    quaternions: Optional[np.ndarray] = None,
+    scales: Optional[np.ndarray] = None
+) -> None:
+    """COLMAPディレクトリに完全なガウシアン情報を含むファイルをエクスポート
+    
+    Args:
+        colmap_dir: COLMAPディレクトリのパス
+        points_3d: 3D点の位置 [N, 3]
+        covariances_3d: 3D共分散行列 [N, 3, 3]
+        colors_3d: RGB色 [N, 3]
+        alphas_3d: 不透明度 [N]
+        quaternions: 四元数 [N, 4] (オプション)
+        scales: スケール [N, 3] (オプション)
+    """
+    from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_gaussians_as_ply
+    
+    # 完全なガウシアン情報を含むPLYファイル
+    ply_ellipsoids_path = os.path.join(colmap_dir, "gaussians_ellipsoids.ply")
+    save_ellipsoids_as_ply(
+        points_3d=points_3d,
+        covariances_3d=covariances_3d,
+        colors_3d=colors_3d,
+        alphas_3d=alphas_3d,
+        filename=ply_ellipsoids_path,
+        use_alpha=True
+    )
+    print(f"Saved ellipsoids with full Gaussian information to {ply_ellipsoids_path}")
+    
+    # Gaussian Splattingの初期値として使用できる形式のPLYファイル
+    ply_gs_path = os.path.join(colmap_dir, "gaussians_splat.ply")
+    
+    # 四元数とスケールのチェック・正規化
+    if quaternions is None or len(quaternions) == 0 or quaternions.shape[0] != points_3d.shape[0]:
+        print("Warning: Valid quaternions not found or count mismatch. Computing from covariances.")
+        # 共分散行列から四元数を計算する処理（簡易版）
+        quaternions = np.array([[1.0, 0.0, 0.0, 0.0]] * len(points_3d))
+    else:
+        # 四元数の正規化
+        norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+        if np.any(np.abs(norms - 1.0) > 1e-5):
+            quaternions = quaternions / norms
+    
+    if scales is None or len(scales) == 0 or scales.shape[0] != points_3d.shape[0]:
+        print("Warning: Valid scales not found or count mismatch. Computing from covariances.")
+        # 共分散行列からスケールを計算
+        scales = np.array([np.sqrt(np.clip(np.linalg.eigvalsh(cov), 1e-10, None)) 
+                        for cov in covariances_3d])
+    else:
+        # スケールの非負を確認
+        if np.any(scales < 0):
+            scales = np.abs(scales)
+    
+    # Alpha値の範囲チェック
+    alphas_3d = np.clip(alphas_3d, 0.0, 1.0)
+    
+    save_gaussians_as_ply(
+        points_3d=points_3d,
+        quaternions=quaternions,
+        scales=scales,
+        colors_3d=colors_3d,
+        alphas_3d=alphas_3d,
+        filename=ply_gs_path
+    )
+    print(f"Saved Gaussian Splatting PLY format to {ply_gs_path}")
+    
+    # 追加: Numpy形式でガウシアン情報を保存
+    numpy_path = os.path.join(colmap_dir, "gaussians.npy")
+    export_gaussians_to_numpy(
+        output_path=numpy_path,
+        points_3d=points_3d,
+        covariances_3d=covariances_3d,
+        colors_3d=colors_3d,
+        alphas_3d=alphas_3d,
+        quaternions=quaternions,
+        scales=scales
+    )
 
 def get_image_names(directory: str) -> List[str]:
     """Get image file names from directory."""
@@ -436,7 +613,7 @@ def perform_initial_reconstruction(
     R2 = R_est      # world->camera2 (R_estはworld->camera2の回転)
     t2 = t_optimized  # world->camera2 (t_optimizedはworld->camera2の並進)
     camera_params_list = [(R1, t1), (R2, t2)]
-    print(f"camera_params_list {camera_params_list}")
+    # print(f"camera_params_list {camera_params_list}")
 
     # Save results as PLY
     ply_path = os.path.join(output_dir, "initial_3d_gaussians.ply")
@@ -514,6 +691,146 @@ def perform_initial_reconstruction(
     
     return results
 
+def process_remaining_source_gaussians(
+    reconstruction_data: Dict, 
+    args,
+    device: torch.device = None
+) -> int:
+    """最後に残った未処理の湧出ガウスを処理する
+    
+    主に初期ペアのうち、referenceとして使われなかった方の画像の湧出ガウスを処理する
+    
+    Args:
+        reconstruction_data: 再構成データ辞書
+        args: コマンドライン引数
+        device: 計算デバイス
+        
+    Returns:
+        int: 処理されたガウスの数
+    """
+    if "source_gaussians_data" not in reconstruction_data:
+        print("No source gaussians data available.")
+        return 0
+    
+    # 未処理の湧出ガウスをカウント
+    unprocessed_count = 0
+    source_gaussians_data = reconstruction_data["source_gaussians_data"]
+    
+    # 各カメラごとの未処理湧出ガウス数を確認
+    cam_unprocessed = {}
+    for key, data in source_gaussians_data.items():
+        if not key.startswith('source_gaussians') or 'indices' not in data:
+            continue
+        
+        cam_idx = int(key.replace('source_gaussians', '').replace('_data', '')) - 1
+        
+        if 'processed' in data:
+            unproc_count = np.sum(~data['processed'])
+        else:
+            unproc_count = len(data['indices'])
+            
+        if unproc_count > 0:
+            cam_unprocessed[cam_idx] = unproc_count
+            unprocessed_count += unproc_count
+    
+    if unprocessed_count == 0:
+        print("No unprocessed source gaussians found.")
+        return 0
+    
+    print(f"Found {unprocessed_count} unprocessed source gaussians from cameras: {list(cam_unprocessed.keys())}")
+    
+    # 初期ペアの情報を取得
+    if len(reconstruction_data.get('used_images', [])) < 2:
+        print("Not enough images to identify initial pair.")
+        return 0
+    
+    initial_pair = reconstruction_data['used_images'][:2]
+    print(f"Initial image pair: {initial_pair}")
+    
+    # カメラパラメータ情報を取得
+    camera_params_list = reconstruction_data["camera_params_list"]
+    if len(camera_params_list) < 2:
+        print("Not enough camera parameters available.")
+        return 0
+    
+    # カメラ内部パラメータを取得
+    K = reconstruction_data.get("K", None)
+    if K is None:
+        K = reconstruction_data.get("camera1_K", None)
+    
+    if K is None:
+        print("Camera intrinsics not found.")
+        return 0
+    
+    # 最初の視点拡張で使われたreferenceカメラを特定
+    # 通常0番のカメラ（初期ペアの1枚目）
+    reference_cam_idx = 0
+    
+    # もう片方のカメラインデックス
+    other_cam_idx = 1
+    
+    # 処理するカメラを選択→主に初期ペアのうち、referenceとして使われなかった方のカメラ
+    target_cam_idx = other_cam_idx if other_cam_idx in cam_unprocessed else None
+    
+    if target_cam_idx is None:
+        print("No unprocessed source gaussians from non-reference initial camera.")
+        return 0
+    
+    print(f"Processing unprocessed source gaussians from camera {target_cam_idx} (initial pair)")
+    
+    # もう片方の画像のガウスをロード
+    ref_image = initial_pair[reference_cam_idx]
+    ref_gaussians_path = os.path.join(
+        args.fitted_gaussians_dir, 
+        f"{ref_image.split('.')[0]}_fitted_gaussians.pkl"
+    )
+    
+    
+    _, ref_2d_gaussians, _, _ = load_gaussians_torch(ref_gaussians_path, device=device)
+    
+    # ViewpointExtenderを使用して三角測量
+    from src.reconstructor.viewpoint_extender import ViewpointExtender
+    extender = ViewpointExtender(
+        existing_3d_gaussians=reconstruction_data["existing_3d_gaussians"],
+        camera_params_list=camera_params_list,
+        K_new=K,
+        reference_camera_idx=reference_cam_idx,
+        device=device,
+        source_gaussians_data=source_gaussians_data
+    )
+    
+    # 三角測量実行
+    processed = extender.triangulate_source_gaussians(
+        source_camera_idx=target_cam_idx,
+        new_image_2d_gaussians=ref_2d_gaussians,
+        target_volume=args.target_volume,
+        correspondence_threshold=1e-6 
+    )
+    
+    # 結果を更新
+    reconstruction_data["existing_3d_gaussians"] = extender.existing_3d_gaussians
+    reconstruction_data["source_gaussians_data"] = extender.source_gaussians_data
+    
+    if processed > 0:
+        # points_3d, covariances_3d, color_3d, alpha_3dを更新
+        points_3d, covariances_3d, colors_3d, alphas_3d = [], [], [], []
+        for gauss in reconstruction_data["existing_3d_gaussians"]:
+            points_3d.append(gauss["center"])
+            covariances_3d.append(gauss["covariance"])
+            colors_3d.append(gauss["color"])
+            alphas_3d.append(gauss["alpha"])
+        
+        reconstruction_data["points_3d"] = np.array(points_3d)
+        reconstruction_data["covariances_3d"] = np.array(covariances_3d)
+        reconstruction_data["color_3d"] = np.array(colors_3d)
+        reconstruction_data["alpha_3d"] = np.array(alphas_3d)
+        
+        print(f"Successfully processed {processed} source gaussians from non-reference initial camera")
+        return processed
+    else:
+        print("No source gaussians could be processed")
+        return 0
+
 def select_reference_camera(camera_params_list):
     """視点拡張時の参照カメラを選択する
     
@@ -575,7 +892,7 @@ def add_new_viewpoint(
     # Get source Gaussians data
     source_gaussians_data = reconstruction_data.get("source_gaussians_data", {})
     used_images = reconstruction_data.get("used_images", [])
-    reference_camera_idx = select_reference_camera(camera_params_list, used_images)
+    reference_camera_idx = select_reference_camera(camera_params_list)
     print(f"Using camera {reference_camera_idx} as reference for new viewpoint")
     
     # Initialize ViewpointExtender
@@ -813,6 +1130,36 @@ def run_complete_pipeline(args):
         print(f"Elapsed time: {elapsed_time:.2f} seconds")
         print(f"Estimated time remaining: {estimated_remaining:.2f} seconds")
     
+    print("\n--- Processing Remaining Source Gaussians ---")
+    processed_count = process_remaining_source_gaussians(
+        reconstruction_data, 
+        args,
+        device=device
+    )
+    if processed_count > 0:
+        print(f"Successfully processed {processed_count} remaining source gaussians")
+    else:
+        print("No remaining source gaussians to process or processing failed")
+
+    # 残りの未処理ガウス数を確認（通常0になっているはず）
+    unprocessed_count = 0
+    if "source_gaussians_data" in reconstruction_data:
+        for key, data in reconstruction_data["source_gaussians_data"].items():
+            if not key.startswith('source_gaussians') or 'indices' not in data:
+                continue
+            
+            if 'processed' in data:
+                unproc_count = np.sum(~data['processed'])
+                if unproc_count > 0:
+                    print(f"{key}: {unproc_count} gaussians still unprocessed")
+                    unprocessed_count += unproc_count
+
+    if unprocessed_count > 0:
+        print(f"Warning: {unprocessed_count} source gaussians remain unprocessed")
+        print("These are likely gaussians that failed in covariance optimization")
+    else:
+        print("All source gaussians have been processed successfully")
+    
     # Final results
     final_output_dir = os.path.join(args.output_dir, "final")
     os.makedirs(final_output_dir, exist_ok=True)
@@ -880,9 +1227,6 @@ def run_complete_pipeline(args):
     colmap_output_dir = os.path.join(final_output_dir, "colmap")
     os.makedirs(colmap_output_dir, exist_ok=True)
 
-    from src.optimizer.observation_builder import ObservationBuilder
-    from src.optimizer.bundle_adjuster import BundleAdjuster
-
     # 観測データの構築
     observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
     match_points_2d = ObservationBuilder.convert_to_match_points_2d(
@@ -902,13 +1246,15 @@ def run_complete_pipeline(args):
         else:
             # Fallback
             intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
-
-    # Bundle Adjusterを初期化（最適化せずエクスポートのみ）
+            
+    # 画像名をBundleAdjusterに渡す
+    image_names = reconstruction_data.get("used_images")
     ba = BundleAdjuster(
         points_3d=reconstruction_data["points_3d"],
         camera_params_list=reconstruction_data["camera_params_list"],
         match_points_2d=match_points_2d,
         intrinsics_list=intrinsics_list,
+        image_names=image_names,  
         use_robust_loss=True,
         loss_scale=1.0
     )
@@ -916,7 +1262,17 @@ def run_complete_pipeline(args):
     # COLMAPフォーマットにエクスポート
     ba.export_colmap_format(colmap_output_dir)
     print(f"Exported reconstruction to COLMAP format in {colmap_output_dir}")
-    
+
+    export_gaussians_to_colmap_dir(
+        colmap_dir=colmap_output_dir,
+        points_3d=reconstruction_data["points_3d"],
+        covariances_3d=reconstruction_data["covariances_3d"],
+        colors_3d=reconstruction_data["color_3d"],
+        alphas_3d=reconstruction_data["alpha_3d"],
+        quaternions=reconstruction_data.get("quaternions"),
+        scales=reconstruction_data.get("scales")
+    )
+
     # Save final results
     final_results_path = os.path.join(final_output_dir, "final_reconstruction.pkl")
     with open(final_results_path, 'wb') as f:

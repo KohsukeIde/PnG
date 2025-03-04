@@ -272,11 +272,11 @@ class BundleAdjuster:
                         qy = (rot_mat[1, 2] + rot_mat[2, 1]) / s
                         qz = 0.25 * s
                 
-                # Use provided image name if available, otherwise use generic name
+                # Use provided image name if available, otherwise raise an error
                 if self.image_names and i < len(self.image_names):
                     image_name = self.image_names[i]
                 else:
-                    image_name = f"image_{i+1:06d}.jpg"
+                    raise ValueError(f"Image name not provided for camera {i+1}. Please provide image_names parameter with names for all cameras.")
                 
                 # Write image info
                 f.write(f"{i+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} {i+1} {image_name}\n")
