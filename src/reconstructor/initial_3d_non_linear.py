@@ -242,6 +242,28 @@ class Initial3DReconstructor:
         row_sums = transport_matrix.sum(axis=1)  # 第1画像の各ガウスに対する総輸送量
         col_sums = transport_matrix.sum(axis=0)  # 第2画像の各ガウスに対する総輸送量
         
+        # Auto threshold
+        if auto_threshold:
+            # 行和と列和の平均を計算
+            mean_row = np.mean(row_sums)
+            mean_col = np.mean(col_sums)
+            
+            # 統計情報を表示
+            print(f"Row sums statistics: Mean={mean_row:.4f}")
+            print(f"Column sums statistics: Mean={mean_col:.4f}")
+            
+            # 平均未満のガウスをすべてソースガウスとして特定
+            self.source_gaussians1 = np.where(row_sums < mean_row)[0]
+            self.source_gaussians2 = np.where(col_sums < mean_col)[0]
+            
+            print(f"Using mean as threshold: Row={mean_row:.4f}, Col={mean_col:.4f}")
+        else:
+            # 手動指定の閾値を使用
+            self.source_gaussians1 = np.where(row_sums < threshold)[0]
+            self.source_gaussians2 = np.where(col_sums < threshold)[0]
+        
+        # 以前の実装（
+        """
         # Autot threshold
         if auto_threshold:
             # 行和の統計
@@ -278,6 +300,7 @@ class Initial3DReconstructor:
         # 閾値以下の行/列インデックスを湧出ガウスとして特定
         self.source_gaussians1 = np.where(row_sums < threshold_row)[0]
         self.source_gaussians2 = np.where(col_sums < threshold_col)[0]
+        """
         
         print(f"Identified {len(self.source_gaussians1)} source gaussians in image 1")
         print(f"Identified {len(self.source_gaussians2)} source gaussians in image 2")
@@ -560,8 +583,6 @@ class Initial3DReconstructor:
 
         # 初期化
         num_3d = self.points_3d.shape[0]
-        self.quaternions = []  
-        self.scales = []       
         
         # None値を格納できるようにリスト作成　（最適化失敗時に使用）
         covariances_3d_list = [None] * num_3d
@@ -648,14 +669,16 @@ class Initial3DReconstructor:
         )
         
         covariances_3d_list = []
+        quaternions_list = []  
+        scales_list = []     
         valid_indices = []
         failed_indices = []
         
-        for idx, (cov3_, qq_, ss_, success) in enumerate(results):
-            if success:
-                covariances_3d_list.append(cov3_)
-                self.quaternions.append(qq_)  
-                self.scales.append(ss_)      
+        for idx, result in enumerate(results):
+            if result[3]:  # 最適化が成功
+                covariances_3d_list.append(result[0])
+                quaternions_list.append(result[1])  # 四元数を保存
+                scales_list.append(result[2])       # スケールを保存
                 valid_indices.append(idx)
             else:
                 failed_indices.append(idx)
@@ -668,6 +691,7 @@ class Initial3DReconstructor:
             print("Warning: No valid Gaussians after covariance optimization.")
             self.points_3d = np.zeros((0, 3), dtype=np.float64)
             self.covariances_3d = np.zeros((0, 3, 3), dtype=np.float64)
+            # 空の四元数とスケール配列を初期化（重要な修正点）
             self.quaternions = np.zeros((0, 4), dtype=np.float64)
             self.scales = np.zeros((0, 3), dtype=np.float64)
             # match_pairsなども更新
@@ -681,13 +705,9 @@ class Initial3DReconstructor:
         self.points_3d = self.points_3d[valid_indices]
         self.covariances_3d = np.array(covariances_3d_list)
         
-        # 共分散行列と一緒に四元数とスケールも配列に変換
-        if len(valid_indices) > 0:
-            self.quaternions = np.array(self.quaternions)
-            self.scales = np.array(self.scales)
-        else:
-            self.quaternions = np.zeros((0, 4), dtype=np.float64)
-            self.scales = np.zeros((0, 3), dtype=np.float64)
+        # 四元数とスケールを明示的に保存
+        self.quaternions = np.array(quaternions_list)
+        self.scales = np.array(scales_list)
         
         # match_pairsも更新
         if self.match_pairs:
@@ -699,6 +719,9 @@ class Initial3DReconstructor:
 
         print(f"Finished LM optimization: {len(valid_indices)} valid Gaussians out of {num_3d} total.")
         print(f"Added {len(failed_indices)} Gaussians to source collections for future evaluation.")
+
+        print(f"After covariance computation: quaternions shape = {self.quaternions.shape if hasattr(self, 'quaternions') else 'None'}")
+        print(f"After covariance computation: scales shape = {self.scales.shape if hasattr(self, 'scales') else 'None'}")
 
     def _add_failed_gaussians_to_sources(self, failed_indices: List[int]) -> None:
         """Cov計算に失敗したガウスを湧出ガウスとして追加"""
