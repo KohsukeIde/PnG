@@ -1,6 +1,8 @@
 import os
-import matplotlib.pyplot as plt
+import sys
+import argparse
 import numpy as np
+import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -94,7 +96,7 @@ def read_images_txt(images_txt_path):
                 q = np.array([qw, qx, qy, qz])
                 q = q / np.linalg.norm(q)  # Normalize
                 
-                # Quaternion to rotation matrix
+                # Quaternion to rotation matrix (world-to-camera rotation)
                 R = np.zeros((3, 3))
                 R[0, 0] = 1 - 2 * (q[2]**2 + q[3]**2)
                 R[0, 1] = 2 * (q[1] * q[2] - q[3] * q[0])
@@ -106,12 +108,18 @@ def read_images_txt(images_txt_path):
                 R[2, 1] = 2 * (q[2] * q[3] + q[1] * q[0])
                 R[2, 2] = 1 - 2 * (q[1]**2 + q[2]**2)
                 
-                # Construct extrinsic matrix (camera to world)
+                # 並進ベクトル (world-to-camera translation)
                 t = np.array([tx, ty, tz]).reshape(3, 1)
-                extrinsic = np.zeros((4, 4))
-                extrinsic[:3, :3] = R
-                extrinsic[:3, 3] = t.flatten()
-                extrinsic[3, 3] = 1.0
+                
+                # カメラ中心座標（ワールド座標系）を計算
+                # C = -R.T @ t が正しいカメラ中心
+                C = -R.T @ t
+                
+                # Construct camera-to-world transformation
+                # COLMAPのカメラ座標系は右手系：Z軸が前方向き
+                extrinsic = np.eye(4)
+                extrinsic[:3, :3] = R.T  # camera-to-worldの回転
+                extrinsic[:3, 3] = C.flatten()  # カメラの中心位置
                 
                 cameras.append({
                     'image_id': image_id,
@@ -119,31 +127,142 @@ def read_images_txt(images_txt_path):
                     'name': image_name,
                     'extrinsic': extrinsic,
                     'quaternion': q,
-                    'position': t.flatten()
+                    'position': C.flatten(),  # カメラ中心
+                    'R': R,  # 回転行列
+                    't': t.flatten()  # 並進ベクトル
                 })
             
             is_camera_line = not is_camera_line
     
     return cameras
 
-def visualize_cameras(cameras, scene_bounds=None, use_plotly=False):
+def read_points3D_txt(points3D_txt_path):
     """
-    Visualize cameras using CameraPoseVisualizer
+    Read 3D points from COLMAP's points3D.txt file
+    
+    Returns:
+        points: Nx3 array of 3D point positions
+        colors: Nx3 array of RGB colors (0-255)
+    """
+    points = []
+    colors = []
+    
+    with open(points3D_txt_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            elements = line.split()
+            # POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)
+            point_id = int(elements[0])
+            x, y, z = map(float, elements[1:4])
+            r, g, b = map(int, elements[4:7])
+            
+            points.append([x, y, z])
+            colors.append([r, g, b])
+    
+    return np.array(points), np.array(colors)
+
+def read_points3D_bin(points3D_bin_path):
+    """
+    Read 3D points from COLMAP's points3D.bin file
+    
+    Returns:
+        points: Nx3 array of 3D point positions
+        colors: Nx3 array of RGB colors (0-255)
+    """
+    import struct
+    
+    points = []
+    colors = []
+    
+    with open(points3D_bin_path, 'rb') as f:
+        # Read number of points
+        num_points = struct.unpack('Q', f.read(8))[0]
+        
+        # Define data structure
+        point_data_struct = struct.Struct('<Q 3d 3B d Q')
+        
+        for i in range(num_points):
+            data = point_data_struct.unpack(f.read(point_data_struct.size))
+            point_id = data[0]
+            x, y, z = data[1:4]
+            r, g, b = data[4:7]
+            
+            points.append([x, y, z])
+            colors.append([r, g, b])
+            
+            # Skip track information
+            track_len = data[8]
+            f.seek(track_len * 2 * 4, os.SEEK_CUR)  # 2 uint32 per track element
+    
+    return np.array(points), np.array(colors)
+
+def read_points3D(points3D_path):
+    """
+    Read 3D points from COLMAP's points3D file (either .txt or .bin)
+    """
+    if points3D_path.endswith('.txt'):
+        return read_points3D_txt(points3D_path)
+    elif points3D_path.endswith('.bin'):
+        return read_points3D_bin(points3D_path)
+    else:
+        raise ValueError("Points3D file must have .txt or .bin extension")
+
+def visualize_cameras_and_points(cameras, points=None, colors=None, scene_bounds=None, use_plotly=True, max_points=50000, focal_len=5, aspect_ratio=0.3):
+    """
+    Visualize cameras and optionally points using CameraPoseVisualizer
     
     Args:
         cameras: List of camera dictionaries from read_images_txt
+        points: Nx3 array of 3D point positions
+        colors: Nx3 array of RGB colors (0-255)
         scene_bounds: Tuple of (min_bound, max_bound) for x, y, z
         use_plotly: Whether to use plotly for interactive visualization
+        max_points: Maximum number of points to display
+        focal_len: Focal length for camera visualization
+        aspect_ratio: Aspect ratio for camera visualization
     """
+    # Calculate camera positions
+    camera_positions = np.array([cam['position'] for cam in cameras])
+    
     # Calculate scene bounds if not provided
     if scene_bounds is None:
-        positions = np.array([cam['position'] for cam in cameras])
-        center = positions.mean(axis=0)
-        max_dist = np.max(np.linalg.norm(positions - center, axis=1))
+        # Calculate frustum vertices for all cameras
+        all_vertices = []
+        for cam in cameras:
+            # Create standard frustum vertices
+            vertex_std = np.array([
+                [0, 0, 0, 1],  # Camera center
+                [focal_len * aspect_ratio, -focal_len * aspect_ratio, focal_len, 1],  # Top-right
+                [focal_len * aspect_ratio, focal_len * aspect_ratio, focal_len, 1],   # Top-left
+                [-focal_len * aspect_ratio, focal_len * aspect_ratio, focal_len, 1],  # Bottom-left
+                [-focal_len * aspect_ratio, -focal_len * aspect_ratio, focal_len, 1]  # Bottom-right
+            ])
+            
+            # Transform vertices to world space
+            vertex_transformed = vertex_std @ cam['extrinsic'].T
+            
+            # Add to list of all vertices (excluding homogeneous coordinate)
+            all_vertices.extend([v[:-1] for v in vertex_transformed])
+        
+        # Convert to numpy array
+        all_vertices = np.array(all_vertices)
+        
+        # Combine camera positions and frustum vertices
+        all_points = np.vstack([camera_positions, all_vertices])
+        
+        # Calculate center and extent
+        center = all_points.mean(axis=0)
+        distances = np.linalg.norm(all_points - center, axis=1)
+        max_dist = np.max(distances)
+        
+        # Make the bounds a bit larger to ensure all frustums are visible
         scene_bounds = (
-            [-max_dist*10, max_dist*10],
-            [-max_dist*10, max_dist*10],
-            [-max_dist*10, max_dist*10]
+            [center[0] - max_dist*1.2, center[0] + max_dist*1.2],
+            [center[1] - max_dist*1.2, center[1] + max_dist*1.2],
+            [center[2] - max_dist*1.2, center[2] + max_dist*1.2]
         )
     
     # Initialize visualizer
@@ -151,7 +270,7 @@ def visualize_cameras(cameras, scene_bounds=None, use_plotly=False):
         scene_bounds[0], scene_bounds[1], scene_bounds[2]
     )
     
-    # Add cameras to visualizer
+    # For plotly visualization
     if use_plotly:
         final_layout = go.Figure()
         final_layout.update_layout(
@@ -159,34 +278,80 @@ def visualize_cameras(cameras, scene_bounds=None, use_plotly=False):
                 xaxis=dict(nticks=4, range=scene_bounds[0]),
                 yaxis=dict(nticks=4, range=scene_bounds[1]),
                 zaxis=dict(nticks=4, range=scene_bounds[2]),
+                aspectmode='data'
             ),
-            legend=dict(x=0.7, y=0.5, font=dict(color='black', size=5))
+            title='Camera and Point Cloud Visualization',
+            legend=dict(x=0.8, y=0.5, font=dict(color='black', size=12))
         )
     
     # Add each camera
     for i, cam in enumerate(cameras):
-        color_val = i / len(cameras)
+        color_val = i / max(1, len(cameras) - 1)  # Avoid division by zero
         visualizer.extrinsic2pyramid(
             cam['extrinsic'], 
             color_map=color_val,
-            focal_len_scaled=3,
-            aspect_ratio=0.3,
+            focal_len_scaled=focal_len,
+            aspect_ratio=aspect_ratio,
             plotly_viz=use_plotly,
-            legend_group=f"Camera {i+1}",
-            name=cam['name'],
+            legend_group=f"Camera",
+            name=f"Camera {i+1}: {cam['name']}",
             show_legend=(i == 0)  # Only show legend for first camera
         )
         
         if use_plotly:
             final_layout.add_trace(visualizer.plotly_data)
     
-    # Add point cloud if available (commented out as it requires points3D data)
-    # if points3D is not None:
-    #     # Add points as scatter
-    #     ax.scatter(
-    #         points3D[:, 0], points3D[:, 1], points3D[:, 2],
-    #         c='gray', alpha=0.3, s=1
-    #     )
+    # Add point cloud if available
+    if points is not None and len(points) > 0:
+        # Subsample points if there are too many
+        if len(points) > max_points:
+            print(f"Subsampling point cloud from {len(points)} to {max_points} points")
+            indices = np.random.choice(len(points), max_points, replace=False)
+            points_subset = points[indices]
+            colors_subset = colors[indices] if colors is not None else None
+        else:
+            points_subset = points
+            colors_subset = colors
+        
+        if use_plotly:
+            # Prepare colors for plotting
+            point_colors = colors_subset
+            if colors_subset is None:
+                point_colors = np.ones((len(points_subset), 3)) * np.array([255, 0, 0])  # Red color
+            
+            # Convert RGB (0-255) to hex color strings for Plotly
+            point_colors_hex = [f'rgb({r},{g},{b})' for r, g, b in point_colors]
+            
+            # Add scatter3d trace for points
+            final_layout.add_trace(
+                go.Scatter3d(
+                    x=points_subset[:, 0],
+                    y=points_subset[:, 1],
+                    z=points_subset[:, 2],
+                    mode='markers',
+                    marker=dict(
+                        size=1.5,
+                        color=point_colors_hex,
+                        opacity=0.7
+                    ),
+                    name='3D Points',
+                    showlegend=True
+                )
+            )
+        else:
+            # Matplotlib version
+            point_colors = colors_subset
+            if colors_subset is None:
+                point_colors = np.ones((len(points_subset), 3)) * np.array([1.0, 0.0, 0.0])  # Red color (already in 0-1 range)
+            else:
+                # Normalize to 0-1 range for matplotlib
+                point_colors = point_colors.astype(float) / 255.0
+            
+            # Add scatter plot
+            visualizer.ax.scatter(
+                points_subset[:, 0], points_subset[:, 1], points_subset[:, 2],
+                c=point_colors, s=0.5, alpha=0.5
+            )
     
     # Show visualization
     if use_plotly:
@@ -196,20 +361,47 @@ def visualize_cameras(cameras, scene_bounds=None, use_plotly=False):
         visualizer.show()
 
 def main():
-    # Path to COLMAP images.txt file
-    images_txt_path = "/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/images_correct.txt"
+    parser = argparse.ArgumentParser(description='Visualize COLMAP camera poses and 3D points')
+    parser.add_argument('--images', type=str, required=True, help='Path to COLMAP images.txt file')
+    parser.add_argument('--points', type=str, default=None, help='Path to COLMAP points3D.txt or points3D.bin file')
+    parser.add_argument('--plotly', action='store_true', default=True, help='Use Plotly for interactive visualization')
+    parser.add_argument('--max_points', type=int, default=50000, help='Maximum number of points to display')
+    parser.add_argument('--focal_len', type=float, default=2, help='Focal length for camera visualization')
+    parser.add_argument('--aspect_ratio', type=float, default=0.1, help='Aspect ratio for camera visualization')
     
-    # images_txt_path = "/Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt"
+    args = parser.parse_args()
     
     # Read camera poses
-    cameras = read_images_txt(images_txt_path)
-    print(f"Loaded {len(cameras)} cameras from {images_txt_path}")
+    cameras = read_images_txt(args.images)
+    print(f"Loaded {len(cameras)} cameras from {args.images}")
     
-    # Optional: Read points3D.txt to visualize point cloud
-    # points3D = read_points3D_txt("path/to/your/colmap/points3D.txt")
+    points = None
+    colors = None
     
-    # Visualize cameras
-    visualize_cameras(cameras, use_plotly=True)  # Set use_plotly=False for matplotlib
+    # Read points if path is provided
+    if args.points:
+        try:
+            points, colors = read_points3D(args.points)
+            print(f"Loaded {len(points)} points from {args.points}")
+        except Exception as e:
+            print(f"Error loading points: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Visualize cameras and points
+    visualize_cameras_and_points(
+        cameras, 
+        points, 
+        colors, 
+        use_plotly=args.plotly,
+        max_points=args.max_points,
+        focal_len=args.focal_len,
+        aspect_ratio=args.aspect_ratio
+    )
     
 if __name__ == "__main__":
     main()
+    
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
+
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/images_correct.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/points3D.txt
