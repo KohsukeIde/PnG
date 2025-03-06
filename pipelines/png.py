@@ -231,7 +231,6 @@ def export_gaussians_to_colmap_dir(
         quaternions: 四元数 [N, 4] (オプション)
         scales: スケール [N, 3] (オプション)
     """
-    from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_gaussians_as_ply
     
     # 完全なガウシアン情報を含むPLYファイル
     ply_ellipsoids_path = os.path.join(colmap_dir, "gaussians_ellipsoids.ply")
@@ -1223,7 +1222,7 @@ def run_complete_pipeline(args):
     )
     print(f"Saved Gaussian Splatting initialization data to {gs_ply_path}")
 
-    # COLMAP形式でのエクスポート
+    # COLMAPフォーマットでのエクスポート
     colmap_output_dir = os.path.join(final_output_dir, "colmap")
     os.makedirs(colmap_output_dir, exist_ok=True)
 
@@ -1233,6 +1232,10 @@ def run_complete_pipeline(args):
         observation_map, 
         len(reconstruction_data["camera_params_list"])
     )
+
+    # 実際の画像名を取得
+    image_names = reconstruction_data.get("used_images", [])
+    print(f"Using image names: {image_names}")
 
     # 内部パラメータリストを構築
     intrinsics_list = []
@@ -1247,14 +1250,13 @@ def run_complete_pipeline(args):
             # Fallback
             intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
             
-    # 画像名をBundleAdjusterに渡す
-    image_names = reconstruction_data.get("used_images")
+    # Bundle Adjusterを初期化
     ba = BundleAdjuster(
         points_3d=reconstruction_data["points_3d"],
         camera_params_list=reconstruction_data["camera_params_list"],
         match_points_2d=match_points_2d,
         intrinsics_list=intrinsics_list,
-        image_names=image_names,  
+        image_names=image_names, 
         use_robust_loss=True,
         loss_scale=1.0
     )
