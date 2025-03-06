@@ -46,14 +46,29 @@ class CameraPoseVisualizer:
             self.plotly_data = self.draw_interactive(meshes=meshes, color=color, legend_group=legend_group, name=name, show_legend=show_legend)
 
     def draw_interactive(self, meshes, color, legend_group, name, show_legend):
-
         x = [polygon[0] for vertice in meshes for polygon in vertice]
         y = [polygon[1] for vertice in meshes for polygon in vertice]
         z = [polygon[2] for vertice in meshes for polygon in vertice]
 
-        data = go.Mesh3d(x=x, y=y, z=z, opacity=1, color=color, showlegend=show_legend, legendgroup=legend_group, name=name)
+        # Extract camera position (first vertex is camera center)
+        camera_pos = meshes[0][0]  # This is the camera center
+
+        data = go.Mesh3d(
+            x=x, 
+            y=y, 
+            z=z, 
+            opacity=0.7,
+            color=color, 
+            showlegend=show_legend, 
+            legendgroup=legend_group, 
+            name=name,
+            hoverinfo='text',
+            hovertext=f"{name}<br>Position: ({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f})",
+            hoverlabel=dict(bgcolor='white', font_size=12)
+        )
 
         return data
+
     def customize_legend(self, list_label):
         list_handle = []
         for idx, label in enumerate(list_label):
@@ -287,15 +302,19 @@ def visualize_cameras_and_points(cameras, points=None, colors=None, scene_bounds
     # Add each camera
     for i, cam in enumerate(cameras):
         color_val = i / max(1, len(cameras) - 1)  # Avoid division by zero
+        
+        # Create a more informative name for the camera
+        camera_name = f"Camera {i+1}: {cam['name']}"
+        
         visualizer.extrinsic2pyramid(
             cam['extrinsic'], 
             color_map=color_val,
             focal_len_scaled=focal_len,
             aspect_ratio=aspect_ratio,
             plotly_viz=use_plotly,
-            legend_group=f"Camera",
-            name=f"Camera {i+1}: {cam['name']}",
-            show_legend=(i == 0)  # Only show legend for first camera
+            legend_group="Cameras",  # Group all cameras together
+            name=camera_name,  # Use the camera name
+            show_legend=True  # Show all cameras in legend
         )
         
         if use_plotly:
@@ -355,6 +374,47 @@ def visualize_cameras_and_points(cameras, points=None, colors=None, scene_bounds
     
     # Show visualization
     if use_plotly:
+        # Create camera selection buttons
+        camera_buttons = []
+        for i, cam in enumerate(cameras):
+            camera_buttons.append(
+                dict(
+                    method="update",
+                    args=[
+                        {"visible": [j == i for j in range(len(cameras))] + [True] * (1 if points is not None else 0)},
+                        {"title": f"Camera {i+1}: {cam['name']}"}
+                    ],
+                    label=f"Camera {i+1}"
+                )
+            )
+        
+        # Add "Show All" button
+        camera_buttons.append(
+            dict(
+                method="update",
+                args=[
+                    {"visible": [True] * (len(cameras) + (1 if points is not None else 0))},
+                    {"title": "All Cameras"}
+                ],
+                label="Show All"
+            )
+        )
+        
+        # Add buttons to layout
+        final_layout.update_layout(
+            updatemenus=[
+                dict(
+                    type="dropdown",
+                    direction="down",
+                    buttons=camera_buttons,
+                    showactive=True,
+                    x=0.1,
+                    y=1.15,
+                    xanchor="left",
+                    yanchor="top"
+                )
+            ]
+        )
         final_layout.show()
     else:
         visualizer.colorbar(len(cameras))
@@ -401,7 +461,7 @@ def main():
     
 if __name__ == "__main__":
     main()
-    
+
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
 
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/images_correct.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/points3D.txt
