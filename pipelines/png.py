@@ -1,6 +1,5 @@
 import os
 import sys
-import traceback
 import argparse
 import pickle
 import glob
@@ -9,8 +8,8 @@ import time
 
 import numpy as np
 import torch
-import cv2
 from tqdm import tqdm
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Add project root to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +26,10 @@ from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_co
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from utils.gs_pkl_loader import load_gaussians_torch
 from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_gaussians_as_ply
+from utils.export.export_utils import (
+    export_colmap_format,
+    export_gaussians_to_colmap_dir
+)
 from src.optimizer.bundle_adjuster import BundleAdjuster
 from src.optimizer.observation_builder import ObservationBuilder
 
@@ -101,8 +104,14 @@ def parse_args():
     parser.add_argument(
         "--target_volume",
         type=float,
-        default=1.0,
-        help="Target volume for 3D Gaussians"
+        default=None,
+        help="Target volume for 3D Gaussians (None for automatic calculation)"
+    )
+    parser.add_argument(
+        "--auto_target_volume",
+        action="store_true",
+        default=True,
+        help="Automatically calculate target volume based on image properties"
     )
     parser.add_argument(
         "--auto_threshold", 
@@ -124,7 +133,7 @@ def parse_args():
     parser.add_argument(
         "--ba_iterations",
         type=int,
-        default=3,
+        default=5,
         help="Maximum iterations for Bundle Adjustment"
     )
     parser.add_argument(
@@ -177,122 +186,6 @@ def parse_args():
     )
     
     return parser.parse_args()
-
-def export_gaussians_to_numpy(
-    output_path: str,
-    points_3d: np.ndarray,
-    covariances_3d: np.ndarray,
-    colors_3d: np.ndarray,
-    alphas_3d: np.ndarray,
-    quaternions: np.ndarray,
-    scales: np.ndarray
-) -> None:
-    """Gaussian Splattingの初期値として使用できるnumpy形式でガウシアン情報を保存
-    
-    Args:
-        output_path: 出力ファイルパス (.npy)
-        points_3d: 3D点の位置 [N, 3]
-        covariances_3d: 3D共分散行列 [N, 3, 3]
-        colors_3d: RGB色 [N, 3]
-        alphas_3d: 不透明度 [N]
-        quaternions: 四元数 [N, 4]
-        scales: スケール [N, 3]
-    """
-    N = len(points_3d)
-    
-    # SH係数を設定 (0次のみ)
-    sh_deg = 0
-    sh_dim = (sh_deg + 1) ** 2
-    sh_coeffs = np.zeros((N, sh_dim, 3), dtype=np.float32)
-    sh_coeffs[:, 0, :] = colors_3d
-
-    # データ構造
-    gs_data = {
-        'xyz': points_3d.astype(np.float32),
-        'quaternions': quaternions.astype(np.float32),
-        'scales': scales.astype(np.float32),
-        'opacities': alphas_3d.astype(np.float32),
-        'sh_coeffs': sh_coeffs,
-        'covariances': covariances_3d.astype(np.float32)
-    }
-    
-    # 保存
-    np.save(output_path, gs_data)
-    print(f"Saved Gaussian Splatting numpy data to {output_path}")
-    
-    # メタデータファイル
-    meta_path = output_path.replace('.npy', '_meta.txt')
-    with open(meta_path, 'w') as f:
-        f.write(f"Total Gaussians: {N}\n")
-        f.write(f"SH degree: {sh_deg}\n")
-        f.write(f"Data format: xyz, quaternions, scales, opacities, sh_coeffs, covariances\n")
-        f.write(f"xyz shape: {points_3d.shape}\n")
-        f.write(f"quaternions shape: {quaternions.shape}\n")
-        f.write(f"scales shape: {scales.shape}\n")
-        f.write(f"opacities shape: {alphas_3d.shape}\n")
-        f.write(f"sh_coeffs shape: {sh_coeffs.shape}\n")
-        f.write(f"covariances shape: {covariances_3d.shape}\n")
-    
-    print(f"Saved metadata to {meta_path}")
-    
-def export_gaussians_to_colmap_dir(
-    colmap_dir: str,
-    points_3d: np.ndarray,
-    covariances_3d: np.ndarray,
-    colors_3d: np.ndarray,
-    alphas_3d: np.ndarray,
-    quaternions: np.ndarray,
-    scales: np.ndarray
-) -> None:
-    """COLMAPディレクトリにGS情報を含むファイルをエクスポート
-    
-    Args:
-        colmap_dir: COLMAPディレクトリのパス
-        points_3d: 3D点の位置 [N, 3]
-        covariances_3d: 3D共分散行列 [N, 3, 3]
-        colors_3d: RGB色 [N, 3]
-        alphas_3d: 不透明度 [N]
-        quaternions: 四元数 [N, 4]
-        scales: スケール [N, 3]
-    """
-    N = len(points_3d)
-    
-    # GS情報を含むPLYファイル
-    ply_ellipsoids_path = os.path.join(colmap_dir, "gaussians_ellipsoids.ply")
-    save_ellipsoids_as_ply(
-        points_3d=points_3d,
-        covariances_3d=covariances_3d,
-        colors_3d=colors_3d,
-        alphas_3d=alphas_3d,
-        filename=ply_ellipsoids_path,
-        use_alpha=True
-    )
-    print(f"Saved ellipsoids with full Gaussian information to {ply_ellipsoids_path}")
-    
-    # Gaussian Splattingの初期値として使用できる形式のPLYファイル
-    ply_gs_path = os.path.join(colmap_dir, "gaussians_splat.ply")
-    
-    save_gaussians_as_ply(
-        points_3d=points_3d,
-        quaternions=quaternions,
-        scales=scales,
-        colors_3d=colors_3d,
-        alphas_3d=alphas_3d,
-        filename=ply_gs_path
-    )
-    print(f"Saved Gaussian Splatting PLY format to {ply_gs_path}")
-    
-    # Numpy形式でガウシアン情報を保存
-    numpy_path = os.path.join(colmap_dir, "gaussians.npy")
-    export_gaussians_to_numpy(
-        output_path=numpy_path,
-        points_3d=points_3d,
-        covariances_3d=covariances_3d,
-        colors_3d=colors_3d,
-        alphas_3d=alphas_3d,
-        quaternions=quaternions,
-        scales=scales
-    )
 
 def get_image_names(directory: str) -> List[str]:
     """Get image file names from directory."""
@@ -365,45 +258,72 @@ def select_initial_pair(
     if len(available_images) < 2:
         raise ValueError(f"Need at least 2 images with fitted Gaussians, found {len(available_images)}")
     
-    # Initialize ViewSelector
+    # Initialize ViewSelector with CLIP features for textureless images
     selector = ViewSelector(
         image_dir=image_dir,
-        vocab_size=vocab_size,
-        feature_type=feature_type,
         min_overlap_ratio=min_overlap,
         max_overlap_ratio=max_overlap
     )
     
-    # Process ONLY the available images to extract features and build codebook
+    # Process ONLY the available images to extract CLIP features
     image_paths = [os.path.join(image_dir, img) for img in available_images]
     
-    print(f"Processing {len(image_paths)} images (out of all images in directory)")
-    selector.initialize_from_images(image_paths)
+    print(f"Processing {len(image_paths)} images using CLIP (out of all images in directory)")
+    selector.process_images(image_paths)
     
-    # Calculate similarity matrix between all pairs
+    # Calculate CLIP similarity matrix between all pairs using CLIP features
     similarity_matrix = np.zeros((len(available_images), len(available_images)))
     
-    for i, img1 in enumerate(available_images):
-        hist1 = selector.image_histograms[os.path.join(image_dir, img1)]
-        for j, img2 in enumerate(available_images):
-            if i >= j:  # Avoid redundant computation and self-comparison
-                continue
-            hist2 = selector.image_histograms[os.path.join(image_dir, img2)]
-            # Compute cosine similarity
-            similarity = np.sum(hist1 * hist2) / (np.sqrt(np.sum(hist1**2)) * np.sqrt(np.sum(hist2**2)) + 1e-10)
-            similarity_matrix[i, j] = similarity
-            similarity_matrix[j, i] = similarity
+    # Get paths
+    image_paths = [os.path.join(image_dir, img) for img in available_images]
     
-    # Calculate feature richness scores (number of features)
-    feature_scores = np.array([
-        len(selector.image_features[os.path.join(image_dir, img)]['keypoints'])
-        for img in available_images
-    ])
+    # Get available CLIP features
+    valid_paths = [p for p in image_paths if p in selector.clip_features]
     
-    # Normalize feature scores
-    max_features = np.max(feature_scores)
-    if max_features > 0:
-        feature_scores = feature_scores / max_features
+    # Make sure we have at least 2 images with valid CLIP features
+    if len(valid_paths) < 2:
+        print("Warning: Not enough images with valid CLIP features")
+        print("Attempting to extract features again...")
+        # Try to extract features one more time
+        for path in image_paths:
+            if path not in selector.clip_features:
+                clip_feature = selector.extract_clip_features(path)
+                if clip_feature is not None:
+                    selector.clip_features[path] = clip_feature
+        
+        # Update the valid paths
+        valid_paths = [p for p in image_paths if p in selector.clip_features]
+        
+        if len(valid_paths) < 2:
+            print("Warning: Still not enough images with valid CLIP features")
+            print("Using random similarity values")
+            # Fill the similarity matrix with random values as fallback
+            similarity_matrix = np.random.rand(len(available_images), len(available_images))
+            # Make it symmetric
+            similarity_matrix = (similarity_matrix + similarity_matrix.T) / 2
+            # Set diagonal to 1
+            np.fill_diagonal(similarity_matrix, 1.0)
+    
+    # Extract CLIP features if we have enough valid paths
+    if len(valid_paths) >= 2:
+        clip_features = np.vstack([selector.clip_features[p] for p in valid_paths])
+        
+        # Calculate similarity matrix for valid paths
+        clip_similarity = cosine_similarity(clip_features, clip_features)
+        
+        # Map to original indices
+        for i, path1 in enumerate(valid_paths):
+            idx1 = image_paths.index(path1)
+            for j, path2 in enumerate(valid_paths):
+                if i >= j:  # Avoid redundant computation and self-comparison
+                    continue
+                idx2 = image_paths.index(path2)
+                similarity = clip_similarity[i, j]
+                similarity_matrix[idx1, idx2] = similarity
+                similarity_matrix[idx2, idx1] = similarity
+    
+    # Each image is represented by its CLIP embedding directly
+    feature_scores = np.ones(len(available_images))
 
     best_pair = None
     best_score = -1
@@ -447,8 +367,9 @@ def select_initial_pair(
     
     print(f"Selected initial pair: {img1} and {img2}")
     print(f"Similarity: {similarity_matrix[best_pair[0], best_pair[1]]:.4f}")
-    print(f"Feature counts: {len(selector.image_features[os.path.join(image_dir, img1)]['keypoints'])} and "
-          f"{len(selector.image_features[os.path.join(image_dir, img2)]['keypoints'])}")
+    
+    # With the CLIP-based ViewSelector, we don't have keypoint counts anymore
+    # Instead, we're using semantic similarity from CLIP embeddings
     
     return img1, img2, selector
 
@@ -569,7 +490,8 @@ def perform_initial_reconstruction(
     fitted_gaussians_dir: str,
     output_dir: str,
     max_iterations: int = 1000,
-    target_volume: float = 1.0,
+    target_volume: float = None,
+    auto_target_volume: bool = True,
     device: torch.device = None,
     enable_ba: bool = True,
     ba_iterations: int = 10
@@ -742,7 +664,24 @@ def perform_initial_reconstruction(
     
     # Compute 3D covariances, colors, and alphas 
     print("Computing 3D Gaussian properties...")
-    reconstructor.compute_3d_gaussian_covariances(lambda_volume=10.0, target_volume=target_volume)
+    
+    # Calculate target volume dynamically if needed
+    if auto_target_volume or target_volume is None:
+        W1, H1 = K1[0, 2]*2, K1[1, 2]*2  # image1 width, height
+        W2, H2 = K2[0, 2]*2, K2[1, 2]*2  # image2 width, height
+        avg_pixel_area = (W1 * H1 + W2 * H2) / 2
+        num_gaussians = max(len(gaussians1.means), len(gaussians2.means))
+        final_target_volume = avg_pixel_area / num_gaussians
+        print(f"Calculated target volume: {final_target_volume:.2f}")
+    else:
+        # Use the provided target volume
+        final_target_volume = target_volume
+        
+    print(f"Using target volume: {final_target_volume:.2f}")
+    reconstructor.compute_3d_gaussian_covariances(lambda_volume=0.0, target_volume=final_target_volume)
+    
+    # Save the target volume for future viewpoints
+    reconstruction_data_target_volume = final_target_volume
     if len(reconstructor.points_3d) == 0:
         raise ValueError("No valid 3D Gaussians after covariance optimization. Try different initial images.")
 
@@ -819,7 +758,10 @@ def perform_initial_reconstruction(
         # Metadata
         "used_images": [img1_name, img2_name],
         "total_3d_gaussians": len(reconstructor.points_3d),
-        "all_matches": []  # Initialize for future BA
+        "all_matches": [],  # Initialize for future BA
+        
+        # Store the calculated target volume for future viewpoints
+        "target_volume": reconstruction_data_target_volume
     }
     
     # Track observations for BA
@@ -1014,7 +956,8 @@ def add_new_viewpoint(
     output_dir: str,
     max_iterations: int = 1000,
     transport_threshold: float = 1e-6,
-    target_volume: float = 1.0,
+    target_volume: float = None,
+    auto_target_volume: bool = True,
     auto_threshold: bool = True,
     device: torch.device = None,
     enable_ba: bool = True,
@@ -1221,6 +1164,9 @@ def run_complete_pipeline(args):
     image_dir = os.path.join(args.data_dir, "images")
     colmap_dir = os.path.join(args.data_dir, args.colmap_dir)
     
+    # We'll use the same target_volume throughout the pipeline for consistency
+    global_target_volume = args.target_volume
+    
     all_images = get_image_names(image_dir)
     gaussian_files = get_fitted_gaussians_info(args.fitted_gaussians_dir)
     
@@ -1284,11 +1230,16 @@ def run_complete_pipeline(args):
             fitted_gaussians_dir=args.fitted_gaussians_dir,
             output_dir=args.output_dir,
             max_iterations=args.max_iterations,
-            target_volume=args.target_volume,
+            target_volume=global_target_volume,
+            auto_target_volume=args.auto_target_volume,
             device=device,
             enable_ba=args.enable_ba and not args.ba_skip_initial,
             ba_iterations=args.ba_iterations
         )
+        
+        # If we calculated the target volume automatically, store it for future use
+        if global_target_volume is None and args.auto_target_volume:
+            global_target_volume = reconstruction_data.get("target_volume", None)
         
         used_images = [img1, img2]
 
@@ -1332,7 +1283,7 @@ def run_complete_pipeline(args):
         # Determine if we need to force single intrinsic matrix
         force_single_K = not has_colmap_data or args.force_single_intrinsic
         
-        # Add the new viewpoint
+        # Add the new viewpoint - use the consistent target volume from initial reconstruction
         updated_data = add_new_viewpoint(
             reconstruction_data=reconstruction_data,
             new_image_name=next_image,
@@ -1340,7 +1291,7 @@ def run_complete_pipeline(args):
             output_dir=iter_output_dir,
             max_iterations=args.max_iterations,
             transport_threshold=args.transport_threshold,
-            target_volume=args.target_volume,
+            target_volume=global_target_volume,
             auto_threshold=args.auto_threshold,
             device=device,
             enable_ba=run_ba_this_iteration,
@@ -1378,9 +1329,17 @@ def run_complete_pipeline(args):
     # Process remaining source Gaussians at the end 
     if "source_gaussians_data" in reconstruction_data and reconstruction_data["source_gaussians_data"]:
         print("\n--- Processing Remaining Source Gaussians ---")
+        # Create a copy of args with our consistent target_volume
+        class ArgsWithTargetVolume:
+            pass
+        args_copy = ArgsWithTargetVolume()
+        for key, value in vars(args).items():
+            setattr(args_copy, key, value)
+        args_copy.target_volume = global_target_volume
+        
         processed_count = process_remaining_source_gaussians(
             reconstruction_data, 
-            args,
+            args_copy,
             device=device
         )
         if processed_count > 0:
@@ -1483,19 +1442,15 @@ def run_complete_pipeline(args):
             assert "camera1_K" in reconstruction_data, f"No intrinsics available for camera {cam_idx+1}"
             intrinsics_list.append(reconstruction_data["camera1_K"])
             
-    # Bundle Adjusterを初期化
-    ba = BundleAdjuster(
+    # COLMAPフォーマットにエクスポート
+    export_colmap_format(
+        output_dir=colmap_output_dir,
         points_3d=reconstruction_data["points_3d"],
         camera_params_list=reconstruction_data["camera_params_list"],
         match_points_2d=match_points_2d,
         intrinsics_list=intrinsics_list,
-        image_names=image_names, 
-        use_robust_loss=True,
-        loss_scale=1.0
+        image_names=image_names
     )
-
-    # COLMAPフォーマットにエクスポート
-    ba.export_colmap_format(colmap_output_dir)
     print(f"Exported reconstruction to COLMAP format in {colmap_output_dir}")
 
     # COLMAPフォーマットでのGaussian保存
@@ -1505,8 +1460,10 @@ def run_complete_pipeline(args):
         covariances_3d=reconstruction_data["covariances_3d"],
         colors_3d=reconstruction_data["color_3d"],
         alphas_3d=reconstruction_data["alpha_3d"],
-        quaternions=quaternions,  
-        scales=scales             
+        quaternions=quaternions,
+        scales=scales,
+        save_ellipsoids_as_ply=save_ellipsoids_as_ply,
+        save_gaussians_as_ply=save_gaussians_as_ply
     )
 
     # Save final results
