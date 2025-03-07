@@ -19,7 +19,7 @@ sys.path.append(parent_dir)
 
 
 from src.reconstructor.view_selector import ViewSelector
-from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor, build_covariance_3d
+from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 from src.reconstructor.viewpoint_extender import ViewpointExtender
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless",
         help="Path to the data directory containing images and COLMAP data"
     )
     parser.add_argument(
@@ -52,7 +52,7 @@ def parse_args():
     parser.add_argument(
         "--fitted_gaussians_dir",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
         help="Directory containing fitted 2D Gaussians"
     )
     parser.add_argument(
@@ -115,6 +115,66 @@ def parse_args():
         action="store_true",
         help="Skip processing if output files already exist"
     )
+    parser.add_argument(
+        "--enable_ba",
+        action="store_true",
+        default=True,
+        help="Enable Bundle Adjustment"
+    )
+    parser.add_argument(
+        "--ba_iterations",
+        type=int,
+        default=3,
+        help="Maximum iterations for Bundle Adjustment"
+    )
+    parser.add_argument(
+        "--ba_skip_initial",
+        action="store_true",
+        default=False,
+        help="Skip Bundle Adjustment after initial reconstruction"
+    )
+    parser.add_argument(
+        "--ba_skip_incremental",
+        action="store_true",
+        default=False,
+        help="Skip incremental Bundle Adjustment after adding each view"
+    )
+    parser.add_argument(
+        "--ba_every_n_views",
+        type=int,
+        default=3,
+        help="Perform incremental Bundle Adjustment every N views (1 = after every view)"
+    )
+    parser.add_argument(
+        "--force_single_intrinsic",
+        action="store_true",
+        default=False,
+        help="Force using a single intrinsic matrix for all cameras (useful when COLMAP data is incomplete)"
+    )
+    parser.add_argument(
+        "--ba_skip_final",
+        action="store_true",
+        default=False,
+        help="Skip final global Bundle Adjustment"
+    )
+    parser.add_argument(
+        "--use_sparse_set",
+        action="store_true",
+        default=True,
+        help="Use a sparse subset of available images"
+    )
+    parser.add_argument(
+        "--sparse_interval",
+        type=int,
+        default=10,
+        help="Interval for sparse image set (e.g., 2 means use every 2nd image)"
+    )
+    parser.add_argument(
+        "--max_images",
+        type=int,
+        default=None,
+        help="Maximum number of images to use (None means use all available)"
+    )
     
     return parser.parse_args()
 
@@ -124,11 +184,10 @@ def export_gaussians_to_numpy(
     covariances_3d: np.ndarray,
     colors_3d: np.ndarray,
     alphas_3d: np.ndarray,
-    quaternions: Optional[np.ndarray] = None,
-    scales: Optional[np.ndarray] = None
+    quaternions: np.ndarray,
+    scales: np.ndarray
 ) -> None:
-    """
-    Gaussian Splattingの初期値として使用できるnumpy形式でガウシアン情報を保存
+    """Gaussian Splattingの初期値として使用できるnumpy形式でガウシアン情報を保存
     
     Args:
         output_path: 出力ファイルパス (.npy)
@@ -136,67 +195,32 @@ def export_gaussians_to_numpy(
         covariances_3d: 3D共分散行列 [N, 3, 3]
         colors_3d: RGB色 [N, 3]
         alphas_3d: 不透明度 [N]
-        quaternions: 四元数 [N, 4] (オプション)
-        scales: スケール [N, 3] (オプション)
+        quaternions: 四元数 [N, 4]
+        scales: スケール [N, 3]
     """
     N = len(points_3d)
     
-    # 四元数とスケールの有効性チェック
-    if quaternions is None or len(quaternions) != N or quaternions.shape[1] != 4:
-        print(f"Warning: Invalid quaternions (shape={None if quaternions is None else quaternions.shape}), expected ({N}, 4)")
-        print("Generating unit quaternions...")
-        quaternions = np.zeros((N, 4), dtype=np.float32)
-        quaternions[:, 0] = 1.0  # w成分を1に設定（単位四元数）
-    
-    if scales is None or len(scales) != N or scales.shape[1] != 3:
-        print(f"Warning: Invalid scales (shape={None if scales is None else scales.shape}), expected ({N}, 3)")
-        print("Computing scales from covariances...")
-        scales = np.zeros((N, 3), dtype=np.float32)
-        
-        # 各共分散行列から固有値を計算してスケールとする
-        for i in range(N):
-            try:
-                eigvals = np.linalg.eigvalsh(covariances_3d[i])
-                # 固有値がゼロ以下になることを防ぐ
-                eigvals = np.maximum(eigvals, 1e-6)
-                scales[i] = np.sqrt(eigvals)
-            except np.linalg.LinAlgError:
-                scales[i] = [0.01, 0.01, 0.01]  # デフォルト値
-    
-    # 四元数の正規化
-    quaternion_norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
-    quaternions = quaternions / np.maximum(quaternion_norms, 1e-10)
-    
-    # スケールが非負であることを確認
-    scales = np.maximum(scales, 1e-6)
-    
-    # 球面調和関数(SH)係数を設定
-    # Gaussian Splattingでは色情報をSHで表現することが多い
-    # ここでは0次の係数のみを使用し、これはRGB値と同じ
-    sh_deg = 0  # 0次のSH
-    sh_dim = (sh_deg + 1) ** 2  # SHの次元数（0次なら1）
-    
-    # SH係数配列を作成
+    # SH係数を設定 (0次のみ)
+    sh_deg = 0
+    sh_dim = (sh_deg + 1) ** 2
     sh_coeffs = np.zeros((N, sh_dim, 3), dtype=np.float32)
-    
-    # 0次のSH係数はRGB値そのもの
     sh_coeffs[:, 0, :] = colors_3d
 
-    # Gaussian Splatting用のデータ構造
+    # データ構造
     gs_data = {
-        'xyz': points_3d.astype(np.float32),          # 位置
-        'quaternions': quaternions.astype(np.float32), # 回転
-        'scales': scales.astype(np.float32),           # スケール
-        'opacities': alphas_3d.astype(np.float32),     # 不透明度
-        'sh_coeffs': sh_coeffs,                        # SH係数
-        'covariances': covariances_3d.astype(np.float32)  # 共分散行列（オプション）
+        'xyz': points_3d.astype(np.float32),
+        'quaternions': quaternions.astype(np.float32),
+        'scales': scales.astype(np.float32),
+        'opacities': alphas_3d.astype(np.float32),
+        'sh_coeffs': sh_coeffs,
+        'covariances': covariances_3d.astype(np.float32)
     }
     
-    # numpyファイルとして保存
+    # 保存
     np.save(output_path, gs_data)
     print(f"Saved Gaussian Splatting numpy data to {output_path}")
     
-    # メタデータファイルも生成（オプション）
+    # メタデータファイル
     meta_path = output_path.replace('.npy', '_meta.txt')
     with open(meta_path, 'w') as f:
         f.write(f"Total Gaussians: {N}\n")
@@ -217,10 +241,10 @@ def export_gaussians_to_colmap_dir(
     covariances_3d: np.ndarray,
     colors_3d: np.ndarray,
     alphas_3d: np.ndarray,
-    quaternions: Optional[np.ndarray] = None,
-    scales: Optional[np.ndarray] = None
+    quaternions: np.ndarray,
+    scales: np.ndarray
 ) -> None:
-    """COLMAPディレクトリに完全なガウシアン情報を含むファイルをエクスポート
+    """COLMAPディレクトリにGS情報を含むファイルをエクスポート
     
     Args:
         colmap_dir: COLMAPディレクトリのパス
@@ -228,11 +252,12 @@ def export_gaussians_to_colmap_dir(
         covariances_3d: 3D共分散行列 [N, 3, 3]
         colors_3d: RGB色 [N, 3]
         alphas_3d: 不透明度 [N]
-        quaternions: 四元数 [N, 4] (オプション)
-        scales: スケール [N, 3] (オプション)
+        quaternions: 四元数 [N, 4]
+        scales: スケール [N, 3]
     """
+    N = len(points_3d)
     
-    # 完全なガウシアン情報を含むPLYファイル
+    # GS情報を含むPLYファイル
     ply_ellipsoids_path = os.path.join(colmap_dir, "gaussians_ellipsoids.ply")
     save_ellipsoids_as_ply(
         points_3d=points_3d,
@@ -247,30 +272,6 @@ def export_gaussians_to_colmap_dir(
     # Gaussian Splattingの初期値として使用できる形式のPLYファイル
     ply_gs_path = os.path.join(colmap_dir, "gaussians_splat.ply")
     
-    # 四元数とスケールのチェック・正規化
-    if quaternions is None or len(quaternions) == 0 or quaternions.shape[0] != points_3d.shape[0]:
-        print("Warning: Valid quaternions not found or count mismatch. Computing from covariances.")
-        # 共分散行列から四元数を計算する処理（簡易版）
-        quaternions = np.array([[1.0, 0.0, 0.0, 0.0]] * len(points_3d))
-    else:
-        # 四元数の正規化
-        norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
-        if np.any(np.abs(norms - 1.0) > 1e-5):
-            quaternions = quaternions / norms
-    
-    if scales is None or len(scales) == 0 or scales.shape[0] != points_3d.shape[0]:
-        print("Warning: Valid scales not found or count mismatch. Computing from covariances.")
-        # 共分散行列からスケールを計算
-        scales = np.array([np.sqrt(np.clip(np.linalg.eigvalsh(cov), 1e-10, None)) 
-                        for cov in covariances_3d])
-    else:
-        # スケールの非負を確認
-        if np.any(scales < 0):
-            scales = np.abs(scales)
-    
-    # Alpha値の範囲チェック
-    alphas_3d = np.clip(alphas_3d, 0.0, 1.0)
-    
     save_gaussians_as_ply(
         points_3d=points_3d,
         quaternions=quaternions,
@@ -281,7 +282,7 @@ def export_gaussians_to_colmap_dir(
     )
     print(f"Saved Gaussian Splatting PLY format to {ply_gs_path}")
     
-    # 追加: Numpy形式でガウシアン情報を保存
+    # Numpy形式でガウシアン情報を保存
     numpy_path = os.path.join(colmap_dir, "gaussians.npy")
     export_gaussians_to_numpy(
         output_path=numpy_path,
@@ -334,14 +335,15 @@ def select_initial_pair(
     vocab_size: int = 200,
     feature_type: str = "sift",
     min_overlap: float = 0.3,
-    max_overlap: float = 0.7
+    max_overlap: float = 0.7,
+    available_images: List[str] = None
 ) -> Tuple[str, str]:
     """Select the best initial pair of images using Bag of Visual Words.
     
     The best pair should have:
     1. Good feature overlap (within min/max range)
     2. Rich features in both images
-    3. Good spatial distribution of features → this is debatable (視差がありすぎると3D covが求められない可能性ありそう)
+    3. Good spatial distribution of features
     
     Args:
         image_dir: Directory containing images
@@ -350,15 +352,15 @@ def select_initial_pair(
         feature_type: Type of features to extract
         min_overlap: Minimum overlap ratio
         max_overlap: Maximum overlap ratio
+        available_images: Optional list of available images to consider
     
     Returns:
-        Tuple containing the names of the two selected images
+        Tuple containing the names of the two selected images and the ViewSelector
     """
     print("\n--- Selecting Initial Image Pair ---")
     
-    # Get available images that have fitted Gaussians (ここの処理はパイプライン最初と同じ)
-    all_images = get_image_names(image_dir)
-    available_images = [img for img in all_images if img in gaussian_files]
+    # Get available images that have fitted Gaussians
+    available_images = [img for img in available_images if img in gaussian_files]
     
     if len(available_images) < 2:
         raise ValueError(f"Need at least 2 images with fitted Gaussians, found {len(available_images)}")
@@ -372,18 +374,19 @@ def select_initial_pair(
         max_overlap_ratio=max_overlap
     )
     
-    # Process all images to extract features and build codebook
+    # Process ONLY the available images to extract features and build codebook
     image_paths = [os.path.join(image_dir, img) for img in available_images]
+    
+    print(f"Processing {len(image_paths)} images (out of all images in directory)")
     selector.initialize_from_images(image_paths)
     
     # Calculate similarity matrix between all pairs
     similarity_matrix = np.zeros((len(available_images), len(available_images)))
     
     for i, img1 in enumerate(available_images):
-        # hist = ヒストグラムベクトル（dim = vocab_size）
         hist1 = selector.image_histograms[os.path.join(image_dir, img1)]
         for j, img2 in enumerate(available_images):
-            if i >= j:  # Avoid redundant computation and self-comparison (対称行列なのでi < jのみでおけ)
+            if i >= j:  # Avoid redundant computation and self-comparison
                 continue
             hist2 = selector.image_histograms[os.path.join(image_dir, img2)]
             # Compute cosine similarity
@@ -401,75 +404,162 @@ def select_initial_pair(
     max_features = np.max(feature_scores)
     if max_features > 0:
         feature_scores = feature_scores / max_features
-    
-    # Find valid pairs (within overlap range)
-    # valid_pairs = []
-    # pair_scores = []
-    
-    # for i in range(len(available_images)):
-    #     for j in range(i+1, len(available_images)):
-    #         similarity = similarity_matrix[i, j]
-            
-    #         # Check if within desired overlap range
-    #         if min_overlap <= similarity <= max_overlap:
-    #             # Combined score: similarity + feature richness of both images
-    #             score = similarity + 0.5 * (feature_scores[i] + feature_scores[j])
-    #             valid_pairs.append((i, j))
-    #             pair_scores.append(score)
-    
-    # if not valid_pairs:
-    #     print("No pairs within specified overlap range, using best available pair")
-    #     # Take pair with highest combined feature score
-    #     best_pair = None
-    #     best_score = -1
-        
-    #     for i in range(len(available_images)):
-    #         for j in range(i+1, len(available_images)):
-    #             combined_score = feature_scores[i] + feature_scores[j]
-    #             if combined_score > best_score:
-    #                 best_score = combined_score
-    #                 best_pair = (i, j)
-        
-    #     if best_pair is None:
-    #         # Fallback: just take the first two images
-    #         best_pair = (0, 1)
-            
-    #     selected_idx = best_pair
-    # else:
-    #     # Select the best pair based on score
-    #     best_idx = np.argmax(pair_scores)
-    #     selected_idx = valid_pairs[best_idx]
-    
-    # Get the selected image names
-    # img1 = available_images[selected_idx[0]]
-    # img2 = available_images[selected_idx[1]]
-    
-    best_pair = None
-    best_similarity = -1
 
+    best_pair = None
+    best_score = -1
+    
     for i in range(len(available_images)):
         for j in range(i+1, len(available_images)):
             similarity = similarity_matrix[i, j]
             
-            # 類似度が最大のペアを探す
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_pair = (i, j)
-
-    # best_pair が見つからなかった場合のフォールバック処理（全く特徴点が取れないケースとかのため）
+            # 類似度が範囲内にあるか確認
+            if min_overlap <= similarity <= max_overlap:
+                # スコア = 類似度 + 両方の画像の特徴点のrichness
+                feature_richness = (feature_scores[i] + feature_scores[j]) / 2
+                score = similarity * 0.5 + feature_richness * 0.5
+                
+                if score > best_score:
+                    best_score = score
+                    best_pair = (i, j)
+    
+    # 適切な範囲内のペアが見つからなかった場合、特徴点が多いペアを選択
     if best_pair is None:
+        print("No pairs within specified overlap range, selecting based on feature richness")
+        for i in range(len(available_images)):
+            for j in range(i+1, len(available_images)):
+                similarity = similarity_matrix[i, j]
+                # 最低限の類似度を確保
+                if similarity > 0.1:
+                    feature_richness = (feature_scores[i] + feature_scores[j]) / 2
+                    score = feature_richness
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_pair = (i, j)
+    
+    # それでもペアが見つからない場合は最初の2つを使用（テキスチャレスの場合はあり得る→局所特徴に依存しないように修正）
+    if best_pair is None:
+        print("No suitable pairs found, using first two images")
         best_pair = (0, 1)
 
     img1 = available_images[best_pair[0]]
     img2 = available_images[best_pair[1]]
-            
-
     
     print(f"Selected initial pair: {img1} and {img2}")
     print(f"Similarity: {similarity_matrix[best_pair[0], best_pair[1]]:.4f}")
-    print(f"Feature counts: {len(selector.image_features[os.path.join(image_dir, img1)]['keypoints'])} and "f"{len(selector.image_features[os.path.join(image_dir, img2)]['keypoints'])}")
+    print(f"Feature counts: {len(selector.image_features[os.path.join(image_dir, img1)]['keypoints'])} and "
+          f"{len(selector.image_features[os.path.join(image_dir, img2)]['keypoints'])}")
     
     return img1, img2, selector
+
+def perform_bundle_adjustment(
+    reconstruction_data: Dict,
+    ba_iterations: int = 10, 
+    device: torch.device = None,
+    verbose: bool = True,
+    save_dir: Optional[str] = None
+) -> Dict:
+    """BA実行,カメラパラメータとGS中心位置を最適化
+    
+    Args:
+        reconstruction_data: 再構成データ辞書
+        ba_iterations: BAの最大イテレーション数
+        device: 計算デバイス
+        verbose: 詳細な出力を表示するかどうか
+        save_dir: 結果を保存するディレクトリ
+        
+    Returns:
+        Dict: 更新された再構成データ
+    """
+    print("\n--- Performing Bundle Adjustment ---")
+    
+    # 観測データ構築
+    observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
+    
+    if not observation_map:
+        print("No valid observations found for BA. Skipping.")
+        return reconstruction_data
+    
+    # 観測データをBundleAdjusterの形式に変換
+    num_cameras = len(reconstruction_data["camera_params_list"])
+    match_points_2d = ObservationBuilder.convert_to_match_points_2d(
+        observation_map, num_cameras
+    )
+    
+    # 最低限必要な観測数をチェック
+    total_obs = sum(len(obs) for obs in match_points_2d)
+    if total_obs < 10:
+        print(f"Not enough observations ({total_obs}) for meaningful Bundle Adjustment. Skipping.")
+        return reconstruction_data
+    
+    # 各カメラの内部パラメータリスト（現状必要ないが，colmap破綻するケースだと使うかも）
+    intrinsics_list = []
+    for cam_idx in range(num_cameras):
+        # カメラ固有のKがあればそれを使用
+        cam_key = f"camera{cam_idx+1}_K"
+        if cam_key in reconstruction_data:
+            intrinsics_list.append(reconstruction_data[cam_key])
+        elif "K" in reconstruction_data:
+            intrinsics_list.append(reconstruction_data["K"])
+        else:
+            # Fallback to first camera's K
+            intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
+    
+    image_names = reconstruction_data.get("used_images", None)
+    
+    ba = BundleAdjuster(
+        points_3d=reconstruction_data["points_3d"],
+        camera_params_list=reconstruction_data["camera_params_list"],
+        match_points_2d=match_points_2d,
+        intrinsics_list=intrinsics_list,
+        image_names=image_names,
+        use_robust_loss=True,
+        loss_scale=1.0
+    )
+    
+    # ba最適化実行
+    ba_results = ba.optimize(n_iterations=ba_iterations, verbose=verbose)
+    
+    if ba_results["success"]:
+        print(f"Bundle Adjustment completed successfully.")
+        print(f"Initial RMSE: {ba_results.get('initial_rmse', 'N/A'):.4f} pixels")
+        print(f"Final RMSE: {ba_results.get('final_rmse', 'N/A'):.4f} pixels")
+        
+        # 再構成データを更新
+        reconstruction_data["camera_params_list"] = ba_results["optimized_cameras"]
+        reconstruction_data["points_3d"] = ba_results["optimized_points"]
+        
+        # 最適化されたGS中心を反映
+        for i, point in enumerate(ba_results["optimized_points"]):
+            if i < len(reconstruction_data["existing_3d_gaussians"]):
+                reconstruction_data["existing_3d_gaussians"][i]["center"] = point
+            
+        # 結果保存
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # COLMAPフォーマットで出力
+            colmap_ba_dir = os.path.join(save_dir, "colmap_ba")
+            os.makedirs(colmap_ba_dir, exist_ok=True)
+            ba.export_colmap_format(colmap_ba_dir)
+            
+            # PLYとして保存
+            ply_path = os.path.join(save_dir, "ba_optimized.ply")
+            save_ellipsoids_as_ply(
+                points_3d=reconstruction_data["points_3d"],
+                covariances_3d=reconstruction_data["covariances_3d"],
+                colors_3d=reconstruction_data["color_3d"],
+                alphas_3d=reconstruction_data["alpha_3d"],
+                filename=ply_path,
+                camera_params=reconstruction_data["camera_params_list"],
+                use_alpha=True
+            )
+            
+            print(f"BA results saved to {save_dir}")
+    else:
+        print(f"Bundle Adjustment failed: {ba_results.get('message', 'Unknown error')}")
+    
+    return reconstruction_data
 
 def perform_initial_reconstruction(
     img1_name: str,
@@ -480,7 +570,9 @@ def perform_initial_reconstruction(
     output_dir: str,
     max_iterations: int = 1000,
     target_volume: float = 1.0,
-    device: torch.device = None
+    device: torch.device = None,
+    enable_ba: bool = True,
+    ba_iterations: int = 10
 ) -> Dict:
     """Perform initial 3D reconstruction from two views.
     
@@ -494,6 +586,8 @@ def perform_initial_reconstruction(
         max_iterations: Maximum optimization iterations
         target_volume: Target volume for 3D Gaussians
         device: Computation device
+        enable_ba: Whether to perform Bundle Adjustment
+        ba_iterations: Maximum BA iterations
     
     Returns:
         Dictionary with reconstruction results
@@ -517,30 +611,79 @@ def perform_initial_reconstruction(
     _, gaussians1, _, K1 = load_gaussians_torch(gaussians1_path, device)
     _, gaussians2, _, K2 = load_gaussians_torch(gaussians2_path, device)
     
-    # Load COLMAP data
+    # Attempt to load COLMAP data
     colmap_path = os.path.join(data_dir, colmap_dir)
-    cameras = load_cameras_from_colmap(colmap_path)
-    images_data = load_images_from_colmap(colmap_path)
+    has_colmap_data = os.path.exists(colmap_path) and os.path.isdir(colmap_path)
     
-    # Get image IDs
-    image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
-    image1_id = image_name_to_id.get(img1_name)
-    image2_id = image_name_to_id.get(img2_name)
+    if has_colmap_data:
+        try:
+            cameras = load_cameras_from_colmap(colmap_path)
+            images_data = load_images_from_colmap(colmap_path)
+            print(f"Successfully loaded COLMAP data with {len(cameras)} cameras and {len(images_data)} images")
+        except Exception as e:
+            print(f"Error loading COLMAP data: {e}")
+            has_colmap_data = False
+            cameras = {}
+            images_data = {}
+    else:
+        print(f"COLMAP directory {colmap_path} not found or not valid")
+        cameras = {}
+        images_data = {}
     
-    if image1_id is None or image2_id is None:
-        raise ValueError(f"Image {img1_name} or {img2_name} not found in COLMAP data")
+    # Determine whether to use COLMAP camera data or fallback to a generic intrinsic matrix(in the case of using "non-colmappable" data→ex:meterials)
+    use_colmap_cameras = has_colmap_data and bool(cameras) and bool(images_data)
     
-    # Create camera models
-    camera1_id = images_data[image1_id]['camera_id']
-    camera2_id = images_data[image2_id]['camera_id']
+    if use_colmap_cameras:
+        # Get image IDs from COLMAP data
+        image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
+        print(f"Available images in COLMAP data: {image_name_to_id}")
+
+        image1_id = image_name_to_id.get(img1_name)
+        image2_id = image_name_to_id.get(img2_name)
+        
+        # Double check that both images are in COLMAP data
+        if image1_id is None or image2_id is None:
+            print(f"Warning: Image {img1_name} or {img2_name} not found in COLMAP data.")
+            print("Will use a single generic intrinsic matrix for all cameras.")
+            use_colmap_cameras = False
+    else:
+        print("No valid COLMAP data found. Will use a single generic intrinsic matrix for all cameras.")
     
-    camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
-    camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
+    if use_colmap_cameras:
+        # Create camera models from COLMAP data
+        camera1_id = images_data[image1_id]['camera_id']
+        camera2_id = images_data[image2_id]['camera_id']
+        
+        camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
+        camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
+        
+        K1 = camera1.K
+        K2 = camera2.K
+    else:
+        # Use a common intrinsic matrix
+        # Get information from 2D Gaussians if available
+        _, _, _, K_from_gs1 = load_gaussians_torch(gaussians1_path, device)
+        _, _, _, K_from_gs2 = load_gaussians_torch(gaussians2_path, device)
+        
+        if K_from_gs1 is not None:
+            K1 = K_from_gs1
+            K2 = K_from_gs1
+            print(f"Using intrinsic matrix from 2D Gaussians data.")
+        else:
+            # Use a default intrinsic matrix (centered principal point, focal length based on arbitrary values)
+            H, W = 800, 800  # Random image size, adjust as needed
+            fx, fy = 1.2*W, 1.2*W  # Random focal length (1.2x image width)
+            cx, cy = W/2, H/2  # Principal point at center
+            
+            K1 = np.array([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ])
+            K2 = K1
+            print(f"Using default intrinsic matrix with focal length: {fx:.2f}")
+            print(f"K = \n{K1}")
     
-    K1 = camera1.K
-    K2 = camera2.K
-    
-    # Initialize OptimalTransportSolver
     solver = OptimalTransportSolver(
         gaussians1=gaussians1,
         gaussians2=gaussians2,
@@ -565,7 +708,7 @@ def perform_initial_reconstruction(
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         transport_matrix_np = transport_matrix.cpu().numpy()
     
-    # Set up reconstructor
+    # Set up reconstructor (homographyの可能性あるからまだh_dummy捨てない)
     h_dummy = np.eye(3)
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
     
@@ -581,7 +724,7 @@ def perform_initial_reconstruction(
     t_optimized = solver.tvec.detach().cpu().numpy()
     R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()
     
-    # Set camera matrices and triangulate
+    # Set camera matrices
     reconstructor.set_camera_matrices_explicitly(
         r1=np.eye(3),
         t1=np.zeros(3),
@@ -591,13 +734,13 @@ def perform_initial_reconstruction(
     
     # Triangulate Gaussian centers
     print("Triangulating Gaussian centers...")
-    threshold = 0.0  # Don't drop any Gaussians at this stage
+    threshold = 0.0  # Don't drop any Gaussians (to cover local optima)
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold)
     
     if len(reconstructor.points_3d) == 0:
         raise ValueError("Triangulation failed: no 3D points generated")
     
-    # Compute 3D covariances, colors, and alphas
+    # Compute 3D covariances, colors, and alphas 
     print("Computing 3D Gaussian properties...")
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=10.0, target_volume=target_volume)
     if len(reconstructor.points_3d) == 0:
@@ -612,7 +755,6 @@ def perform_initial_reconstruction(
     R2 = R_est      # world->camera2 (R_estはworld->camera2の回転)
     t2 = t_optimized  # world->camera2 (t_optimizedはworld->camera2の並進)
     camera_params_list = [(R1, t1), (R2, t2)]
-    # print(f"camera_params_list {camera_params_list}")
 
     # Save results as PLY
     ply_path = os.path.join(output_dir, "initial_3d_gaussians.ply")
@@ -627,14 +769,10 @@ def perform_initial_reconstruction(
     )
     # Prepare source Gaussians data for future use
     source_gaussians_data = {}
-    if hasattr(reconstructor, 'source_gaussians1_data'):
-        source_gaussians_data['source_gaussians1_data'] = reconstructor.source_gaussians1_data
-        # Add the image name to the data
-        source_gaussians_data['source_gaussians1_data']['image_name'] = img1_name
-    
-    if hasattr(reconstructor, 'source_gaussians2_data'):
-        source_gaussians_data['source_gaussians2_data'] = reconstructor.source_gaussians2_data
-        source_gaussians_data['source_gaussians2_data']['image_name'] = img2_name
+    source_gaussians_data['source_gaussians1_data'] = reconstructor.source_gaussians1_data
+    source_gaussians_data['source_gaussians1_data']['image_name'] = img1_name
+    source_gaussians_data['source_gaussians2_data'] = reconstructor.source_gaussians2_data
+    source_gaussians_data['source_gaussians2_data']['image_name'] = img2_name
     
     # Create 3D Gaussians in the expected format for ViewpointExtender
     existing_3d_gaussians = []
@@ -643,42 +781,68 @@ def perform_initial_reconstruction(
         cov_3d = reconstructor.covariances_3d[i]
         color = reconstructor.color_3d[i]
         alpha = reconstructor.alpha_3d[i]
+        quaternion = reconstructor.quaternions[i]
+        scale = reconstructor.scales[i]
         
         gauss = {
             "center": point_3d,
             "covariance": cov_3d,  
             "color": color,
-            "alpha": alpha
+            "alpha": alpha,
+            "quaternion": quaternion,
+            "scale": scale
         }
         existing_3d_gaussians.append(gauss)
     
-    # Save full results
+    # quaternionsとscalesはGaussにも追加してあるが，全体としても保持しておく
+    quaternions = reconstructor.quaternions
+    scales = reconstructor.scales
+    
+    # Save essential results, removing redundant fields
     results = {
-        "fundamental_matrix": F_optimized,
-        "transport_matrix": transport_matrix_np,
-        "camera1_K": K1,
-        "camera2_K": K2,
+        # Core 3D Gaussian data
+        "existing_3d_gaussians": existing_3d_gaussians,
         "points_3d": reconstructor.points_3d,
         "covariances_3d": reconstructor.covariances_3d,
         "color_3d": reconstructor.color_3d,
         "alpha_3d": reconstructor.alpha_3d,
-        'source_gaussians1': reconstructor.source_gaussians1,
-        'source_gaussians2': reconstructor.source_gaussians2,
-        'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
-        'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
-        'cov_failed_gaussians_included': True,  # Cov最適化に失敗したガウスが湧出ガウスに含まれていることを示すフラグ
-        "transport_values": getattr(reconstructor, 'transport_values', None),
-        "source_gaussians_data": source_gaussians_data,
+        "quaternions": quaternions,
+        "scales": scales,
+        
+        # Camera parameters
         "camera_params_list": camera_params_list,
-        "R1": R1,
-        "t1": t1,
-        "R2": R2,
-        "t2": t2,
-        "existing_3d_gaussians": existing_3d_gaussians,
+        "K": K1,  # (need to modify if the intrinsic matrix is not shared)
+        
+        # for adding viewpoint
+        "source_gaussians_data": source_gaussians_data,
+        
+        # Metadata
         "used_images": [img1_name, img2_name],
-        "quaternions": getattr(reconstructor, 'quaternions', None),
-        "scales": getattr(reconstructor, 'scales', None)
+        "total_3d_gaussians": len(reconstructor.points_3d),
+        "all_matches": []  # Initialize for future BA
     }
+    
+    # Track observations for BA
+    observations1 = []
+    observations2 = []
+    
+
+    for i, (idx1, idx2) in enumerate(reconstructor.match_pairs):
+        if i < len(reconstructor.points_3d):
+            observations1.append((i, gaussians1.means[idx1]))
+            observations2.append((i, gaussians2.means[idx2]))
+    
+    results["all_matches"] = [observations1, observations2]
+    
+    # Perform initial bundle adjustment if enabled
+    if enable_ba and len(reconstructor.points_3d) >= 3:
+        ba_dir = os.path.join(output_dir, "ba_initial")
+        results = perform_bundle_adjustment(
+            reconstruction_data=results,
+            ba_iterations=ba_iterations,
+            device=device,
+            save_dir=ba_dir
+        )
     
     # Save to pickle
     results_path = os.path.join(output_dir, "initial_3d_reconstruction.pkl")
@@ -695,9 +859,10 @@ def process_remaining_source_gaussians(
     args,
     device: torch.device = None
 ) -> int:
-    """最後に残った未処理の湧出ガウスを処理する
+    """最後に残った未処理の湧出ガウスを処理
     
     主に初期ペアのうち、referenceとして使われなかった方の画像の湧出ガウスを処理する
+    →湧出ガウスとして残っているものは使用されていないカメラとの輸送で潰されるべき（理想的には）
     
     Args:
         reconstruction_data: 再構成データ辞書
@@ -753,13 +918,12 @@ def process_remaining_source_gaussians(
         return 0
     
     # カメラ内部パラメータを取得
-    K = reconstruction_data.get("K", None)
-    if K is None:
-        K = reconstruction_data.get("camera1_K", None)
-    
-    if K is None:
-        print("Camera intrinsics not found.")
-        return 0
+    if "K" in reconstruction_data:
+        K = reconstruction_data["K"]
+    elif "camera1_K" in reconstruction_data:
+        K = reconstruction_data["camera1_K"]
+    else:
+        assert False, "Camera intrinsics not found in reconstruction_data"
     
     # 最初の視点拡張で使われたreferenceカメラを特定
     # 通常0番のカメラ（初期ペアの1枚目）
@@ -768,7 +932,7 @@ def process_remaining_source_gaussians(
     # もう片方のカメラインデックス
     other_cam_idx = 1
     
-    # 処理するカメラを選択→主に初期ペアのうち、referenceとして使われなかった方のカメラ
+    # 処理するカメラを選択→主に初期ペアのうち，referenceとして使われなかった方のカメラ
     target_cam_idx = other_cam_idx if other_cam_idx in cam_unprocessed else None
     
     if target_cam_idx is None:
@@ -777,7 +941,7 @@ def process_remaining_source_gaussians(
     
     print(f"Processing unprocessed source gaussians from camera {target_cam_idx} (initial pair)")
     
-    # もう片方の画像のガウスをロード
+    # もう片方の画像のガウスをロード（ここも非効率だがとりまおけ）
     ref_image = initial_pair[reference_cam_idx]
     ref_gaussians_path = os.path.join(
         args.fitted_gaussians_dir, 
@@ -787,8 +951,6 @@ def process_remaining_source_gaussians(
     
     _, ref_2d_gaussians, _, _ = load_gaussians_torch(ref_gaussians_path, device=device)
     
-    # ViewpointExtenderを使用して三角測量
-    from src.reconstructor.viewpoint_extender import ViewpointExtender
     extender = ViewpointExtender(
         existing_3d_gaussians=reconstruction_data["existing_3d_gaussians"],
         camera_params_list=camera_params_list,
@@ -798,7 +960,7 @@ def process_remaining_source_gaussians(
         source_gaussians_data=source_gaussians_data
     )
     
-    # 三角測量実行
+    # 湧出ガウスを対象とした三角測量
     processed = extender.triangulate_source_gaussians(
         source_camera_idx=target_cam_idx,
         new_image_2d_gaussians=ref_2d_gaussians,
@@ -806,12 +968,11 @@ def process_remaining_source_gaussians(
         correspondence_threshold=1e-6 
     )
     
-    # 結果を更新
+    # ジオメトリ/湧出ガウスデータを更新
     reconstruction_data["existing_3d_gaussians"] = extender.existing_3d_gaussians
     reconstruction_data["source_gaussians_data"] = extender.source_gaussians_data
     
     if processed > 0:
-        # points_3d, covariances_3d, color_3d, alpha_3dを更新
         points_3d, covariances_3d, colors_3d, alphas_3d = [], [], [], []
         for gauss in reconstruction_data["existing_3d_gaussians"]:
             points_3d.append(gauss["center"])
@@ -843,7 +1004,7 @@ def select_reference_camera(camera_params_list):
         # カメラが1つしかなければそれを使用
         return 0
     
-    # 最新のカメラ（直前に追加されたカメラ）を参照として使用
+    # 最新のカメラ（直前に追加されたカメラ）を参照として使用→これが一番多く湧出ガウスを持つはず
     return len(camera_params_list) - 1
 
 def add_new_viewpoint(
@@ -855,7 +1016,10 @@ def add_new_viewpoint(
     transport_threshold: float = 1e-6,
     target_volume: float = 1.0,
     auto_threshold: bool = True,
-    device: torch.device = None
+    device: torch.device = None,
+    enable_ba: bool = True,
+    ba_iterations: int = 10,
+    force_single_intrinsic: bool = False
 ) -> Dict:
     print(f"\n--- Adding New Viewpoint: {new_image_name} ---")
     
@@ -863,8 +1027,7 @@ def add_new_viewpoint(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Using device: {device}")
-    
-    # Ensure output directory exists
+
     os.makedirs(output_dir, exist_ok=True)
     
     # Get path to fitted Gaussians for new image
@@ -880,21 +1043,46 @@ def add_new_viewpoint(
     existing_3d_gaussians = reconstruction_data["existing_3d_gaussians"]
     camera_params_list = reconstruction_data["camera_params_list"]
     
-    # Get camera intrinsics from reconstruction data
-    if K_new is None:
+    # Determine which camera intrinsics to use
+    if force_single_intrinsic and "K" in reconstruction_data:
+        # Force using the shared K from reconstruction_data
+        print(f"Using shared intrinsic matrix from initial reconstruction")
+        K_new = reconstruction_data["K"]
+    elif K_new is None:
+        # If not provided by the 2D Gaussian loader, try to get from reconstruction data (this is redundant but keep it just in case)
         if "K" in reconstruction_data:
             K_new = reconstruction_data["K"]
+            print(f"Using shared K from reconstruction_data")
         elif "camera1_K" in reconstruction_data:
-            # Fall back to using K1 if no K provided
             K_new = reconstruction_data["camera1_K"]
+            print(f"Using first camera's K as fallback")
+        else:
+            # Create a default intrinsic matrix as last resort (not necessary as well, just keep it for now)
+            assert False, "No intrinsic matrix available"
+            H, W = 800, 800  # Random image size, adjust as needed
+            fx, fy = 1.2*W, 1.2*W  # Random focal length (1.2x image width)
+            cx, cy = W/2, H/2  # Principal point at center
+            
+            K_new = np.array([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ])
+            print(f"WARNING: No intrinsic matrix available. Using default with focal length: {fx:.2f}")
+    else:
+        print(f"Using intrinsic matrix from fitted Gaussians data")
     
-    # Get source Gaussians data
-    source_gaussians_data = reconstruction_data.get("source_gaussians_data", {})
-    used_images = reconstruction_data.get("used_images", [])
+    # Get source Gaussians data - initialize if not present(most likely does not happen→これが起きるということは初期ペア疑った方がいい)
+    if "source_gaussians_data" in reconstruction_data:
+        source_gaussians_data = reconstruction_data["source_gaussians_data"]
+    else:
+        source_gaussians_data = {}
+    
+    # Get used images 
+    used_images = reconstruction_data["used_images"]
     reference_camera_idx = select_reference_camera(camera_params_list)
     print(f"Using camera {reference_camera_idx} as reference for new viewpoint")
     
-    # Initialize ViewpointExtender
     extender = ViewpointExtender(
         existing_3d_gaussians=existing_3d_gaussians,
         camera_params_list=camera_params_list,
@@ -905,7 +1093,7 @@ def add_new_viewpoint(
         source_gaussians_data=source_gaussians_data
     )
     
-    # 新視点のカメラパラメータ推定と3Dガウス分布の更新
+    # 新視点のカメラパラメータ推定と3DGSの更新
     R_new, t_new = extender.integrate_new_view_and_gaussians(
         new_image_2d_gaussians=new_2d_gaussians,
         max_iterations=max_iterations,
@@ -915,60 +1103,75 @@ def add_new_viewpoint(
     )
     
     # 新しい視点との対応関係を抽出
-    # ViewpointExtender内のtransport_solverから輸送行列を取得
-    if extender.transport_solver is not None and hasattr(extender.transport_solver, 'f'):
-        with torch.no_grad():
-            cost_matrix = extender.transport_solver.compute_cost_matrix_fundamental(
-                extender.transport_solver.f
-            )
-            transport_matrix = extender.transport_solver.unbalanced_sinkhorn_algorithm(cost_matrix)
-            transport_matrix_np = transport_matrix.cpu().numpy()
-            
-            # 観測情報を追跡
-            observations = extender.track_observations(transport_matrix_np)
-            
-            # reconstruction_dataに保存
-            if 'all_matches' not in reconstruction_data:
-                reconstruction_data['all_matches'] = [[] for _ in range(len(camera_params_list))]
-            
-            # 新しいカメラの観測情報を追加
-            reconstruction_data['all_matches'].append(observations)
-            
-            # 最適輸送行列自体も保存（後でBundle Adjustmentに使うため）
-            if 'transport_matrices' not in reconstruction_data:
-                reconstruction_data['transport_matrices'] = []
-            reconstruction_data['transport_matrices'].append(transport_matrix_np)
+    # ViewpointExtenderのtransport_solverを使用してcost matrixを計算
+    # 輸送行列の計算
+    with torch.no_grad():
+        cost_matrix = extender.transport_solver.compute_cost_matrix_fundamental(
+            extender.transport_solver.f
+        )
+        transport_matrix = extender.transport_solver.unbalanced_sinkhorn_algorithm(cost_matrix)
+        transport_matrix_np = transport_matrix.cpu().numpy()
+        
+        # 輸送行列を観測情報として追跡
+        observations = extender.track_observations(transport_matrix_np)
+        
+        # 新しいカメラの観測情報を追加
+        reconstruction_data['all_matches'].append(observations)
+        
+        # # Ensure transport_matrices exists
+        # if 'transport_matrices' not in reconstruction_data:
+        #     reconstruction_data['transport_matrices'] = []
+        
+        # # 最適輸送行列を保存（後でBundle Adjustmentに使用するかも？の場合初期化はreconstructorで行うべき）
+        # reconstruction_data['transport_matrices'].append(transport_matrix_np)
     
     # Extract updated data
     points_3d, covariances_3d, colors_3d, alphas_3d = [], [], [], []
+    quaternions, scales = [], []
+    
     for gauss in extender.existing_3d_gaussians:
         points_3d.append(gauss["center"])
         covariances_3d.append(gauss["covariance"])
         colors_3d.append(gauss["color"])
         alphas_3d.append(gauss["alpha"])
+        quaternions.append(gauss["quaternion"])
+        scales.append(gauss["scale"])
     
+    # 配列に変換
     points_3d = np.array(points_3d)
     covariances_3d = np.array(covariances_3d)
     colors_3d = np.array(colors_3d)
     alphas_3d = np.array(alphas_3d)
+    quaternions = np.array(quaternions)
+    scales = np.array(scales)
     
-    # Update used images list
-    used_images = reconstruction_data.get("used_images", []).copy()
+    # Update used images list  its 
+    used_images = reconstruction_data["used_images"].copy()
     used_images.append(new_image_name)
+    
     
     # Create updated results
     updated_results = {
+        # Core 3D Gaussian data
         "existing_3d_gaussians": extender.existing_3d_gaussians,
-        "camera_params_list": extender.camera_params_list,
         "points_3d": points_3d,
         "covariances_3d": covariances_3d,
         "color_3d": colors_3d,
         "alpha_3d": alphas_3d,
+        "quaternions": quaternions,
+        "scales": scales,
+        
+        # Camera parameters
+        "camera_params_list": extender.camera_params_list,
         "K": K_new,
+        
+        # Source Gaussian data
+        "source_gaussians_data": source_gaussians_data,
+        
+        # Metadata
         "used_images": used_images,
-        "source_gaussians_data": source_gaussians_data,  # ViewpointExtender内で更新される
-        "new_camera_R": R_new,
-        "new_camera_t": t_new
+        "total_3d_gaussians": len(points_3d),
+        "all_matches": reconstruction_data.get('all_matches', [])
     }
     
     # Save as PLY
@@ -983,6 +1186,16 @@ def add_new_viewpoint(
         use_alpha=True
     )
     
+    # 視点追加後にバンドル調整を実行(enable_baがTrueの場合)
+    if enable_ba:
+        ba_dir = os.path.join(output_dir, "ba_results")
+        updated_results = perform_bundle_adjustment(
+            reconstruction_data=updated_results,
+            ba_iterations=ba_iterations,
+            device=device,
+            save_dir=ba_dir
+        )
+    
     # Save full results
     results_path = os.path.join(output_dir, f"updated_reconstruction_{new_image_name.split('.')[0]}.pkl")
     with open(results_path, 'wb') as f:
@@ -996,50 +1209,74 @@ def add_new_viewpoint(
 
 def run_complete_pipeline(args):
     """Run the complete Perspective-n-Gaussian pipeline."""
+    
+    #####################################################
+    # 0. Setup and validation
+    #####################################################
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Get image and fitted Gaussian info
     image_dir = os.path.join(args.data_dir, "images")
     colmap_dir = os.path.join(args.data_dir, args.colmap_dir)
     
     all_images = get_image_names(image_dir)
     gaussian_files = get_fitted_gaussians_info(args.fitted_gaussians_dir)
     
-    # Filter to only images with fitted Gaussians (まあいらんかもしれない)
+    # Check if COLMAP directory exists(read camera intrinsics from colmap data)
+    has_colmap_data = os.path.exists(colmap_dir) and os.path.isdir(colmap_dir)
+    if not has_colmap_data or args.force_single_intrinsic:
+        print(f"{'Warning: COLMAP directory not found' if not has_colmap_data else 'User requested single intrinsic matrix'}. Will use a single intrinsic matrix for all cameras.")
+    
+    # Filter to only images with fitted Gaussians 
     available_images = [img for img in all_images if img in gaussian_files]
     
-    if len(available_images) < 2:
-        raise ValueError(f"Need at least 2 images with fitted Gaussians, found {len(available_images)}")
+    # Apply sparse set filtering if requested
+    if args.use_sparse_set:
+        print(f"Using sparse image set with interval {args.sparse_interval}")
+        available_images = available_images[::args.sparse_interval]
+        
+    # Apply maximum images limit if set
+    if args.max_images is not None and len(available_images) > args.max_images:
+        print(f"Limiting to {args.max_images} images out of {len(available_images)} available")
+        available_images = available_images[:args.max_images]
     
+    print(f"Using {len(available_images)} images for reconstruction")
+    
+    # Validate input
+    assert len(available_images) >= 2, f"Need at least 2 images with fitted Gaussians, found {len(available_images)}"
     print(f"Found {len(available_images)} images with fitted Gaussians")
     
-    # Check for existing results
+    #####################################################
+    # 2. Initial reconstruction - either load or compute
+    #####################################################
     initial_results_path = os.path.join(args.output_dir, "initial_3d_reconstruction.pkl")
+    
+    # Determine whether to load existing results or create new ones(if initial_3d_reconstruction_non_linear.py is previsously conducted)
     if os.path.exists(initial_results_path) and args.skip_existing:
-        print(f"Loading existing initial reconstruction from {initial_results_path}")
+        # Load existing reconstruction
         with open(initial_results_path, 'rb') as f:
             reconstruction_data = pickle.load(f)
-        # Get used images
+        
         used_images = reconstruction_data.get("used_images", [])
         print(f"Loaded reconstruction with {len(reconstruction_data['existing_3d_gaussians'])} 3D Gaussians")
         print(f"Used images: {used_images}")
     else:
+        # Create new reconstruction
         # Select initial pair
         img1, img2, selector = select_initial_pair(
-        image_dir=image_dir,
-        gaussian_files=gaussian_files,
-        vocab_size=args.vocab_size,
-        feature_type=args.feature_type,
-        min_overlap=args.min_overlap,
-        max_overlap=args.max_overlap,
-        # device="cuda" if torch.cuda.is_available() else "cpu" 
-    )
+            image_dir=image_dir,
+            gaussian_files=gaussian_files,
+            vocab_size=args.vocab_size,
+            feature_type=args.feature_type,
+            min_overlap=args.min_overlap,
+            max_overlap=args.max_overlap,
+            available_images=available_images  # Pass the filtered available_images
+        )
         
-        # Perform initial reconstruction
-        reconstruction_data = perform_initial_reconstruction(
+        # Conduct initial reconstruction
+        reconstruction_data= perform_initial_reconstruction(
             img1_name=img1,
             img2_name=img2,
             data_dir=args.data_dir,
@@ -1048,27 +1285,27 @@ def run_complete_pipeline(args):
             output_dir=args.output_dir,
             max_iterations=args.max_iterations,
             target_volume=args.target_volume,
-            device=device
+            device=device,
+            enable_ba=args.enable_ba and not args.ba_skip_initial,
+            ba_iterations=args.ba_iterations
         )
         
-        # Get used images
         used_images = [img1, img2]
 
     # Set reference images (already used images)
     selector.add_reference_images(used_images)
     
-    # Set source Gaussians data if available
-    if "source_gaussians_data" in reconstruction_data:
-        selector.set_source_gaussians_data(reconstruction_data["source_gaussians_data"])
-    
-    # Get remaining images to process
-    remaining_images = [img for img in available_images if img not in used_images]
+    # Set source Gaussians data
+    selector.set_source_gaussians_data(reconstruction_data["source_gaussians_data"])
     
     # Start timing
     start_time = time.time()
     
-    # Process each remaining image
+    #####################################################
+    # 3. Incremental reconstruction
+    #####################################################
     iteration = 1
+    remaining_images = [img for img in available_images if img not in used_images]
     total_remaining = len(remaining_images)
     
     while remaining_images:
@@ -1081,8 +1318,21 @@ def run_complete_pipeline(args):
         iter_output_dir = os.path.join(args.output_dir, f"iteration_{iteration}")
         os.makedirs(iter_output_dir, exist_ok=True)
         
+        # Determine if we should run BA in this iteration
+        run_ba_this_iteration = False
+        
+        if args.enable_ba and not args.ba_skip_incremental:
+            # Run BA every N views as specified by ba_every_n_views
+            if iteration % args.ba_every_n_views == 0:
+                run_ba_this_iteration = True
+                print(f"Will run Bundle Adjustment after adding view (iteration {iteration} is divisible by {args.ba_every_n_views})")
+            else:
+                print(f"Skipping Bundle Adjustment (iteration {iteration} is not divisible by {args.ba_every_n_views})")
+        
+        # Determine if we need to force single intrinsic matrix
+        force_single_K = not has_colmap_data or args.force_single_intrinsic
+        
         # Add the new viewpoint
-        # try:
         updated_data = add_new_viewpoint(
             reconstruction_data=reconstruction_data,
             new_image_name=next_image,
@@ -1092,7 +1342,10 @@ def run_complete_pipeline(args):
             transport_threshold=args.transport_threshold,
             target_volume=args.target_volume,
             auto_threshold=args.auto_threshold,
-            device=device
+            device=device,
+            enable_ba=run_ba_this_iteration,
+            ba_iterations=args.ba_iterations,
+            force_single_intrinsic=force_single_K
         )
         
         # Update reconstruction data for next iteration
@@ -1107,15 +1360,8 @@ def run_complete_pipeline(args):
         # Update source Gaussians data in selector
         if "source_gaussians_data" in updated_data:
             selector.set_source_gaussians_data(updated_data["source_gaussians_data"])
-            
-        # except Exception as e:
-        #     print(f"Error processing {next_image}: {e}")
-        #     
-        #     traceback.print_exc()
-            
-        #     # Remove problematic image and continue
-        #     remaining_images.remove(next_image)
-        #     print(f"Skipping problematic image {next_image}")
+                
+    
         # Increment iteration counter
         iteration += 1
         
@@ -1129,39 +1375,34 @@ def run_complete_pipeline(args):
         print(f"Elapsed time: {elapsed_time:.2f} seconds")
         print(f"Estimated time remaining: {estimated_remaining:.2f} seconds")
     
-    print("\n--- Processing Remaining Source Gaussians ---")
-    processed_count = process_remaining_source_gaussians(
-        reconstruction_data, 
-        args,
-        device=device
-    )
-    if processed_count > 0:
-        print(f"Successfully processed {processed_count} remaining source gaussians")
-    else:
-        print("No remaining source gaussians to process or processing failed")
-
-    # 残りの未処理ガウス数を確認（通常0になっているはず）
-    unprocessed_count = 0
-    if "source_gaussians_data" in reconstruction_data:
-        for key, data in reconstruction_data["source_gaussians_data"].items():
-            if not key.startswith('source_gaussians') or 'indices' not in data:
-                continue
-            
-            if 'processed' in data:
-                unproc_count = np.sum(~data['processed'])
-                if unproc_count > 0:
-                    print(f"{key}: {unproc_count} gaussians still unprocessed")
-                    unprocessed_count += unproc_count
-
-    if unprocessed_count > 0:
-        print(f"Warning: {unprocessed_count} source gaussians remain unprocessed")
-        print("These are likely gaussians that failed in covariance optimization")
-    else:
-        print("All source gaussians have been processed successfully")
+    # Process remaining source Gaussians at the end 
+    if "source_gaussians_data" in reconstruction_data and reconstruction_data["source_gaussians_data"]:
+        print("\n--- Processing Remaining Source Gaussians ---")
+        processed_count = process_remaining_source_gaussians(
+            reconstruction_data, 
+            args,
+            device=device
+        )
+        if processed_count > 0:
+            print(f"Successfully processed {processed_count} remaining source gaussians")
+        else:
+            print("No remaining source gaussians to process or processing failed")
     
-    # Final results
+    # Final results directory
     final_output_dir = os.path.join(args.output_dir, "final")
     os.makedirs(final_output_dir, exist_ok=True)
+    
+    # Final global bundle adjustment
+    if args.enable_ba and not args.ba_skip_final:
+        print("\n--- Performing Final Global Bundle Adjustment ---")
+        ba_dir = os.path.join(final_output_dir, "ba_final")
+        reconstruction_data = perform_bundle_adjustment(
+            reconstruction_data=reconstruction_data,
+            ba_iterations=args.ba_iterations*2,  # more iterations for final BA
+            device=device,
+            verbose=True,
+            save_dir=ba_dir
+        )
     
     # Save final PLY
     ply_path = os.path.join(final_output_dir, "final_3d_gaussians.ply")
@@ -1178,39 +1419,20 @@ def run_complete_pipeline(args):
     # Gaussian Splattingの初期値としてのPLY保存
     gs_ply_path = os.path.join(final_output_dir, "gs_init_gaussians.ply")
 
-    # 四元数とスケールを取得
-    quaternions = reconstruction_data.get("quaternions", None)
-    scales = reconstruction_data.get("scales", None)
 
-    # ガウス情報の検証と正規化
-    if quaternions is None or len(quaternions) == 0 or quaternions.shape[0] != reconstruction_data["points_3d"].shape[0]:
-        print("Warning: Valid quaternions not found or count mismatch. Using default orientation.")
-        # 単位四元数を使用（回転なし）
-        quaternions = np.array([[1.0, 0.0, 0.0, 0.0]] * len(reconstruction_data["points_3d"]))
-    else:
-        # 四元数の正規化を確認
-        norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
-        if np.any(np.abs(norms - 1.0) > 1e-5):
-            print("Warning: Normalizing quaternions to unit length.")
-            quaternions = quaternions / norms
-
-    if scales is None or len(scales) == 0 or scales.shape[0] != reconstruction_data["points_3d"].shape[0]:
-        print("Warning: Valid scales not found or count mismatch. Computing default scales.")
-        # 共分散行列の固有値からスケールを計算
-        scales = np.array([np.sqrt(np.clip(np.linalg.eigvalsh(cov), 1e-10, None)) 
-                           for cov in reconstruction_data["covariances_3d"]])
-    else:
-        # スケールの非負を確認
-        if np.any(scales < 0):
-            print("Warning: Found negative scales. Taking absolute values.")
-            scales = np.abs(scales)
-
-    # Gaussian Splatting用のPLY保存 - alpha値の検証を追加
+    #####################################################
+    # 4. Export to COLMAP format
+    #####################################################
+    # データを取得
+    quaternions = reconstruction_data["quaternions"]
+    scales = reconstruction_data["scales"]
     alphas_3d = reconstruction_data["alpha_3d"]
-    # alpha値が0〜1の範囲内にあることを確認
-    if np.any(alphas_3d < 0) or np.any(alphas_3d > 1):
-        print("Warning: Alpha values outside [0,1] range. Clamping to valid range.")
-        alphas_3d = np.clip(alphas_3d, 0.0, 1.0)
+    
+    # quaternionの正規性を検証 - 正規化されていないと後続処理で問題が起きる可能性あり
+    quat_norms = np.linalg.norm(quaternions, axis=1)
+    if not np.allclose(quat_norms, 1.0, rtol=1e-4):
+        print("Warning: Quaternions are not normalized - normalizing now")
+        quaternions = quaternions / quat_norms[:, np.newaxis]
 
     save_gaussians_as_ply(
         points_3d=reconstruction_data["points_3d"],
@@ -1233,22 +1455,33 @@ def run_complete_pipeline(args):
         len(reconstruction_data["camera_params_list"])
     )
 
-    # 実際の画像名を取得
-    image_names = reconstruction_data.get("used_images", [])
+    # 画像名の検証
+    assert "used_images" in reconstruction_data, "Image names missing from reconstruction data"
+    image_names = reconstruction_data["used_images"]
+    assert len(image_names) == len(reconstruction_data["camera_params_list"]), "Number of image names must match number of cameras"
     print(f"Using image names: {image_names}")
 
+    # カメラパラメータの存在チェック - 最低一つは必要
+    assert "K" in reconstruction_data or "camera1_K" in reconstruction_data, "No camera intrinsics found in reconstruction_data"
+    
     # 内部パラメータリストを構築
+    num_cameras = len(reconstruction_data["camera_params_list"])
     intrinsics_list = []
-    for cam_idx in range(len(reconstruction_data["camera_params_list"])):
-        # カメラ固有のKがあればそれを使用
+    
+    for cam_idx in range(num_cameras):
+        # 各カメラの内部パラメータを明示的に決定
         cam_key = f"camera{cam_idx+1}_K"
+        
         if cam_key in reconstruction_data:
+            # このカメラ専用の内部パラメータを使用
             intrinsics_list.append(reconstruction_data[cam_key])
         elif "K" in reconstruction_data:
+            # 共通の内部パラメータを使用
             intrinsics_list.append(reconstruction_data["K"])
         else:
-            # Fallback
-            intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
+            # camera1のパラメータを使用
+            assert "camera1_K" in reconstruction_data, f"No intrinsics available for camera {cam_idx+1}"
+            intrinsics_list.append(reconstruction_data["camera1_K"])
             
     # Bundle Adjusterを初期化
     ba = BundleAdjuster(
@@ -1265,14 +1498,15 @@ def run_complete_pipeline(args):
     ba.export_colmap_format(colmap_output_dir)
     print(f"Exported reconstruction to COLMAP format in {colmap_output_dir}")
 
+    # COLMAPフォーマットでのGaussian保存
     export_gaussians_to_colmap_dir(
         colmap_dir=colmap_output_dir,
         points_3d=reconstruction_data["points_3d"],
         covariances_3d=reconstruction_data["covariances_3d"],
         colors_3d=reconstruction_data["color_3d"],
         alphas_3d=reconstruction_data["alpha_3d"],
-        quaternions=reconstruction_data.get("quaternions"),
-        scales=reconstruction_data.get("scales")
+        quaternions=quaternions,  
+        scales=scales             
     )
 
     # Save final results
@@ -1285,71 +1519,32 @@ def run_complete_pipeline(args):
     print(f"Total 3D Gaussians: {len(reconstruction_data['existing_3d_gaussians'])}")
     print(f"Final results saved to {final_output_dir}")
     print(f"Total execution time: {time.time() - start_time:.2f} seconds")
-    
-    # # Final Bundle Adjustment
-    # if len(reconstruction_data["points_3d"]) > 0:
-    #     print("\n--- Performing Bundle Adjustment ---")
-    #     
-    #     # 1. Build observation map from all accumulated data
-    #     from src.optimizer.observation_builder import ObservationBuilder
-    #     
-    #     # ObservationBuilderはall_matchesまたはtransport_matricesから観測情報を構築
-    #     observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
-    #     match_points_2d = ObservationBuilder.convert_to_match_points_2d(
-    #         observation_map, 
-    #         len(reconstruction_data["camera_params_list"])
-    #     )
-    #     
-    #     # 最低限必要な観測数をチェック
-    #     total_obs = sum(len(obs) for obs in match_points_2d)
-    #     if total_obs < 10:
-    #         print(f"Not enough observations ({total_obs}) for meaningful Bundle Adjustment. Skipping.")
-    #     else:
-    #         # Initialize Bundle Adjuster
-    #         
-    #         
-    #         # 各カメラの内部パラメータリストを構築
-    #         intrinsics_list = []
-    #         for cam_idx in range(len(reconstruction_data["camera_params_list"])):
-    #             # カメラ固有のKがあればそれを使用
-    #             cam_key = f"camera{cam_idx+1}_K"
-    #             if cam_key in reconstruction_data:
-    #                 intrinsics_list.append(reconstruction_data[cam_key])
-    #             elif "K" in reconstruction_data:
-    #                 intrinsics_list.append(reconstruction_data["K"])
-    #             else:
-    #                 # Fallback to first camera's K
-    #                 intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
-    #         
-    #         # BundleAdjuster初期化/最適化
-    #         ba = BundleAdjuster(
-    #             points_3d=reconstruction_data["points_3d"],
-    #             camera_params_list=reconstruction_data["camera_params_list"],
-    #             match_points_2d=match_points_2d,
-    #             intrinsics_list=intrinsics_list,
-    #             use_robust_loss=True,
-    #             loss_scale=1.0
-    #         )
-    #         
-    #         ba_results = ba.optimize(n_iterations=1000, verbose=True)
-    #         
-    #         if ba_results["success"]:
-    #             reconstruction_data["camera_params_list"] = ba_results["optimized_cameras"]
-    #             reconstruction_data["points_3d"] = ba_results["optimized_points"]
-    #             
-    #             # 更新されたカメラパラメータと3D点をViewpointExtenderの既存3Dガウスにも反映
-    #             for i, point in enumerate(ba_results["optimized_points"]):
-    #                 if i < len(reconstruction_data["existing_3d_gaussians"]):
-    #                     reconstruction_data["existing_3d_gaussians"][i]["center"] = point
-    #             
-    #             # Export in COLMAP format
-    #             colmap_dir = os.path.join(args.output_dir, "colmap_ba")
-    #             ba.export_colmap_format(colmap_dir)
-    #             
-    #             print(f"Bundle Adjustment completed successfully. Results saved to {colmap_dir}")
-    #         else:
-    #             print(f"Bundle Adjustment failed: {ba_results.get('message', 'Unknown error')}")
 
 if __name__ == "__main__":
     args = parse_args()
+    print("\n=== Perspective-n-Gaussian Pipeline ===")
+    print(f"Data Directory: {args.data_dir}")
+    print(f"Output Directory: {args.output_dir}")
+    print(f"Fitted Gaussians Directory: {args.fitted_gaussians_dir}")
+    
+    # Print image selection settings
+    if args.use_sparse_set:
+        print(f"Using sparse image set with interval: {args.sparse_interval}")
+    if args.max_images:
+        print(f"Maximum images limit: {args.max_images}")
+        
+    # Print bundle adjustment settings
+    print(f"Bundle Adjustment: {'Enabled' if args.enable_ba else 'Disabled'}")
+    if args.enable_ba:
+        print(f"  - BA iterations: {args.ba_iterations}")
+        print(f"  - Initial BA: {'Skip' if args.ba_skip_initial else 'Perform'}")
+        print(f"  - Incremental BA: {'Skip' if args.ba_skip_incremental else 'Perform'}")
+        if not args.ba_skip_incremental:
+            print(f"  - BA frequency: Every {args.ba_every_n_views} view(s)")
+        print(f"  - Final BA: {'Skip' if args.ba_skip_final else 'Perform'}")
+    
+    # Print camera settings
+    print(f"Camera intrinsics: {'Force single matrix' if args.force_single_intrinsic else 'Use per-camera if available'}")
+    
+    print("=====================================\n")
     run_complete_pipeline(args)
