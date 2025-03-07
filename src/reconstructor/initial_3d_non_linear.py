@@ -595,6 +595,7 @@ class Initial3DReconstructor:
         r2_local = self.r2
         t2_local = self.t2
 
+
         def solve_cov_for_gaussian(idx: int) -> Tuple:
             """各ガウスの共分散行列を計算する関数"""
             assert self.points_3d is not None, "points_3d should not be None"
@@ -683,8 +684,10 @@ class Initial3DReconstructor:
             else:
                 failed_indices.append(idx)
         
-        # 失敗したガウスを湧出ガウスとして管理
-        self._add_failed_gaussians_to_sources(failed_indices)
+        # 失敗したガウスの統計情報を出力して廃棄
+        if len(failed_indices) > 0:
+            failed_percent = len(failed_indices) / num_3d * 100
+            print(f"Failed to optimize covariance for {len(failed_indices)} Gaussians ({failed_percent:.1f}%). These will be discarded.")
         
         # 有効なガウスのみ保持
         if len(valid_indices) == 0:
@@ -709,157 +712,38 @@ class Initial3DReconstructor:
         self.quaternions = np.array(quaternions_list)
         self.scales = np.array(scales_list)
         
+        # 四元数の形状と正規性を検証
+        assert self.quaternions.shape[0] == len(self.points_3d), f"Quaternion count ({self.quaternions.shape[0]}) must match point count ({len(self.points_3d)})"
+        assert self.quaternions.shape[1] == 4, f"Quaternions must have shape [N, 4], got {self.quaternions.shape}"
+        
+        # スケールの形状と値の検証
+        assert self.scales.shape[0] == len(self.points_3d), f"Scale count ({self.scales.shape[0]}) must match point count ({len(self.points_3d)})"
+        assert self.scales.shape[1] == 3, f"Scales must have shape [N, 3], got {self.scales.shape}"
+        
+        # スケールが負にならないようにする
+        if np.any(self.scales < 0):
+            print("Warning: Negative scales detected. Taking absolute values.")
+            self.scales = np.abs(self.scales)
+            
+        # 四元数の正規化
+        quat_norms = np.linalg.norm(self.quaternions, axis=1)
+        if not np.allclose(quat_norms, 1.0, rtol=1e-4):
+            print("Warning: Quaternions are not normalized. Normalizing now.")
+            self.quaternions = self.quaternions / quat_norms[:, np.newaxis]
+        
         # match_pairsも更新
-        if self.match_pairs:
-            self.match_pairs = [self.match_pairs[idx] for idx in valid_indices]
+        self.match_pairs = [self.match_pairs[idx] for idx in valid_indices]
         
         # 輸送値も更新
-        if hasattr(self, 'transport_values'):
-            self.transport_values = self.transport_values[valid_indices]
+        self.transport_values = self.transport_values[valid_indices]
 
         print(f"Finished LM optimization: {len(valid_indices)} valid Gaussians out of {num_3d} total.")
-        print(f"Added {len(failed_indices)} Gaussians to source collections for future evaluation.")
+        if len(failed_indices) > 0:
+            print(f"Discarded {len(failed_indices)} failed Gaussians.")
 
         print(f"After covariance computation: quaternions shape = {self.quaternions.shape if hasattr(self, 'quaternions') else 'None'}")
         print(f"After covariance computation: scales shape = {self.scales.shape if hasattr(self, 'scales') else 'None'}")
 
-    def _add_failed_gaussians_to_sources(self, failed_indices: List[int]) -> None:
-        """Cov計算に失敗したガウスを湧出ガウスとして追加"""
-        if not self.match_pairs or not failed_indices:
-            return
-        
-        # 湧出ガウスの初期化（存在しない場合）
-        if not hasattr(self, 'source_gaussians1') or self.source_gaussians1 is None:
-            self.source_gaussians1 = []
-        elif isinstance(self.source_gaussians1, np.ndarray):
-            # NumPy配列をリストに変換
-            self.source_gaussians1 = self.source_gaussians1.tolist()
-            
-        if not hasattr(self, 'source_gaussians2') or self.source_gaussians2 is None:
-            self.source_gaussians2 = []
-        elif isinstance(self.source_gaussians2, np.ndarray):
-            # NumPy配列をリストに変換
-            self.source_gaussians2 = self.source_gaussians2.tolist()
-        
-        # source_gaussians_dataの初期化（存在しない場合）
-        if not hasattr(self, 'source_gaussians1_data') or self.source_gaussians1_data is None:
-            self.source_gaussians1_data = {
-                'indices': [],
-                'means': [],
-                'covs': [],
-                'rgb': [],
-                'alpha': [],
-                'rotations': [],
-                'scales': []
-            }
-        else:
-            # 各フィールドがNumPy配列またはTensorの場合はリストに変換
-            for key in self.source_gaussians1_data:
-                if isinstance(self.source_gaussians1_data[key], np.ndarray):
-                    self.source_gaussians1_data[key] = self.source_gaussians1_data[key].tolist()
-                elif hasattr(self.source_gaussians1_data[key], 'detach'):
-                    self.source_gaussians1_data[key] = self.source_gaussians1_data[key].detach().cpu().numpy().tolist()
-        
-        if not hasattr(self, 'source_gaussians2_data') or self.source_gaussians2_data is None:
-            self.source_gaussians2_data = {
-                'indices': [],
-                'means': [],
-                'covs': [],
-                'rgb': [],
-                'alpha': [],
-                'rotations': [],
-                'scales': []
-            }
-        else:
-            # 各フィールドがNumPy配列またはTensorの場合はリストに変換
-            for key in self.source_gaussians2_data:
-                if isinstance(self.source_gaussians2_data[key], np.ndarray):
-                    self.source_gaussians2_data[key] = self.source_gaussians2_data[key].tolist()
-                elif hasattr(self.source_gaussians2_data[key], 'detach'):
-                    self.source_gaussians2_data[key] = self.source_gaussians2_data[key].detach().cpu().numpy().tolist()
-        
-        # 失敗したガウスごとに処理
-        for idx in failed_indices:
-            i_img1, j_img2 = self.match_pairs[idx]
-            
-            # 視点1の湧出ガウスに追加
-            if i_img1 not in self.source_gaussians1:
-                self.source_gaussians1.append(i_img1)
-                self.source_gaussians1_data['indices'].append(i_img1)
-                
-                # Tensorをnumpy配列に変換
-                means1 = self.gaussians1.means[i_img1]
-                if hasattr(means1, 'detach'):
-                    means1 = means1.detach().cpu().numpy()
-                self.source_gaussians1_data['means'].append(means1)
-                
-                covs1 = self.gaussians1.covs[i_img1]
-                if hasattr(covs1, 'detach'):
-                    covs1 = covs1.detach().cpu().numpy()
-                self.source_gaussians1_data['covs'].append(covs1)
-                
-                rgb1 = self.gaussians1.rgb[i_img1]
-                if hasattr(rgb1, 'detach'):
-                    rgb1 = rgb1.detach().cpu().numpy()
-                self.source_gaussians1_data['rgb'].append(rgb1)
-                
-                alpha1 = self.gaussians1.alpha[i_img1]
-                if hasattr(alpha1, 'detach'):
-                    alpha1 = alpha1.detach().cpu().numpy()
-                self.source_gaussians1_data['alpha'].append(alpha1)
-                
-                rotations1 = self.gaussians1.rotations[i_img1]
-                if hasattr(rotations1, 'detach'):
-                    rotations1 = rotations1.detach().cpu().numpy()
-                self.source_gaussians1_data['rotations'].append(rotations1)
-                
-                scales1 = self.gaussians1.scales[i_img1]
-                if hasattr(scales1, 'detach'):
-                    scales1 = scales1.detach().cpu().numpy()
-                self.source_gaussians1_data['scales'].append(scales1)
-            
-            # 視点2の湧出ガウスに追加
-            if j_img2 not in self.source_gaussians2:
-                self.source_gaussians2.append(j_img2)
-                self.source_gaussians2_data['indices'].append(j_img2)
-                
-                # Tensorをnumpy配列に変換
-                means2 = self.gaussians2.means[j_img2]
-                if hasattr(means2, 'detach'):
-                    means2 = means2.detach().cpu().numpy()
-                self.source_gaussians2_data['means'].append(means2)
-                
-                covs2 = self.gaussians2.covs[j_img2]
-                if hasattr(covs2, 'detach'):
-                    covs2 = covs2.detach().cpu().numpy()
-                self.source_gaussians2_data['covs'].append(covs2)
-                
-                rgb2 = self.gaussians2.rgb[j_img2]
-                if hasattr(rgb2, 'detach'):
-                    rgb2 = rgb2.detach().cpu().numpy()
-                self.source_gaussians2_data['rgb'].append(rgb2)
-                
-                alpha2 = self.gaussians2.alpha[j_img2]
-                if hasattr(alpha2, 'detach'):
-                    alpha2 = alpha2.detach().cpu().numpy()
-                self.source_gaussians2_data['alpha'].append(alpha2)
-                
-                rotations2 = self.gaussians2.rotations[j_img2]
-                if hasattr(rotations2, 'detach'):
-                    rotations2 = rotations2.detach().cpu().numpy()
-                self.source_gaussians2_data['rotations'].append(rotations2)
-                
-                scales2 = self.gaussians2.scales[j_img2]
-                if hasattr(scales2, 'detach'):
-                    scales2 = scales2.detach().cpu().numpy()
-                self.source_gaussians2_data['scales'].append(scales2)
-        
-        # NumPy配列に変換（便宜上）
-        for key in ['means', 'covs', 'rgb', 'alpha', 'rotations', 'scales']:
-            if self.source_gaussians1_data[key]:
-                self.source_gaussians1_data[key] = np.array(self.source_gaussians1_data[key])
-            if self.source_gaussians2_data[key]:
-                self.source_gaussians2_data[key] = np.array(self.source_gaussians2_data[key])
 
     def compute_3d_gaussian_colors(self, color_mode: str = "average") -> None:
         """Compute a single RGB color for each 3D Gaussian by combining matched 2D Gaussians' colors."""
