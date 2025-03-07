@@ -366,33 +366,181 @@ def read_points3D(points3D_path):
     else:
         raise ValueError("Points3D file must have .txt or .bin extension")
 
+def read_cameras_txt(cameras_txt_path):
+    """
+    COLMAPのcameras.txtからカメラ内部パラメータを読み込む
+    (テキスト形式)
+    """
+    cameras = {}
+    with open(cameras_txt_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            elements = line.split()
+            camera_id = int(elements[0])
+            model = elements[1]
+            width = int(elements[2])
+            height = int(elements[3])
+            params = list(map(float, elements[4:]))
+            
+            cameras[camera_id] = {
+                'camera_id': camera_id,
+                'model': model,
+                'width': width,
+                'height': height,
+                'params': params
+            }
+    
+    return cameras
+
+def read_cameras_bin(cameras_bin_path):
+    """
+    COLMAPのcameras.binからカメラ内部パラメータを読み込む
+    (バイナリ形式)
+    """
+    import struct
+    cameras = {}
+    with open(cameras_bin_path, 'rb') as f:
+        # 最初にカメラ数（uint64）を読み込む
+        num_cameras = struct.unpack('Q', f.read(8))[0]
+        
+        for _ in range(num_cameras):
+            # カメラIDとモデルタイプを読み込む
+            camera_id, model_id, width, height = struct.unpack('<IIQQ', f.read(24))
+            
+            # パラメータ数を読み込む
+            num_params = struct.unpack('I', f.read(4))[0]
+            
+            # パラメータを読み込む
+            params = struct.unpack('d' * num_params, f.read(8 * num_params))
+            
+            cameras[camera_id] = {
+                'camera_id': camera_id,
+                'model': model_id,  # バイナリではモデルIDが数値
+                'width': width,
+                'height': height,
+                'params': params
+            }
+    
+    return cameras
+
+def read_cameras(cameras_path):
+    """
+    cameras.txt or cameras.bin に応じて読み込み関数を切り替える
+    """
+    if cameras_path.endswith('.txt'):
+        return read_cameras_txt(cameras_path)
+    elif cameras_path.endswith('.bin'):
+        return read_cameras_bin(cameras_path)
+    else:
+        raise ValueError("Cameras file must have .txt or .bin extension")
+
+def get_camera_frustum_vertices(camera_params, extrinsic, scale=1.0):
+    """
+    カメラの内部パラメータと外部パラメータから、実際のフラスタム頂点を計算する
+    
+    Args:
+        camera_params: カメラの内部パラメータ辞書
+        extrinsic: カメラの外部パラメータ (4x4行列)
+        scale: フラスタムの奥行きスケール
+    
+    Returns:
+        vertex_transformed: 変換後のフラスタム頂点 (5x4)
+    """
+    model = camera_params['model']
+    width = camera_params['width']
+    height = camera_params['height']
+    params = camera_params['params']
+    
+    # カメラモデルに応じてパラメータを解釈
+    if model == 'SIMPLE_PINHOLE' or model == 1:  # 1 is SIMPLE_PINHOLE in binary
+        # params = [f, cx, cy]
+        fx = fy = params[0]
+        cx, cy = params[1], params[2]
+    elif model == 'PINHOLE' or model == 0:  # 0 is PINHOLE in binary
+        # params = [fx, fy, cx, cy]
+        fx, fy = params[0], params[1]
+        cx, cy = params[2], params[3]
+    else:
+        # 他のモデル（RADIAL, OPENCV, FULL_OPENCV など）は簡略化のため省略
+        # 実際のアプリケーションでは必要に応じて追加実装
+        print(f"Warning: Camera model {model} not fully supported. Using approximation.")
+        if len(params) >= 4:
+            fx, fy = params[0], params[1]
+            cx, cy = params[2], params[3]
+        else:
+            fx = fy = params[0]
+            cx, cy = width/2, height/2
+    
+    # 画像の四隅の座標（画像座標系）
+    corners_image = np.array([
+        [0, 0],           # 左上
+        [width, 0],       # 右上
+        [width, height],  # 右下
+        [0, height]       # 左下
+    ])
+    
+    # 画像座標系から正規化カメラ座標系への変換
+    corners_normalized = np.zeros((4, 3))
+    for i, (x, y) in enumerate(corners_image):
+        # 画像座標系 -> カメラ座標系
+        corners_normalized[i, 0] = (x - cx) / fx
+        corners_normalized[i, 1] = (y - cy) / fy
+        corners_normalized[i, 2] = 1.0
+    
+    # フラスタムの奥行き（Z方向）をスケーリング
+    depth = scale
+    
+    # カメラ原点とフラスタム頂点（カメラ座標系）
+    vertex_std = np.zeros((5, 4))
+    vertex_std[0, :] = [0, 0, 0, 1]  # カメラ原点
+    
+    for i in range(4):
+        # 正規化座標に深さを掛けてスケーリング
+        x = corners_normalized[i, 0] * depth
+        y = corners_normalized[i, 1] * depth
+        z = depth
+        vertex_std[i+1, :] = [x, y, z, 1]
+    
+    # 世界座標系に変換
+    vertex_transformed = vertex_std @ extrinsic.T
+    
+    return vertex_transformed
 
 ##############################################################################
 # 可視化用関数
 ##############################################################################
 def visualize_cameras_and_points(
     cameras,
+    camera_intrinsics=None,
     points=None,
     colors=None,
     scene_bounds=None,
     use_plotly=True,
     max_points=50000,
     focal_len=5,
-    aspect_ratio=0.3
+    aspect_ratio=0.3,
+    use_true_intrinsics=False,
+    frustum_scale=5
 ):
     """
     カメラの姿勢と3D点群を可視化する。
 
     Args:
         cameras: read_images_txt / read_images_bin で得られるカメラ情報のリスト
+        camera_intrinsics: read_cameras で得られるカメラ内部パラメータの辞書
         points: (N, 3) の3D点群座標
         colors: (N, 3) のRGB色 (0-255)
         scene_bounds: ( (x_min, x_max), (y_min, y_max), (z_min, z_max) ) のタプル
                       None の場合は自動計算
         use_plotly: Trueの場合はPlotlyによるインタラクティブ可視化
         max_points: 表示する最大点数（多すぎる場合はサンプリング）
-        focal_len: カメラフラスタムの奥行きスケール
-        aspect_ratio: カメラフラスタムの画角スケール
+        focal_len: カメラフラスタムの奥行きスケール（use_true_intrinsics=Falseの場合）
+        aspect_ratio: カメラフラスタムの画角スケール（use_true_intrinsics=Falseの場合）
+        use_true_intrinsics: Trueの場合、実際のカメラ内部パラメータを使用
+        frustum_scale: 実際のフラスタムの奥行きスケール（use_true_intrinsics=Trueの場合）
     """
     # カメラ中心座標をまとめる
     camera_positions = np.array([cam['position'] for cam in cameras])
@@ -401,16 +549,27 @@ def visualize_cameras_and_points(
     if scene_bounds is None:
         # まず全カメラのフラスタム頂点を集めて、そこから境界を推定する
         all_vertices = []
+        
         for cam in cameras:
-            vertex_std = np.array([
-                [0, 0, 0, 1],
-                [focal_len * aspect_ratio, -focal_len * aspect_ratio, focal_len, 1],
-                [focal_len * aspect_ratio,  focal_len * aspect_ratio, focal_len, 1],
-                [-focal_len * aspect_ratio,  focal_len * aspect_ratio, focal_len, 1],
-                [-focal_len * aspect_ratio, -focal_len * aspect_ratio, focal_len, 1]
-            ])
-            vertex_transformed = vertex_std @ cam['extrinsic'].T
-            all_vertices.extend([v[:-1] for v in vertex_transformed])
+            if use_true_intrinsics and camera_intrinsics and cam['camera_id'] in camera_intrinsics:
+                # 内部パラメータを使用して正確なフラスタムを計算
+                vertices = get_camera_frustum_vertices(
+                    camera_intrinsics[cam['camera_id']], 
+                    cam['extrinsic'],
+                    scale=frustum_scale
+                )
+                all_vertices.extend([v[:-1] for v in vertices])
+            else:
+                # 近似フラスタムを使用
+                vertex_std = np.array([
+                    [0, 0, 0, 1],
+                    [focal_len * aspect_ratio, -focal_len * aspect_ratio, focal_len, 1],
+                    [focal_len * aspect_ratio,  focal_len * aspect_ratio, focal_len, 1],
+                    [-focal_len * aspect_ratio,  focal_len * aspect_ratio, focal_len, 1],
+                    [-focal_len * aspect_ratio, -focal_len * aspect_ratio, focal_len, 1]
+                ])
+                vertex_transformed = vertex_std @ cam['extrinsic'].T
+                all_vertices.extend([v[:-1] for v in vertex_transformed])
         
         all_vertices = np.array(all_vertices)
         
@@ -452,21 +611,84 @@ def visualize_cameras_and_points(
         color_val = i / max(1, len(cameras) - 1)  # カラースケール用(0-1)
         camera_name = f"Camera {i+1}: {cam['name']}"
         
-        # Matplotlib用のフラスタム描画
-        visualizer.extrinsic2pyramid(
-            cam['extrinsic'], 
-            color_map=color_val,
-            focal_len_scaled=focal_len,
-            aspect_ratio=aspect_ratio,
-            plotly_viz=use_plotly,
-            legend_group="Cameras",
-            name=camera_name,
-            show_legend=True
-        )
-        
-        # Plotly用データが更新されるので、それを Figure に追加
-        if use_plotly:
-            final_layout.add_trace(visualizer.plotly_data)
+        # 内部パラメータを使用するかどうかで処理を分岐
+        if use_true_intrinsics and camera_intrinsics and cam['camera_id'] in camera_intrinsics:
+            # 正確なフラスタム頂点を計算
+            vertices = get_camera_frustum_vertices(
+                camera_intrinsics[cam['camera_id']], 
+                cam['extrinsic'],
+                scale=frustum_scale
+            )
+            
+            # フラスタムを構成するポリゴン面
+            meshes = [
+                [vertices[0, :-1], vertices[1, :-1], vertices[2, :-1]],
+                [vertices[0, :-1], vertices[2, :-1], vertices[3, :-1]],
+                [vertices[0, :-1], vertices[3, :-1], vertices[4, :-1]],
+                [vertices[0, :-1], vertices[4, :-1], vertices[1, :-1]],
+                [vertices[1, :-1], vertices[2, :-1], vertices[3, :-1], vertices[4, :-1]]
+            ]
+            
+            # Matplotlib での色指定
+            if isinstance(color_val, str):
+                color = color_val
+            else:
+                color = plt.cm.rainbow(color_val)
+            
+            # Matplotlib で描画
+            visualizer.ax.add_collection3d(
+                Poly3DCollection(meshes, facecolors=color, linewidths=0.3, edgecolors=color, alpha=0.35)
+            )
+            
+            # Plotly での描画用データを作成
+            if use_plotly:
+                # Plotly用のカラースケールから色を取得
+                color_plotly = sample_colorscale('rainbow', color_val)[0] if not isinstance(color_val, str) else color_val
+                
+                # Plotly用の3D Meshデータを生成
+                x = []
+                y = []
+                z = []
+                for face in meshes:
+                    for vertex in face:
+                        x.append(vertex[0])
+                        y.append(vertex[1])
+                        z.append(vertex[2])
+                
+                # カメラ中心（最初の面の最初の頂点を利用）
+                camera_pos = vertices[0, :-1]
+                
+                data = go.Mesh3d(
+                    x=x, 
+                    y=y, 
+                    z=z, 
+                    opacity=0.7,
+                    color=color_plotly, 
+                    showlegend=True, 
+                    legendgroup="Cameras", 
+                    name=camera_name,
+                    hoverinfo='text',
+                    hovertext=f"{camera_name}<br>Position: ({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f})",
+                    hoverlabel=dict(bgcolor='white', font_size=12)
+                )
+                
+                final_layout.add_trace(data)
+        else:
+            # 近似フラスタムを使用
+            visualizer.extrinsic2pyramid(
+                cam['extrinsic'], 
+                color_map=color_val,
+                focal_len_scaled=focal_len,
+                aspect_ratio=aspect_ratio,
+                plotly_viz=use_plotly,
+                legend_group="Cameras",
+                name=camera_name,
+                show_legend=True
+            )
+            
+            # Plotly用データが更新されるので、それを Figure に追加
+            if use_plotly:
+                final_layout.add_trace(visualizer.plotly_data)
     
     # 3D点群を追加
     if points is not None and len(points) > 0:
@@ -521,16 +743,8 @@ def visualize_cameras_and_points(
         camera_buttons = []
         for i, cam in enumerate(cameras):
             # 各カメラ以外を非表示にする設定
-            #   トレースの並び:
-            #   0         -> Camera1
-            #   1         -> Camera2
-            #   ...
-            #   len(cameras)-1 -> CameraN
-            #   次が3D点(あるなら1トレース)
-            
-            # カメラ部分: j == i のみ True, それ以外 False
             visibility_list = [(j == i) for j in range(len(cameras))]
-            # 3D点がある場合は末尾のトレースを常に表示する ( True )
+            # 3D点がある場合は末尾のトレースを常に表示する
             if points is not None and len(points) > 0:
                 visibility_list.append(True)
             
@@ -582,7 +796,6 @@ def visualize_cameras_and_points(
         visualizer.colorbar(len(cameras))
         visualizer.show()
 
-
 ##############################################################################
 # メイン処理
 ##############################################################################
@@ -590,6 +803,8 @@ def main():
     parser = argparse.ArgumentParser(description='Visualize COLMAP camera poses and 3D points')
     parser.add_argument('--images', type=str, required=True,
                         help='Path to COLMAP images.txt or images.bin file')
+    parser.add_argument('--cameras', type=str, default=None,
+                        help='Path to COLMAP cameras.txt or cameras.bin file')
     parser.add_argument('--points', type=str, default=None,
                         help='Path to COLMAP points3D.txt or points3D.bin file')
     parser.add_argument('--plotly', action='store_true', default=True,
@@ -597,15 +812,30 @@ def main():
     parser.add_argument('--max_points', type=int, default=50000,
                         help='Maximum number of points to display')
     parser.add_argument('--focal_len', type=float, default=2,
-                        help='Focal length for camera visualization')
+                        help='Focal length for camera visualization (when not using true intrinsics)')
     parser.add_argument('--aspect_ratio', type=float, default=0.1,
-                        help='Aspect ratio for camera visualization')
+                        help='Aspect ratio for camera visualization (when not using true intrinsics)')
+    parser.add_argument('--use_true_intrinsics', action='store_true', default=False,
+                        help='Use actual camera intrinsics for frustum visualization')
+    parser.add_argument('--frustum_scale', type=float, default=5,
+                        help='Scale factor for camera frustum depth (when using true intrinsics)')
     
     args = parser.parse_args()
     
     # カメラ情報を読み込み
     cameras = read_images(args.images)
     print(f"Loaded {len(cameras)} cameras from {args.images}")
+    
+    # カメラ内部パラメータを読み込み（オプション）
+    camera_intrinsics = None
+    if args.cameras:
+        try:
+            camera_intrinsics = read_cameras(args.cameras)
+            print(f"Loaded {len(camera_intrinsics)} camera intrinsics from {args.cameras}")
+        except Exception as e:
+            print(f"Error loading camera intrinsics: {e}")
+            import traceback
+            traceback.print_exc()
     
     points = None
     colors = None
@@ -623,19 +853,28 @@ def main():
     # カメラ・点群を可視化
     visualize_cameras_and_points(
         cameras,
+        camera_intrinsics=camera_intrinsics,
         points=points,
         colors=colors,
         use_plotly=args.plotly,
         max_points=args.max_points,
         focal_len=args.focal_len,
-        aspect_ratio=args.aspect_ratio
+        aspect_ratio=args.aspect_ratio,
+        use_true_intrinsics=args.use_true_intrinsics,
+        frustum_scale=args.frustum_scale
     )
 
 if __name__ == "__main__":
     main()
 
+#png wo ba
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
 
+#colmap
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/images_correct.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/points3D.txt
 
+#colmap netf-synthetic
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/images.bin --points /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/points3D.bin
+
+
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
