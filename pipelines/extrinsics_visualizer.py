@@ -510,6 +510,140 @@ def get_camera_frustum_vertices(camera_params, extrinsic, scale=1.0):
     return vertex_transformed
 
 ##############################################################################
+# NeRF JSON読み込み用関数
+##############################################################################
+def read_nerf_json(json_path):
+    """
+    NeRFのtransforms_train.jsonなどからカメラパラメータを読み込む
+    
+    Args:
+        json_path: transforms_train.jsonなどのパス
+        
+    Returns:
+        cameras: カメラ情報のリスト
+        camera_angle_x: カメラのFOV（ラジアン）
+    """
+    import json
+    
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    
+    camera_angle_x = data.get('camera_angle_x', None)
+    frames = data.get('frames', [])
+    
+    cameras = []
+    for i, frame in enumerate(frames):
+        # 変換行列を取得
+        transform_matrix = np.array(frame['transform_matrix'])
+        
+        # NeRFの変換行列はカメラ->ワールドの変換
+        # しかし、NeRFの座標系はOpenGLスタイル（Y軸上向き、Z軸奥行き）
+        # COLMAPの座標系はY軸下向き、Z軸前方
+        # 座標系を変換する行列
+        # OpenGL -> COLMAP: X -> X, Y -> -Y, Z -> -Z
+        coord_transform = np.array([
+            [1,  0,  0, 0],
+            [0, -1,  0, 0],
+            [0,  0, -1, 0],
+            [0,  0,  0, 1]
+        ])
+        
+        # 座標系変換を適用
+        transform_matrix = transform_matrix @ coord_transform
+        
+        # 回転行列と並進ベクトルを抽出
+        R = transform_matrix[:3, :3]
+        t = transform_matrix[:3, 3]
+        
+        # カメラ中心位置（ワールド座標系）
+        C = t
+        
+        # クォータニオンを計算（回転行列から）
+        # 回転行列からクォータニオンへの変換
+        trace = R[0, 0] + R[1, 1] + R[2, 2]
+        
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            qw = 0.25 / s
+            qx = (R[2, 1] - R[1, 2]) * s
+            qy = (R[0, 2] - R[2, 0]) * s
+            qz = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+        
+        q = np.array([qw, qx, qy, qz])
+        q = q / np.linalg.norm(q)  # 正規化
+        
+        # 画像ファイル名を取得
+        file_path = frame.get('file_path', '')
+        image_name = os.path.basename(file_path)
+        
+        # カメラ情報を作成
+        camera_info = {
+            'image_id': i,
+            'camera_id': 0,  # NeRFでは通常1つのカメラモデルを使用
+            'name': image_name if image_name else f"frame_{i}",
+            'extrinsic': transform_matrix,
+            'quaternion': q,
+            'position': C,
+            'R': R,
+            't': t
+        }
+        
+        cameras.append(camera_info)
+    
+    return cameras, camera_angle_x
+
+def create_nerf_camera_intrinsics(camera_angle_x, width, height):
+    """
+    NeRFのカメラ角度からカメラ内部パラメータを作成
+    
+    Args:
+        camera_angle_x: X方向のFOV（ラジアン）
+        width: 画像幅
+        height: 画像高さ
+        
+    Returns:
+        camera_intrinsics: カメラ内部パラメータ辞書
+    """
+    # 焦点距離を計算
+    fx = width / (2 * np.tan(camera_angle_x / 2))
+    fy = fx  # 正方形ピクセルを仮定
+    
+    # 主点を画像中心に設定
+    cx = width / 2
+    cy = height / 2
+    
+    # カメラ内部パラメータ辞書を作成
+    camera_intrinsics = {
+        0: {  # camera_id = 0
+            'camera_id': 0,
+            'model': 'PINHOLE',  # PINHOLEモデルを使用
+            'width': width,
+            'height': height,
+            'params': [fx, fy, cx, cy]  # [fx, fy, cx, cy]
+        }
+    }
+    
+    return camera_intrinsics
+
+##############################################################################
 # 可視化用関数
 ##############################################################################
 def visualize_cameras_and_points(
@@ -801,12 +935,18 @@ def visualize_cameras_and_points(
 ##############################################################################
 def main():
     parser = argparse.ArgumentParser(description='Visualize COLMAP camera poses and 3D points')
-    parser.add_argument('--images', type=str, required=True,
+    parser.add_argument('--images', type=str, default=None,
                         help='Path to COLMAP images.txt or images.bin file')
     parser.add_argument('--cameras', type=str, default=None,
                         help='Path to COLMAP cameras.txt or cameras.bin file')
     parser.add_argument('--points', type=str, default=None,
                         help='Path to COLMAP points3D.txt or points3D.bin file')
+    parser.add_argument('--nerf_json', type=str, default=None,
+                        help='Path to NeRF transforms_train.json file')
+    parser.add_argument('--nerf_width', type=int, default=800,
+                        help='Width of NeRF images (default: 800)')
+    parser.add_argument('--nerf_height', type=int, default=800,
+                        help='Height of NeRF images (default: 800)')
     parser.add_argument('--plotly', action='store_true', default=True,
                         help='Use Plotly for interactive visualization')
     parser.add_argument('--max_points', type=int, default=50000,
@@ -823,19 +963,53 @@ def main():
     args = parser.parse_args()
     
     # カメラ情報を読み込み
-    cameras = read_images(args.images)
-    print(f"Loaded {len(cameras)} cameras from {args.images}")
-    
-    # カメラ内部パラメータを読み込み（オプション）
+    cameras = None
     camera_intrinsics = None
-    if args.cameras:
+    
+    # COLMAPデータとNeRFデータの両方が指定されていないか確認
+    if args.images is None and args.nerf_json is None:
+        print("Error: Either --images or --nerf_json must be specified")
+        parser.print_help()
+        return
+    
+    # COLMAPデータを読み込み
+    if args.images:
+        cameras = read_images(args.images)
+        print(f"Loaded {len(cameras)} cameras from {args.images}")
+        
+        # カメラ内部パラメータを読み込み（オプション）
+        if args.cameras:
+            try:
+                camera_intrinsics = read_cameras(args.cameras)
+                print(f"Loaded {len(camera_intrinsics)} camera intrinsics from {args.cameras}")
+            except Exception as e:
+                print(f"Error loading camera intrinsics: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # NeRFデータを読み込み
+    elif args.nerf_json:
         try:
-            camera_intrinsics = read_cameras(args.cameras)
-            print(f"Loaded {len(camera_intrinsics)} camera intrinsics from {args.cameras}")
+            cameras, camera_angle_x = read_nerf_json(args.nerf_json)
+            print(f"Loaded {len(cameras)} cameras from NeRF JSON: {args.nerf_json}")
+            
+            # NeRFのカメラ内部パラメータを作成
+            if camera_angle_x is not None:
+                camera_intrinsics = create_nerf_camera_intrinsics(
+                    camera_angle_x, args.nerf_width, args.nerf_height
+                )
+                print(f"Created camera intrinsics from NeRF FOV: {np.degrees(camera_angle_x):.2f} degrees")
+            else:
+                print("Warning: camera_angle_x not found in NeRF JSON")
         except Exception as e:
-            print(f"Error loading camera intrinsics: {e}")
+            print(f"Error loading NeRF JSON: {e}")
             import traceback
             traceback.print_exc()
+    
+    # カメラ情報が読み込めなかった場合は終了
+    if cameras is None or len(cameras) == 0:
+        print("Error: No camera information loaded")
+        return
     
     points = None
     colors = None
@@ -867,7 +1041,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-#png wo ba
+#png w ba
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
 
 #colmap
@@ -877,4 +1051,5 @@ if __name__ == "__main__":
 #python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/images.bin --points /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/points3D.bin
 
 
-#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
+#nerf materials gt
+#python extrinsics_visualizer.py --nerf_json /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/materials/transforms_train.json --use_true_intrinsics
