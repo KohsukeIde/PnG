@@ -3,6 +3,7 @@ import sys
 import argparse
 import pickle
 import glob
+import json
 from typing import List, Dict, Tuple, Optional
 import time
 
@@ -151,7 +152,7 @@ def parse_args():
     parser.add_argument(
         "--ba_every_n_views",
         type=int,
-        default=3,
+        default=1,
         help="Perform incremental Bundle Adjustment every N views (1 = after every view)"
     )
     parser.add_argument(
@@ -159,6 +160,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Force using a single intrinsic matrix for all cameras (useful when COLMAP data is incomplete)"
+    )
+    parser.add_argument(
+        "--use_nerf_intrinsics",
+        action="store_true",
+        default=True,
+        help="Use camera intrinsics from NeRF dataset's transforms_train.json"
     )
     parser.add_argument(
         "--ba_skip_final",
@@ -169,20 +176,26 @@ def parse_args():
     parser.add_argument(
         "--use_sparse_set",
         action="store_true",
-        default=True,
-        help="Use a sparse subset of available images"
+        default=False,
+        help="Use a sparse subset of available images" # (ランダムではないので注意)
     )
     parser.add_argument(
         "--sparse_interval",
         type=int,
-        default=10,
+        default=2,
         help="Interval for sparse image set (e.g., 2 means use every 2nd image)"
     )
     parser.add_argument(
         "--max_images",
         type=int,
         default=None,
-        help="Maximum number of images to use (None means use all available)"
+        help="Maximum number of images to use (None means use all available)" #(これも修正必須)
+    )
+    parser.add_argument(
+        "--max_views_to_add",
+        type=int,
+        default=8,
+        help="Maximum number of views to add after initial pair (None means no limit)"
     )
     
     return parser.parse_args()
@@ -199,6 +212,70 @@ def get_image_names(directory: str) -> List[str]:
     image_names = [os.path.basename(path) for path in image_names]
     
     return sorted(image_names)
+
+def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
+    """
+    Load camera intrinsics from NeRF dataset's transforms_train.json file.
+    
+    Args:
+        data_dir: Directory containing the transforms_train.json file
+        
+    Returns:
+        np.ndarray: The camera intrinsic matrix K
+    """
+    json_path = os.path.join(data_dir, "transforms_train.json")
+    
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"NeRF transforms file not found: {json_path}")
+    
+    try:
+        with open(json_path, 'r') as f:
+            transforms = json.load(f)
+        
+        # NeRF datasets provide camera_angle_x which is the horizontal FOV in radians
+        fov_x = transforms.get("camera_angle_x")
+        
+        if fov_x is None:
+            raise ValueError("transforms_train.json does not contain camera_angle_x")
+        
+        # Get image dimensions - assume square images
+        frame_path = transforms["frames"][0]["file_path"]
+        frame_path = frame_path.replace("./train/", "")
+        
+        # Check both train and images directories
+        img_path = os.path.join(data_dir, "train", f"{frame_path}.png")
+        if not os.path.exists(img_path):
+            img_path = os.path.join(data_dir, "images", f"{frame_path}.png")
+        
+        if not os.path.exists(img_path):
+            # Assume default NeRF resolution of 800x800
+            width = height = 800
+            print(f"Image not found, assuming default NeRF resolution of {width}x{height}")
+        else:
+            from PIL import Image
+            img = Image.open(img_path)
+            width, height = img.size
+            print(f"Found image with dimensions {width}x{height}")
+        
+        # Calculate focal length from FOV
+        # focal_length = (width / 2) / tan(fov_x / 2)
+        focal_length = (width / 2) / np.tan(fov_x / 2)
+        
+        # Construct intrinsic matrix K
+        K = np.array([
+            [focal_length, 0, width / 2],
+            [0, focal_length, height / 2],
+            [0, 0, 1]
+        ])
+        
+        print(f"Loaded NeRF intrinsics with focal length: {focal_length:.2f}")
+        print(f"K = \n{K}")
+        
+        return K
+        
+    except Exception as e:
+        print(f"Error loading NeRF intrinsics: {e}")
+        raise
 
 def get_fitted_gaussians_info(directory: str) -> Dict[str, str]:
     """Get mappings between image names and their fitted Gaussian pkl files."""
@@ -462,19 +539,38 @@ def perform_bundle_adjustment(
             # COLMAPフォーマットで出力
             colmap_ba_dir = os.path.join(save_dir, "colmap_ba")
             os.makedirs(colmap_ba_dir, exist_ok=True)
-            ba.export_colmap_format(colmap_ba_dir)
+            
+            # Get valid point indices (points with at least 2 observations)
+            valid_point_indices = ba.get_valid_point_indices(min_observations=2)
+            
+            # Use existing export functions
+            export_colmap_format(
+                output_dir=colmap_ba_dir,
+                points_3d=reconstruction_data["points_3d"],
+                camera_params_list=reconstruction_data["camera_params_list"],
+                match_points_2d=ba.match_points_2d,
+                intrinsics_list=ba.intrinsics_list,
+                image_names=ba.image_names
+            )
+            
+            # Filter points for PLY export
+            valid_points = [reconstruction_data["points_3d"][i] for i in valid_point_indices]
+            valid_colors = [reconstruction_data["color_3d"][i] for i in valid_point_indices] if "color_3d" in reconstruction_data else None
+            valid_covariances = [reconstruction_data["covariances_3d"][i] for i in valid_point_indices] if "covariances_3d" in reconstruction_data else None
+            valid_alphas = [reconstruction_data["alpha_3d"][i] for i in valid_point_indices] if "alpha_3d" in reconstruction_data else None
             
             # PLYとして保存
             ply_path = os.path.join(save_dir, "ba_optimized.ply")
-            save_ellipsoids_as_ply(
-                points_3d=reconstruction_data["points_3d"],
-                covariances_3d=reconstruction_data["covariances_3d"],
-                colors_3d=reconstruction_data["color_3d"],
-                alphas_3d=reconstruction_data["alpha_3d"],
-                filename=ply_path,
-                camera_params=reconstruction_data["camera_params_list"],
-                use_alpha=True
-            )
+            if len(valid_points) > 0:  # Only save if we have valid points
+                save_ellipsoids_as_ply(
+                    points_3d=np.array(valid_points),
+                    covariances_3d=np.array(valid_covariances) if valid_covariances else None,
+                    colors_3d=np.array(valid_colors) if valid_colors else None,
+                    alphas_3d=np.array(valid_alphas) if valid_alphas else None,
+                    filename=ply_path,
+                    camera_params=reconstruction_data["camera_params_list"],
+                    use_alpha=True
+                )
             
             print(f"BA results saved to {save_dir}")
     else:
@@ -494,7 +590,8 @@ def perform_initial_reconstruction(
     auto_target_volume: bool = True,
     device: torch.device = None,
     enable_ba: bool = True,
-    ba_iterations: int = 10
+    ba_iterations: int = 10,
+    nerf_K: Optional[np.ndarray] = None
 ) -> Dict:
     """Perform initial 3D reconstruction from two views.
     
@@ -552,59 +649,71 @@ def perform_initial_reconstruction(
         cameras = {}
         images_data = {}
     
-    # Determine whether to use COLMAP camera data or fallback to a generic intrinsic matrix(in the case of using "non-colmappable" data→ex:meterials)
-    use_colmap_cameras = has_colmap_data and bool(cameras) and bool(images_data)
+    # Priority for camera intrinsics:
+    # 1. NeRF intrinsics (if provided)
+    # 2. COLMAP camera data
+    # 3. Intrinsics from Gaussian fitting
+    # 4. Default intrinsic matrix
     
-    if use_colmap_cameras:
-        # Get image IDs from COLMAP data
-        image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
-        print(f"Available images in COLMAP data: {image_name_to_id}")
-
-        image1_id = image_name_to_id.get(img1_name)
-        image2_id = image_name_to_id.get(img2_name)
-        
-        # Double check that both images are in COLMAP data
-        if image1_id is None or image2_id is None:
-            print(f"Warning: Image {img1_name} or {img2_name} not found in COLMAP data.")
-            print("Will use a single generic intrinsic matrix for all cameras.")
-            use_colmap_cameras = False
+    # First check for NeRF intrinsics
+    if nerf_K is not None:
+        K1 = nerf_K
+        K2 = nerf_K
+        print("Using intrinsic matrix from NeRF dataset's transforms_train.json")
     else:
-        print("No valid COLMAP data found. Will use a single generic intrinsic matrix for all cameras.")
+        # Next try COLMAP data
+        use_colmap_cameras = has_colmap_data and bool(cameras) and bool(images_data)
+        
+        if use_colmap_cameras:
+            # Get image IDs from COLMAP data
+            image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
+            print(f"Available images in COLMAP data: {image_name_to_id}")
     
-    if use_colmap_cameras:
-        # Create camera models from COLMAP data
-        camera1_id = images_data[image1_id]['camera_id']
-        camera2_id = images_data[image2_id]['camera_id']
-        
-        camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
-        camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
-        
-        K1 = camera1.K
-        K2 = camera2.K
-    else:
-        # Use a common intrinsic matrix
-        # Get information from 2D Gaussians if available
-        _, _, _, K_from_gs1 = load_gaussians_torch(gaussians1_path, device)
-        _, _, _, K_from_gs2 = load_gaussians_torch(gaussians2_path, device)
-        
-        if K_from_gs1 is not None:
-            K1 = K_from_gs1
-            K2 = K_from_gs1
-            print(f"Using intrinsic matrix from 2D Gaussians data.")
-        else:
-            # Use a default intrinsic matrix (centered principal point, focal length based on arbitrary values)
-            H, W = 800, 800  # Random image size, adjust as needed
-            fx, fy = 1.2*W, 1.2*W  # Random focal length (1.2x image width)
-            cx, cy = W/2, H/2  # Principal point at center
+            image1_id = image_name_to_id.get(img1_name)
+            image2_id = image_name_to_id.get(img2_name)
             
-            K1 = np.array([
-                [fx, 0, cx],
-                [0, fy, cy],
-                [0, 0, 1]
-            ])
-            K2 = K1
-            print(f"Using default intrinsic matrix with focal length: {fx:.2f}")
-            print(f"K = \n{K1}")
+            # Double check that both images are in COLMAP data
+            if image1_id is None or image2_id is None:
+                print(f"Warning: Image {img1_name} or {img2_name} not found in COLMAP data.")
+                print("Will use a single generic intrinsic matrix for all cameras.")
+                use_colmap_cameras = False
+        else:
+            print("No valid COLMAP data found. Will use a single generic intrinsic matrix for all cameras.")
+        
+        if use_colmap_cameras:
+            # Create camera models from COLMAP data
+            camera1_id = images_data[image1_id]['camera_id']
+            camera2_id = images_data[image2_id]['camera_id']
+            
+            camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
+            camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
+            
+            K1 = camera1.K
+            K2 = camera2.K
+        else:
+            # Use a common intrinsic matrix
+            # Get information from 2D Gaussians if available
+            _, _, _, K_from_gs1 = load_gaussians_torch(gaussians1_path, device)
+            _, _, _, K_from_gs2 = load_gaussians_torch(gaussians2_path, device)
+            
+            if K_from_gs1 is not None:
+                K1 = K_from_gs1
+                K2 = K_from_gs1
+                print(f"Using intrinsic matrix from 2D Gaussians data.")
+            else:
+                # Use a default intrinsic matrix (centered principal point, focal length based on arbitrary values)
+                H, W = 800, 800  # Random image size, adjust as needed
+                fx, fy = 1.2*W, 1.2*W  # Random focal length (1.2x image width)
+                cx, cy = W/2, H/2  # Principal point at center
+                
+                K1 = np.array([
+                    [fx, 0, cx],
+                    [0, fy, cy],
+                    [0, 0, 1]
+                ])
+                K2 = K1
+                print(f"Using default intrinsic matrix with focal length: {fx:.2f}")
+                print(f"K = \n{K1}")
     
     solver = OptimalTransportSolver(
         gaussians1=gaussians1,
@@ -933,11 +1042,14 @@ def process_remaining_source_gaussians(
         print("No source gaussians could be processed")
         return 0
 
-def select_reference_camera(camera_params_list):
-    """視点拡張時の参照カメラを選択する
+def select_reference_camera(camera_params_list, source_gaussians_data=None):
+    """視点拡張時の参照カメラを選択する - 改良版
+    
+    湧出ガウスの数をベースにした参照カメラ選択。未処理湧出ガウスが最も多いカメラを優先する。
     
     Args:
         camera_params_list: カメラパラメータのリスト
+        source_gaussians_data: 湧出ガウス情報（オプション）
         
     Returns:
         int: 参照カメラのインデックス
@@ -946,8 +1058,45 @@ def select_reference_camera(camera_params_list):
         # カメラが1つしかなければそれを使用
         return 0
     
-    # 最新のカメラ（直前に追加されたカメラ）を参照として使用→これが一番多く湧出ガウスを持つはず
-    return len(camera_params_list) - 1
+    # 湧出ガウス情報がない場合、従来通り最新カメラを使用
+    if source_gaussians_data is None:
+        return len(camera_params_list) - 1
+    
+    # 各カメラの未処理湧出ガウス数をカウント
+    unprocessed_counts = {}
+    for key, data in source_gaussians_data.items():
+        if not key.startswith('source_gaussians') or 'indices' not in data:
+            continue
+        
+        # カメラインデックスを抽出（例: 'source_gaussians1_data' -> 1）
+        try:
+            cam_idx = int(key.replace('source_gaussians', '').replace('_data', '')) - 1
+            if cam_idx < len(camera_params_list):  # 有効なインデックスか確認
+                if 'processed' in data:
+                    # 未処理の湧出ガウス数をカウント
+                    unproc_count = np.sum(~data['processed'])
+                    unprocessed_counts[cam_idx] = unproc_count
+                else:
+                    # processed フラグが無い場合は全て未処理と見なす
+                    unprocessed_counts[cam_idx] = len(data['indices'])
+        except (ValueError, IndexError):
+            continue
+    
+    # デバッグ情報出力
+    for cam_idx, count in unprocessed_counts.items():
+        print(f"カメラ {cam_idx}: 未処理湧出ガウス {count}個")
+    
+    # 未処理湧出ガウスが最も多いカメラを選択
+    if unprocessed_counts:
+        best_cam_idx = max(unprocessed_counts.keys(), key=lambda k: unprocessed_counts[k])
+        if unprocessed_counts[best_cam_idx] > 0:  # 未処理ガウスが存在する場合
+            print(f"選択された参照カメラ {best_cam_idx}: 未処理湧出ガウス {unprocessed_counts[best_cam_idx]}個")
+            return best_cam_idx
+    
+    # 未処理湧出ガウスが無いか、情報が不十分な場合は最新カメラを使用
+    latest_cam_idx = len(camera_params_list) - 1
+    print(f"未処理湧出ガウスが見つからなかったため、最新カメラ {latest_cam_idx} を使用")
+    return latest_cam_idx
 
 def add_new_viewpoint(
     reconstruction_data: Dict,
@@ -1023,7 +1172,7 @@ def add_new_viewpoint(
     
     # Get used images 
     used_images = reconstruction_data["used_images"]
-    reference_camera_idx = select_reference_camera(camera_params_list)
+    reference_camera_idx = select_reference_camera(camera_params_list, source_gaussians_data)
     print(f"Using camera {reference_camera_idx} as reference for new viewpoint")
     
     extender = ViewpointExtender(
@@ -1170,20 +1319,29 @@ def run_complete_pipeline(args):
     all_images = get_image_names(image_dir)
     gaussian_files = get_fitted_gaussians_info(args.fitted_gaussians_dir)
     
-    # Check if COLMAP directory exists(read camera intrinsics from colmap data)
+    # Check if we should use NeRF intrinsics
+    nerf_K = None
+    if args.use_nerf_intrinsics:
+        try:
+            print("Using camera intrinsics from NeRF dataset's transforms_train.json")
+            nerf_K = load_nerf_intrinsics(args.data_dir)
+        except Exception as e:
+            print(f"Error loading NeRF intrinsics: {e}")
+            print("Falling back to other intrinsics options")
+    
+    # Check if COLMAP directory exists (read camera intrinsics from colmap data)
     has_colmap_data = os.path.exists(colmap_dir) and os.path.isdir(colmap_dir)
     if not has_colmap_data or args.force_single_intrinsic:
-        print(f"{'Warning: COLMAP directory not found' if not has_colmap_data else 'User requested single intrinsic matrix'}. Will use a single intrinsic matrix for all cameras.")
+        if not args.use_nerf_intrinsics:
+            print(f"{'Warning: COLMAP directory not found' if not has_colmap_data else 'User requested single intrinsic matrix'}. Will use a single intrinsic matrix for all cameras.")
     
     # Filter to only images with fitted Gaussians 
     available_images = [img for img in all_images if img in gaussian_files]
     
-    # Apply sparse set filtering if requested
-    if args.use_sparse_set:
-        print(f"Using sparse image set with interval {args.sparse_interval}")
-        available_images = available_images[::args.sparse_interval]
-        
-    # Apply maximum images limit if set
+    # Don't filter available images upfront anymore
+    # We'll use all available images for initial pair selection
+    
+    # Apply maximum images limit if set - this still limits the total number of images in the dataset
     if args.max_images is not None and len(available_images) > args.max_images:
         print(f"Limiting to {args.max_images} images out of {len(available_images)} available")
         available_images = available_images[:args.max_images]
@@ -1234,7 +1392,8 @@ def run_complete_pipeline(args):
             auto_target_volume=args.auto_target_volume,
             device=device,
             enable_ba=args.enable_ba and not args.ba_skip_initial,
-            ba_iterations=args.ba_iterations
+            ba_iterations=args.ba_iterations,
+            nerf_K=nerf_K
         )
         
         # If we calculated the target volume automatically, store it for future use
@@ -1256,14 +1415,27 @@ def run_complete_pipeline(args):
     # 3. Incremental reconstruction
     #####################################################
     iteration = 1
+    views_added = 0  # Counter for the number of views we've added
     remaining_images = [img for img in available_images if img not in used_images]
     total_remaining = len(remaining_images)
     
-    while remaining_images:
+    # Calculate maximum views to add based on parameters
+    if args.max_views_to_add is not None:
+        max_views = args.max_views_to_add
+        print(f"Will add at most {max_views} additional views")
+    elif args.use_sparse_set:
+        # If using sparse set, calculate max views from interval
+        max_views = (len(available_images) - 2) // args.sparse_interval
+        print(f"Using sparse interval {args.sparse_interval}, will add {max_views} views")
+    else:
+        max_views = None
+        print("No limit on number of views to add")
+    
+    while remaining_images and (max_views is None or views_added < max_views):
         print(f"\n--- Iteration {iteration}/{total_remaining} ---")
         
         # Select next best view
-        next_image = selector.select_next_view_simple(remaining_images, n_select=1)[0]
+        next_image = selector.select_next_view(remaining_images, n_select=1)[0]
         
         # Process the selected image
         iter_output_dir = os.path.join(args.output_dir, f"iteration_{iteration}")
@@ -1313,16 +1485,27 @@ def run_complete_pipeline(args):
             selector.set_source_gaussians_data(updated_data["source_gaussians_data"])
                 
     
-        # Increment iteration counter
+        # Increment counters
         iteration += 1
+        views_added += 1
         
         # Calculate and print progress
         elapsed_time = time.time() - start_time
-        processed_count = total_remaining - len(remaining_images)
-        avg_time_per_image = elapsed_time / processed_count if processed_count > 0 else 0
-        estimated_remaining = avg_time_per_image * len(remaining_images)
+        processed_count = views_added
         
-        print(f"\nProgress: {processed_count}/{total_remaining} images processed")
+        # Adjust estimates based on view limits
+        if max_views is not None:
+            remaining_to_process = min(max_views - views_added, len(remaining_images))
+        else:
+            remaining_to_process = len(remaining_images)
+            
+        avg_time_per_image = elapsed_time / processed_count if processed_count > 0 else 0
+        estimated_remaining = avg_time_per_image * remaining_to_process
+        
+        print(f"\nProgress: {processed_count} views added")
+        if max_views is not None:
+            print(f"Maximum views to add: {max_views}, Remaining: {max_views - views_added}")
+        print(f"Remaining images to choose from: {len(remaining_images)}")
         print(f"Elapsed time: {elapsed_time:.2f} seconds")
         print(f"Estimated time remaining: {estimated_remaining:.2f} seconds")
     
@@ -1472,10 +1655,14 @@ def run_complete_pipeline(args):
         pickle.dump(reconstruction_data, f)
     
     print("\n--- Pipeline Completed Successfully ---")
-    print(f"Total images processed: {len(reconstruction_data['used_images'])}")
+    print(f"Total images used: {len(reconstruction_data['used_images'])}")
+    if max_views is not None:
+        print(f"Views added: {views_added} out of maximum {max_views}")
     print(f"Total 3D Gaussians: {len(reconstruction_data['existing_3d_gaussians'])}")
     print(f"Final results saved to {final_output_dir}")
     print(f"Total execution time: {time.time() - start_time:.2f} seconds")
+
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -1486,9 +1673,11 @@ if __name__ == "__main__":
     
     # Print image selection settings
     if args.use_sparse_set:
-        print(f"Using sparse image set with interval: {args.sparse_interval}")
+        print(f"Using sparse interval: {args.sparse_interval}")
     if args.max_images:
-        print(f"Maximum images limit: {args.max_images}")
+        print(f"Maximum dataset images limit: {args.max_images}")
+    if args.max_views_to_add:
+        print(f"Maximum views to add: {args.max_views_to_add}")
         
     # Print bundle adjustment settings
     print(f"Bundle Adjustment: {'Enabled' if args.enable_ba else 'Disabled'}")
@@ -1501,7 +1690,8 @@ if __name__ == "__main__":
         print(f"  - Final BA: {'Skip' if args.ba_skip_final else 'Perform'}")
     
     # Print camera settings
-    print(f"Camera intrinsics: {'Force single matrix' if args.force_single_intrinsic else 'Use per-camera if available'}")
+    camera_source = "NeRF transforms_train.json" if args.use_nerf_intrinsics else "Force single matrix" if args.force_single_intrinsic else "Use per-camera if available"
+    print(f"Camera intrinsics: {camera_source}")
     
     print("=====================================\n")
     run_complete_pipeline(args)
