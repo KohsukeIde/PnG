@@ -75,8 +75,8 @@ def parse_args():
         "--feature_type",
         type=str,
         default="sift",
-        choices=["sift", "orb"],
-        help="Type of features to extract"
+        choices=["sift", "orb", "clip"],
+        help="Type of features to extract for view selection (sift, orb, or clip)"
     )
     parser.add_argument(
         "--min_overlap",
@@ -134,8 +134,8 @@ def parse_args():
     parser.add_argument(
         "--ba_iterations",
         type=int,
-        default=5,
-        help="Maximum iterations for Bundle Adjustment"
+        default=20,
+        help="Maximum iterations for Bundle Adjustment (must be more than 10)"
     )
     parser.add_argument(
         "--ba_skip_initial",
@@ -335,71 +335,74 @@ def select_initial_pair(
     if len(available_images) < 2:
         raise ValueError(f"Need at least 2 images with fitted Gaussians, found {len(available_images)}")
     
-    # Initialize ViewSelector with CLIP features for textureless images
+    # Initialize ViewSelector with specified feature type
     selector = ViewSelector(
         image_dir=image_dir,
+        vocab_size=vocab_size,
+        feature_type=feature_type,
         min_overlap_ratio=min_overlap,
         max_overlap_ratio=max_overlap
     )
     
-    # Process ONLY the available images to extract CLIP features
+    # Process available images to extract features
     image_paths = [os.path.join(image_dir, img) for img in available_images]
-    
-    print(f"Processing {len(image_paths)} images using CLIP (out of all images in directory)")
     selector.process_images(image_paths)
     
-    # Calculate CLIP similarity matrix between all pairs using CLIP features
+    # Calculate similarity matrix between all pairs
     similarity_matrix = np.zeros((len(available_images), len(available_images)))
     
-    # Get paths
-    image_paths = [os.path.join(image_dir, img) for img in available_images]
-    
-    # Get available CLIP features
-    valid_paths = [p for p in image_paths if p in selector.clip_features]
-    
-    # Make sure we have at least 2 images with valid CLIP features
-    if len(valid_paths) < 2:
-        print("Warning: Not enough images with valid CLIP features")
-        print("Attempting to extract features again...")
-        # Try to extract features one more time
-        for path in image_paths:
-            if path not in selector.clip_features:
-                clip_feature = selector.extract_clip_features(path)
-                if clip_feature is not None:
-                    selector.clip_features[path] = clip_feature
-        
-        # Update the valid paths
+    # Compute similarities based on the feature type
+    if selector.feature_type == 'clip' and selector.clip_model is not None:
+        # Using CLIP features for similarity
         valid_paths = [p for p in image_paths if p in selector.clip_features]
         
-        if len(valid_paths) < 2:
-            print("Warning: Still not enough images with valid CLIP features")
+        if len(valid_paths) >= 2:
+            clip_features = np.vstack([selector.clip_features[p] for p in valid_paths])
+            clip_similarity = cosine_similarity(clip_features, clip_features)
+            
+            # Map to original indices
+            for i, path1 in enumerate(valid_paths):
+                idx1 = image_paths.index(path1)
+                for j, path2 in enumerate(valid_paths):
+                    if i >= j:  # Avoid redundant computation and self-comparison
+                        continue
+                    idx2 = image_paths.index(path2)
+                    similarity = clip_similarity[i, j]
+                    similarity_matrix[idx1, idx2] = similarity
+                    similarity_matrix[idx2, idx1] = similarity
+        else:
+            print("Warning: Not enough images with valid CLIP features")
             print("Using random similarity values")
-            # Fill the similarity matrix with random values as fallback
             similarity_matrix = np.random.rand(len(available_images), len(available_images))
-            # Make it symmetric
             similarity_matrix = (similarity_matrix + similarity_matrix.T) / 2
-            # Set diagonal to 1
+            np.fill_diagonal(similarity_matrix, 1.0)
+    else:
+        # Using traditional feature histograms for similarity
+        valid_paths = [p for p in image_paths if p in selector.image_histograms]
+        
+        if len(valid_paths) >= 2:
+            # Construct histogram vectors for valid paths
+            histograms = np.vstack([selector.image_histograms[p] for p in valid_paths])
+            hist_similarity = cosine_similarity(histograms, histograms)
+            
+            # Map to original indices
+            for i, path1 in enumerate(valid_paths):
+                idx1 = image_paths.index(path1)
+                for j, path2 in enumerate(valid_paths):
+                    if i >= j:
+                        continue
+                    idx2 = image_paths.index(path2)
+                    similarity = hist_similarity[i, j]
+                    similarity_matrix[idx1, idx2] = similarity
+                    similarity_matrix[idx2, idx1] = similarity
+        else:
+            print("Warning: Not enough images with valid feature histograms")
+            print("Using random similarity values")
+            similarity_matrix = np.random.rand(len(available_images), len(available_images))
+            similarity_matrix = (similarity_matrix + similarity_matrix.T) / 2
             np.fill_diagonal(similarity_matrix, 1.0)
     
-    # Extract CLIP features if we have enough valid paths
-    if len(valid_paths) >= 2:
-        clip_features = np.vstack([selector.clip_features[p] for p in valid_paths])
-        
-        # Calculate similarity matrix for valid paths
-        clip_similarity = cosine_similarity(clip_features, clip_features)
-        
-        # Map to original indices
-        for i, path1 in enumerate(valid_paths):
-            idx1 = image_paths.index(path1)
-            for j, path2 in enumerate(valid_paths):
-                if i >= j:  # Avoid redundant computation and self-comparison
-                    continue
-                idx2 = image_paths.index(path2)
-                similarity = clip_similarity[i, j]
-                similarity_matrix[idx1, idx2] = similarity
-                similarity_matrix[idx2, idx1] = similarity
-    
-    # Each image is represented by its CLIP embedding directly
+    # Assign feature richness scores (default to 1.0 for all images)
     feature_scores = np.ones(len(available_images))
 
     best_pair = None
@@ -452,12 +455,13 @@ def select_initial_pair(
 
 def perform_bundle_adjustment(
     reconstruction_data: Dict,
-    ba_iterations: int = 10, 
+    ba_iterations: int = 100, 
     device: torch.device = None,
     verbose: bool = True,
-    save_dir: Optional[str] = None
+    save_dir: Optional[str] = None,
+    use_staged: bool = True  # Use staged optimization like COLMAP
 ) -> Dict:
-    """BA実行,カメラパラメータとGS中心位置を最適化
+    """BA実行,カメラパラメータとGS中心位置を最適化 (COLMAP like approach)
     
     Args:
         reconstruction_data: 再構成データ辞書
@@ -465,13 +469,14 @@ def perform_bundle_adjustment(
         device: 計算デバイス
         verbose: 詳細な出力を表示するかどうか
         save_dir: 結果を保存するディレクトリ
+        use_staged: COLMAP風の段階的最適化を使用するか
         
     Returns:
         Dict: 更新された再構成データ
     """
-    print("\n--- Performing Bundle Adjustment ---")
+    print("\n--- Performing Bundle Adjustment (COLMAP-like) ---")
     
-    # 観測データ構築
+    # 観測データ構築 - point3D_observations 構造を使用
     observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
     
     if not observation_map:
@@ -490,7 +495,7 @@ def perform_bundle_adjustment(
         print(f"Not enough observations ({total_obs}) for meaningful Bundle Adjustment. Skipping.")
         return reconstruction_data
     
-    # 各カメラの内部パラメータリスト（現状必要ないが，colmap破綻するケースだと使うかも）
+    # 各カメラの内部パラメータリスト
     intrinsics_list = []
     for cam_idx in range(num_cameras):
         # カメラ固有のKがあればそれを使用
@@ -505,6 +510,9 @@ def perform_bundle_adjustment(
     
     image_names = reconstruction_data.get("used_images", None)
     
+    # COLMAP風のロバスト損失スケールを初期値として使用
+    initial_loss_scale = 2.0
+    
     ba = BundleAdjuster(
         points_3d=reconstruction_data["points_3d"],
         camera_params_list=reconstruction_data["camera_params_list"],
@@ -512,15 +520,26 @@ def perform_bundle_adjustment(
         intrinsics_list=intrinsics_list,
         image_names=image_names,
         use_robust_loss=True,
-        loss_scale=1.0
+        loss_scale=initial_loss_scale  # COLMAP standard scale
     )
     
-    # ba最適化実行
-    ba_results = ba.optimize(n_iterations=ba_iterations, verbose=verbose)
+    # BA最適化実行 - COLMAPスタイルの段階的最適化サポート
+    ba_results = ba.optimize(
+        n_iterations=ba_iterations, 
+        verbose=verbose,
+        use_staged=use_staged  # 段階的最適化を使用
+    )
     
     if ba_results["success"]:
-        print(f"Bundle Adjustment completed successfully.")
-        print(f"Initial RMSE: {ba_results.get('initial_rmse', 'N/A'):.4f} pixels")
+        # 段階的BAの場合は結果メッセージを調整
+        if use_staged:
+            print(f"Staged Bundle Adjustment completed successfully.")
+        else:
+            print(f"Bundle Adjustment completed successfully.")
+            
+        # 結果のRMSE情報を表示    
+        if "initial_rmse" in ba_results:
+            print(f"Initial RMSE: {ba_results['initial_rmse']:.4f} pixels")
         print(f"Final RMSE: {ba_results.get('final_rmse', 'N/A'):.4f} pixels")
         
         # 再構成データを更新
@@ -543,6 +562,12 @@ def perform_bundle_adjustment(
             # Get valid point indices (points with at least 2 observations)
             valid_point_indices = ba.get_valid_point_indices(min_observations=2)
             
+            # 観測数情報を出力
+            if verbose:
+                point_obs_counts = ba.get_point_observation_counts()
+                points_with_2plus = sum(1 for count in point_obs_counts if count >= 2)
+                print(f"Points with 2+ observations: {points_with_2plus} out of {len(point_obs_counts)}")
+                
             # Use existing export functions
             export_colmap_format(
                 output_dir=colmap_ba_dir,
@@ -553,7 +578,7 @@ def perform_bundle_adjustment(
                 image_names=ba.image_names
             )
             
-            # Filter points for PLY export
+            # Filter points for PLY export - COLMAPスタイルで観測数2以上のみ使用
             valid_points = [reconstruction_data["points_3d"][i] for i in valid_point_indices]
             valid_colors = [reconstruction_data["color_3d"][i] for i in valid_point_indices] if "color_3d" in reconstruction_data else None
             valid_covariances = [reconstruction_data["covariances_3d"][i] for i in valid_point_indices] if "covariances_3d" in reconstruction_data else None
