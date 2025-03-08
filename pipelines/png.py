@@ -12,12 +12,6 @@ import torch
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Add project root to Python path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
-
-
 from src.reconstructor.view_selector import ViewSelector
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 from src.reconstructor.viewpoint_extender import ViewpointExtender
