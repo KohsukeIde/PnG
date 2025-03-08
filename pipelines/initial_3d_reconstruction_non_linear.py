@@ -7,11 +7,6 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 
-# Add parent directory to Python path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
-
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
@@ -39,13 +34,13 @@ def render_gaussians_alpha_blend(
     """3Dガウスをアルファブレンド(Over)でレンダリングする関数
     
     手順:
-      1) ガウスの中心深度 Z_c (カメラ座標系) が大きい順に並び替え (遠い->近い)
-      2) 後ろから順にガウスをレンダリングし、アルファブレンドする
-         alpha_composite: 
-             C_out = C_new * A_new + C_in * (1 - A_new)
-             A_out = A_in + A_new * (1 - A_in)
-      3) 結果を (H,W,3) の color_img と (H,W) の alpha_img にして返す
-    
+        1) ガウスの中心深度 Z_c (カメラ座標系) が大きい順に並び替え (遠い->近い)
+        2) 後ろから順にガウスをレンダリングし、アルファブレンドする
+        alpha_composite: 
+                C_out = C_new * A_new + C_in * (1 - A_new)
+                A_out = A_in + A_new * (1 - A_in)
+        3) 結果を (H,W,3) の color_img と (H,W) の alpha_img にして返す
+
     Args:
         points_3d (N,3)          : 3Dガウスの中心 (world座標)
         covariances_3d (N,3,3)   : 3Dガウスの共分散行列 (world座標)
