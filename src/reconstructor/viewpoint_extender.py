@@ -344,7 +344,8 @@ class ViewpointExtender:
         self,
         source_camera_idx: int,
         new_image_2d_gaussians: TwoDGaussians,
-        target_volume: float = 1.0,
+        target_volume: float = None,
+        auto_target_volume: bool = True,
         correspondence_threshold: float = 1e-6  # 対応付け閾値
     ) -> int:
         """既存の湧出ガウスと新視点の2Dガウスを対応付けて三角測量し、新しい3Dガウスを追加する
@@ -553,28 +554,45 @@ class ViewpointExtender:
             
             successfully_triangulated_source_indices.append(orig_source_idx)
         
-        # reconstructorから四元数とスケールを取得
-        if not hasattr(reconstructor, 'quaternions') or reconstructor.quaternions is None or len(reconstructor.quaternions) == 0:
-            print("Warning: quaternions not found or empty in reconstructor")
-            if len(reconstructor.points_3d) > 0:
-                # 点があるのに四元数がない場合はエラー
-                raise ValueError("Error: quaternions not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
-            else:
-                # 点がない場合は空の配列を作成
-                reconstructor_quaternions = np.zeros((0, 4), dtype=np.float64)
-        else:
-            reconstructor_quaternions = reconstructor.quaternions
 
-        if not hasattr(reconstructor, 'scales') or reconstructor.scales is None or len(reconstructor.scales) == 0:
-            print("Warning: scales not found or empty in reconstructor")
-            if len(reconstructor.points_3d) > 0:
-                # 点があるのにスケールがない場合はエラー
-                raise ValueError("Error: scales not found or empty in reconstructor. Check compute_3d_gaussian_covariances implementation.")
-            else:
-                # 点がない場合は空の配列を作成
-                reconstructor_scales = np.zeros((0, 3), dtype=np.float64)
-        else:
+        if len(reconstructor.points_3d) > 0:
+            # 有効な点があるならquaternionsとscalesも必須
+            if not hasattr(reconstructor, 'quaternions') or reconstructor.quaternions is None or len(reconstructor.quaternions) == 0:
+                raise ValueError("Quaternions not found in reconstructor but points_3d exists")
+                
+            if not hasattr(reconstructor, 'scales') or reconstructor.scales is None or len(reconstructor.scales) == 0:
+                raise ValueError("Scales not found in reconstructor but points_3d exists")
+                
+            # 形状チェック
+            if reconstructor.quaternions.shape[0] != len(reconstructor.points_3d):
+                raise ValueError(f"Quaternion count ({reconstructor.quaternions.shape[0]}) must match point count ({len(reconstructor.points_3d)})")
+                
+            if reconstructor.quaternions.shape[1] != 4:
+                raise ValueError(f"Quaternions must have shape [N, 4], got {reconstructor.quaternions.shape}")
+                
+            if reconstructor.scales.shape[0] != len(reconstructor.points_3d):
+                raise ValueError(f"Scale count ({reconstructor.scales.shape[0]}) must match point count ({len(reconstructor.points_3d)})")
+                
+            if reconstructor.scales.shape[1] != 3:
+                raise ValueError(f"Scales must have shape [N, 3], got {reconstructor.scales.shape}")
+                
+            # 値の検証
+            if np.any(reconstructor.scales < 0):
+                print("Warning: Negative scales found - taking absolute values")
+                reconstructor.scales = np.abs(reconstructor.scales)
+                
+            # quatの正規性を検証
+            quat_norms = np.linalg.norm(reconstructor.quaternions, axis=1)
+            if not np.allclose(quat_norms, 1.0, rtol=1e-4):
+                print("Warning: Quaternions are not normalized - normalizing now")
+                reconstructor.quaternions = reconstructor.quaternions / quat_norms[:, np.newaxis]
+                
+            reconstructor_quaternions = reconstructor.quaternions
             reconstructor_scales = reconstructor.scales
+        else:
+            # 点がない場合は空の配列を作成
+            reconstructor_quaternions = np.zeros((0, 4), dtype=np.float64)
+            reconstructor_scales = np.zeros((0, 3), dtype=np.float64)
         
         # 新しい3Dガウスを既存のリストに追加
         for i in range(len(reconstructor.points_3d)):
@@ -728,26 +746,59 @@ class ViewpointExtender:
         Returns:
             List[Tuple[int, np.ndarray]]: (point3d_idx, [x, y]) の形式の観測リスト
         """
-        observations = []
+        # 必須条件を検証
+        assert hasattr(self, 'transport_solver'), "Transport solver must be initialized before tracking observations"
+        assert self.transport_solver is not None, "Transport solver cannot be None"
         
-        # 新規視点の2Dガウス情報へのアクセスを確保
-        if not hasattr(self, 'transport_solver') or self.transport_solver is None:
-            print("Warning: Transport solver not initialized, cannot track observations")
-            return observations
-            
-        # 新規視点の2Dガウス平均位置
+        # 新規視点の2Dガウス平均位置を取得
         new_means = self.transport_solver.means2
         if isinstance(new_means, torch.Tensor):
             new_means = new_means.detach().cpu().numpy()
-         
+        
+        observations = []
+        
+        # Use a higher threshold for more reliable correspondences
+        # This helps create a more COLMAP-like sparse correspondence model
+        transport_threshold = 0.1  # Increased from 1e-6 to filter weaker matches
+        
+        # Statistics for adaptive thresholding
+        transport_values = []
+        
+        # Collect all transport values first
         for point_idx in range(transport_matrix.shape[0]):
-            # 各3Dポイントに対して最大の輸送値を持つ2Dガウスを見つける
-            if np.sum(transport_matrix[point_idx]) > 1e-6:  # 有意な輸送がある場合
-                best_idx = np.argmax(transport_matrix[point_idx])
-                if transport_matrix[point_idx, best_idx] > 0.1:  # 閾値
-                    # 対応する2D座標
-                    point_2d = new_means[best_idx]
-                    observations.append((point_idx, point_2d))
+            best_idx = np.argmax(transport_matrix[point_idx])
+            best_transport_value = transport_matrix[point_idx, best_idx]
+            transport_values.append(best_transport_value)
+        
+        # Calculate statistics for adaptive thresholding
+        if transport_values:
+            mean_transport = np.mean(transport_values)
+            std_transport = np.std(transport_values)
+            min_transport = np.min(transport_values)
+            max_transport = np.max(transport_values)
+            
+            # Print statistics for debugging
+            print(f"Transport stats - Mean: {mean_transport:.4f}, Std: {std_transport:.4f}, Min: {min_transport:.4f}, Max: {max_transport:.4f}")
+            
+            # Adaptive thresholding based on statistics
+            # Using mean - 0.5*std as threshold to keep reasonable number of observations
+            # while filtering out weak matches
+            if std_transport > 1e-4:  # Only if there's meaningful variance
+                adaptive_threshold = max(mean_transport - 0.5 * std_transport, min_transport)
+                # Use the higher of fixed threshold or adaptive threshold
+                transport_threshold = max(transport_threshold, adaptive_threshold)
+                print(f"Using adaptive transport threshold: {transport_threshold:.4f}")
+        
+        # Find best and reliable matches
+        for point_idx in range(transport_matrix.shape[0]):
+            # 各3Dポイントの最大輸送値を持つ2Dガウスを見つける
+            best_idx = np.argmax(transport_matrix[point_idx])
+            best_transport_value = transport_matrix[point_idx, best_idx]
+            
+            # 輸送値が閾値を超える場合のみ有効な対応と見なす
+            if best_transport_value > transport_threshold:
+                point_2d = new_means[best_idx]
+                observations.append((point_idx, point_2d))
         
         print(f"Found {len(observations)} observations for new camera")
         return observations
