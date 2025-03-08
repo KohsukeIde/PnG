@@ -52,6 +52,11 @@ class ViewSelector:
         self.reference_images = []  # Known reference viewpoints
         self.source_gaussians_data = None  # Source Gaussian information
         
+        # Flag to track whether CLIP initialization succeeded
+        self.clip_model = None
+        self.clip_preprocess = None
+        clip_initialized = False
+        
         # Initialize feature extractor based on type
         if self.feature_type == 'clip':
             try:
@@ -65,21 +70,21 @@ class ViewSelector:
                 print(f"Loading CLIP model {clip_model_name}...")
                 self.clip_model, self.clip_preprocess = clip.load(clip_model_name, device=self.torch_device)
                 print(f"CLIP model loaded on {self.torch_device}")
-            except ImportError:
-                print("Warning: CLIP package not found. Falling back to SIFT")
+                clip_initialized = True
+            except Exception as e:
+                print(f"Error loading CLIP: {str(e)}. Falling back to SIFT")
                 self.feature_type = 'sift'
         
-        # Initialize traditional feature extractors if needed
-        if self.feature_type == 'sift':
-            self.feature_extractor = cv2.SIFT_create()
-            print("Using SIFT feature extractor")
-        elif self.feature_type == 'orb':
-            self.feature_extractor = cv2.ORB_create()
-            print("Using ORB feature extractor")
-        elif self.feature_type != 'clip':
-            print(f"Unsupported feature type: {self.feature_type}, falling back to SIFT")
-            self.feature_type = 'sift'
-            self.feature_extractor = cv2.SIFT_create()
+        # Initialize traditional feature extractors if CLIP failed or not requested
+        if not clip_initialized or self.feature_type != 'clip':
+            if self.feature_type == 'orb':
+                self.feature_extractor = cv2.ORB_create()
+                print("Using ORB feature extractor")
+            else:
+                # Default to SIFT for any other case
+                self.feature_type = 'sift'  # Ensure type is set correctly
+                self.feature_extractor = cv2.SIFT_create()
+                print("Using SIFT feature extractor")
         
     def extract_clip_features(self, image_path: str) -> np.ndarray:
         """Extract CLIP image embeddings from an image
@@ -88,14 +93,13 @@ class ViewSelector:
             image_path: Path to image file
             
         Returns:
-            np.ndarray: CLIP image embedding
+            np.ndarray: CLIP image embedding or None if CLIP is not available
         """
-        if self.feature_type != 'clip':
-            print("Warning: Called extract_clip_features but feature_type is not 'clip'")
+        # First check if CLIP is enabled and initialized
+        if self.feature_type != 'clip' or self.clip_model is None:
             return None
             
         try:
-            import clip
             import torch
             from PIL import Image
             
@@ -151,23 +155,21 @@ class ViewSelector:
         Args:
             image_paths: List of image paths to process
         """
-        if self.feature_type == 'clip':
+        if self.feature_type == 'clip' and self.clip_model is not None:
             # Process using CLIP features
             for path in image_paths:
-                try:
-                    clip_features = self.extract_clip_features(path)
-                    if clip_features is not None:
-                        self.clip_features[path] = clip_features
-                    else:
-                        print(f"Failed to extract CLIP features from {path}")
-                except Exception as e:
-                    print(f"Error processing {path}: {e}")
+                clip_features = self.extract_clip_features(path)
+                if clip_features is not None:
+                    self.clip_features[path] = clip_features
+                else:
+                    print(f"Failed to extract CLIP features from {path}")
             
             print(f"Extracted CLIP features from {len(self.clip_features)} images")
             
         else:
             # Process using traditional features (SIFT/ORB)
             all_features = []
+            valid_paths = []
             
             for path in image_paths:
                 try:
@@ -178,6 +180,7 @@ class ViewSelector:
                             'descriptors': descriptors
                         }
                         all_features.append(descriptors)
+                        valid_paths.append(path)
                     else:
                         print(f"No features found in {path}")
                 except Exception as e:
@@ -185,11 +188,14 @@ class ViewSelector:
             
             print(f"Extracted features from {len(self.image_features)} images")
             
-            # Build codebook for BoVW
-            if all_features:
-                self.build_codebook(np.vstack(all_features))
-                # Compute histograms
-                self.build_histograms(list(self.image_features.keys()))
+            # Build codebook for BoVW only if we have features
+            if all_features and len(all_features) > 0:
+                try:
+                    self.build_codebook(np.vstack(all_features))
+                    # Compute histograms
+                    self.build_histograms(valid_paths)
+                except Exception as e:
+                    print(f"Error building codebook: {e}")
     
     def build_codebook(self, features: np.ndarray) -> None:
         """Build codebook (visual vocabulary) from features for BoVW
