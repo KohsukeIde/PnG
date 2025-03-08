@@ -4,8 +4,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 
 class ObservationBuilder:
-    """
-    Builds observation maps for 3D Gaussian Bundle Adjustment.
+    """Builds observation maps for 3D Gaussian Bundle Adjustment.
     
     This class creates the necessary data structures that track which 3D points
     are visible in which cameras, and at what 2D positions.
@@ -13,8 +12,7 @@ class ObservationBuilder:
     
     @staticmethod
     def build_observation_map(reconstruction_data: Dict) -> Dict[int, Dict[int, np.ndarray]]:
-        """
-        Build observation map from reconstruction data.
+        """Build observation map from reconstruction data.
         
         Args:
             reconstruction_data: Dictionary containing reconstruction information
@@ -69,10 +67,15 @@ class ObservationBuilder:
                 if cam_gaussians is None:
                     continue
                 
+                # Set a confidence threshold for filtering correspondences
+                # Adjust this value to control the sparsity of correspondences
+                confidence_threshold = 0.1  # Only accept correspondences with transport value above this
+                
                 # Find best matches in the transport matrix
                 for point_idx in range(len(reconstruction_data['points_3d'])):
                     best_idx = np.argmax(transport_mat[point_idx])
-                    if transport_mat[point_idx, best_idx] > 0.1:  # Threshold
+                    # Only create correspondence if confidence is high enough
+                    if transport_mat[point_idx, best_idx] > confidence_threshold:
                         if point_idx not in observation_map:
                             observation_map[point_idx] = {}
                         observation_map[point_idx][cam_idx] = cam_gaussians.means[best_idx]
