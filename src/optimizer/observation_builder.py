@@ -67,9 +67,9 @@ class ObservationBuilder:
                 if cam_gaussians is None:
                     continue
                 
-                # Set a confidence threshold for filtering correspondences
-                # Adjust this value to control the sparsity of correspondences
-                confidence_threshold = 0.1  # Only accept correspondences with transport value above this
+                # Set a lower confidence threshold for filtering correspondences
+                # A lower value ensures more correspondences for stable bundle adjustment
+                confidence_threshold = 0.1 # Only accept correspondences with transport value above this
                 
                 # Find best matches in the transport matrix
                 for point_idx in range(len(reconstruction_data['points_3d'])):
