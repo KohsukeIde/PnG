@@ -11,108 +11,73 @@ class ObservationBuilder:
     """
     
     @staticmethod
+    def track_observations(transport_matrix: np.ndarray, means_2d: np.ndarray, 
+                           confidence_threshold: float = 0.01) -> List[Tuple[int, np.ndarray]]:
+        """
+        Extract point correspondences from a transport matrix.
+        
+        Args:
+            transport_matrix: Optimal transport matrix between 3D points and 2D Gaussians
+            means_2d: 2D means of the Gaussians in the target view
+            confidence_threshold: Minimum transport value to consider a valid correspondence
+            
+        Returns:
+            List of (point_idx, [x, y]) tuples for each valid correspondence
+        """
+        observations = []
+        
+        # Find best matches for each 3D point
+        for point_idx in range(transport_matrix.shape[0]):
+            best_idx = np.argmax(transport_matrix[point_idx])
+            best_transport_value = transport_matrix[point_idx, best_idx]
+            
+            # Only keep correspondences with sufficient confidence
+            if best_transport_value > confidence_threshold:
+                point_2d = means_2d[best_idx]
+                observations.append((point_idx, point_2d))
+        
+        print(f"Found {len(observations)} observations from transport matrix")
+        return observations
+    
+    @staticmethod
     def build_observation_map(reconstruction_data: Dict) -> Dict[int, Dict[int, np.ndarray]]:
         """Build observation map from reconstruction data.
         
+        This function uses a single, explicit approach to build observations
+        using the 'all_matches' data, which should be the primary source of
+        correspondence information.
+        
         Args:
-            reconstruction_data: Dictionary containing reconstruction information
+            reconstruction_data: Dictionary containing:
+                - 'points_3d': 3D point coordinates
+                - 'all_matches': List of correspondences for each camera
             
         Returns:
             Dict mapping 3D point idx -> {camera_idx -> 2D point}
         """
         observation_map = {}
         
-        # Step 1: Process the initial pair of images
-        if 'match_pairs' in reconstruction_data and reconstruction_data['match_pairs']:
-            # Initial match pairs for first two cameras
-            match_pairs = reconstruction_data['match_pairs']
-            points_3d = reconstruction_data['points_3d']
+        # Check for required data
+        if 'points_3d' not in reconstruction_data:
+            print("ERROR: 'points_3d' not found in reconstruction data")
+            return observation_map
             
-            # Get back-projection of match pairs to 2D coordinates
-            gaussians1 = reconstruction_data.get('gaussians1', None)
-            gaussians2 = reconstruction_data.get('gaussians2', None)
-            
-            if gaussians1 is not None and gaussians2 is not None:
-                for point_idx, (idx1, idx2) in enumerate(match_pairs):
-                    # Create entry for this 3D point if it doesn't exist
-                    if point_idx not in observation_map:
-                        observation_map[point_idx] = {}
-                    
-                    # Add observations from camera 0 and 1
-                    observation_map[point_idx][0] = gaussians1.means[idx1]
-                    observation_map[point_idx][1] = gaussians2.means[idx2]
-        
-        # Step 2: Process additional cameras from viewpoint extension
+        # Process correspondences from all_matches
         if 'all_matches' in reconstruction_data:
-            # This would be a custom field we add to track all matches
             all_matches = reconstruction_data['all_matches']
+            print(f"Building observations from all_matches ({len(all_matches)} cameras)")
+            
             for cam_idx, point_matches in enumerate(all_matches):
                 for point_idx, point_2d in point_matches:
                     if point_idx not in observation_map:
                         observation_map[point_idx] = {}
                     observation_map[point_idx][cam_idx] = point_2d
-        
-        # If 'all_matches' wasn't found, try to rebuild from transport matrices
-        elif 'transport_matrices' in reconstruction_data:
-            # This assumes we've stored all transport matrices
-            transport_matrices = reconstruction_data['transport_matrices']
-            
-            # Process each transport matrix
-            for cam_idx, transport_mat in enumerate(transport_matrices):
-                if cam_idx < 2:  # Skip first two cameras which we already processed
-                    continue
-                
-                # Get 2D Gaussians for this camera
-                cam_gaussians = reconstruction_data.get(f'gaussians{cam_idx+1}', None)
-                if cam_gaussians is None:
-                    continue
-                
-                # Set a lower confidence threshold for filtering correspondences
-                # A lower value ensures more correspondences for stable bundle adjustment
-                confidence_threshold = 0.1 # Only accept correspondences with transport value above this
-                
-                # Find best matches in the transport matrix
-                for point_idx in range(len(reconstruction_data['points_3d'])):
-                    best_idx = np.argmax(transport_mat[point_idx])
-                    # Only create correspondence if confidence is high enough
-                    if transport_mat[point_idx, best_idx] > confidence_threshold:
-                        if point_idx not in observation_map:
-                            observation_map[point_idx] = {}
-                        observation_map[point_idx][cam_idx] = cam_gaussians.means[best_idx]
-        
-        # Step 3: If neither method worked, try a simpler approach
-        # For each camera, project 3D points and check if they're in view
-        if not observation_map and 'camera_params_list' in reconstruction_data:
-            camera_params_list = reconstruction_data['camera_params_list']
-            points_3d = reconstruction_data['points_3d']
-            
-            for cam_idx, (R, t) in enumerate(camera_params_list):
-                K = reconstruction_data.get('K', None)
-                if K is None:
-                    K = reconstruction_data.get(f'camera{cam_idx+1}_K', None)
-                if K is None:
-                    continue
-                
-                # Project each 3D point to this camera
-                for point_idx, point_3d in enumerate(points_3d):
-                    # Convert to camera coordinates
-                    point_cam = R @ point_3d + t
                     
-                    # Check if point is in front of camera
-                    if point_cam[2] <= 0:
-                        continue
-                    
-                    # Project to image coordinates
-                    point_img = K @ point_cam
-                    point_2d = point_img[:2] / point_img[2]
-                    
-                    # Check if point is within image bounds
-                    width = K[0, 2] * 2
-                    height = K[1, 2] * 2
-                    if 0 <= point_2d[0] < width and 0 <= point_2d[1] < height:
-                        if point_idx not in observation_map:
-                            observation_map[point_idx] = {}
-                        observation_map[point_idx][cam_idx] = point_2d
+            if observation_map:
+                return observation_map
+                
+        # If no observations found, issue a warning
+        print("WARNING: No observations could be built. Make sure 'all_matches' is available in reconstruction_data.")
         
         return observation_map
     
