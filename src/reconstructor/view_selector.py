@@ -1,8 +1,11 @@
 # src/selector/view_selector.py
 import os
 import numpy as np
+import torch
 import cv2
-from typing import List, Dict, Tuple, Optional
+import torch
+from PIL import Image
+from typing import List, Dict, Tuple
 from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
 
@@ -61,7 +64,6 @@ class ViewSelector:
         if self.feature_type == 'clip':
             try:
                 import clip
-                import torch
                 
                 # Set torch device
                 self.torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,7 +84,7 @@ class ViewSelector:
                 print("Using ORB feature extractor")
             else:
                 # Default to SIFT for any other case
-                self.feature_type = 'sift'  # Ensure type is set correctly
+                self.feature_type = 'sift'
                 self.feature_extractor = cv2.SIFT_create()
                 print("Using SIFT feature extractor")
         
@@ -100,9 +102,6 @@ class ViewSelector:
             return None
             
         try:
-            import torch
-            from PIL import Image
-            
             # Load image using PIL (CLIP requires RGB)
             image = Image.open(image_path).convert("RGB")
             
@@ -129,25 +128,18 @@ class ViewSelector:
             
         Returns:
             Tuple: (keypoints, descriptors)
-        """
-        if self.feature_type == 'clip':
-            print("Warning: Called extract_features but feature_type is 'clip'")
+        """ 
+        # Read image in grayscale for feature extraction
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            print(f"Failed to load image: {image_path}")
             return None, None
-            
-        try:
-            # Read image in grayscale for feature extraction
-            img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                print(f"Failed to load image: {image_path}")
-                return None, None
-            
-            # Extract features using selected extractor
-            keypoints, descriptors = self.feature_extractor.detectAndCompute(img, None)
-            
-            return keypoints, descriptors
-        except Exception as e:
-            print(f"Error extracting features from {image_path}: {e}")
-            return None, None
+        
+        # Extract features using selected extractor
+        keypoints, descriptors = self.feature_extractor.detectAndCompute(img, None)
+        
+        return keypoints, descriptors
+
     
     def process_images(self, image_paths: List[str]) -> None:
         """Extract features from multiple images based on feature type
@@ -693,6 +685,8 @@ class ViewSelector:
         
         return selected_names
     
+    
+    # 2DGSのパラメータを用いた類似度計算
     # def compute_gaussian_similarity(self, gaussians1: TwoDGaussians, gaussians2: TwoDGaussians) -> float:
     #     """
     #     Compute similarity based on 2D Gaussian distribution characteristics
