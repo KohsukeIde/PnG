@@ -28,3 +28,4 @@ __pycache__
 /pipelines/results/*
 /results/*
 utils/test.py
+utils/rodrigues_comparison.png
