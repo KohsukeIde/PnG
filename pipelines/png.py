@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 from tqdm import tqdm
+from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
 
 from src.reconstructor.view_selector import ViewSelector
@@ -128,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--ba_iterations",
         type=int,
-        default=20,
+        default=100,
         help="Maximum iterations for Bundle Adjustment (must be more than 10)"
     )
     parser.add_argument(
@@ -208,8 +209,7 @@ def get_image_names(directory: str) -> List[str]:
     return sorted(image_names)
 
 def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
-    """
-    Load camera intrinsics from NeRF dataset's transforms_train.json file.
+    """Load camera intrinsics from NeRF dataset's transforms_train.json file.
     
     Args:
         data_dir: Directory containing the transforms_train.json file
@@ -222,54 +222,50 @@ def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"NeRF transforms file not found: {json_path}")
     
-    try:
-        with open(json_path, 'r') as f:
-            transforms = json.load(f)
-        
-        # NeRF datasets provide camera_angle_x which is the horizontal FOV in radians
-        fov_x = transforms.get("camera_angle_x")
-        
-        if fov_x is None:
-            raise ValueError("transforms_train.json does not contain camera_angle_x")
-        
-        # Get image dimensions - assume square images
-        frame_path = transforms["frames"][0]["file_path"]
-        frame_path = frame_path.replace("./train/", "")
-        
-        # Check both train and images directories
-        img_path = os.path.join(data_dir, "train", f"{frame_path}.png")
-        if not os.path.exists(img_path):
-            img_path = os.path.join(data_dir, "images", f"{frame_path}.png")
-        
-        if not os.path.exists(img_path):
-            # Assume default NeRF resolution of 800x800
-            width = height = 800
-            print(f"Image not found, assuming default NeRF resolution of {width}x{height}")
-        else:
-            from PIL import Image
-            img = Image.open(img_path)
-            width, height = img.size
-            print(f"Found image with dimensions {width}x{height}")
-        
-        # Calculate focal length from FOV
-        # focal_length = (width / 2) / tan(fov_x / 2)
-        focal_length = (width / 2) / np.tan(fov_x / 2)
-        
-        # Construct intrinsic matrix K
-        K = np.array([
-            [focal_length, 0, width / 2],
-            [0, focal_length, height / 2],
-            [0, 0, 1]
-        ])
-        
-        print(f"Loaded NeRF intrinsics with focal length: {focal_length:.2f}")
-        print(f"K = \n{K}")
-        
-        return K
-        
-    except Exception as e:
-        print(f"Error loading NeRF intrinsics: {e}")
-        raise
+    with open(json_path, 'r') as f:
+        transforms = json.load(f)
+    
+    # NeRF datasets provide camera_angle_x which is the horizontal FOV in radians
+    fov_x = transforms.get("camera_angle_x")
+    
+    if fov_x is None:
+        raise ValueError("transforms_train.json does not contain camera_angle_x")
+    
+    # Get image dimensions - assume square images (NeRF-Syntheticは800x800)
+    frame_path = transforms["frames"][0]["file_path"]
+    frame_path = frame_path.replace("./train/", "")
+    
+    # Check both train and images directories
+    img_path = os.path.join(data_dir, "train", f"{frame_path}.png")
+    if not os.path.exists(img_path):
+        img_path = os.path.join(data_dir, "images", f"{frame_path}.png")
+    
+    
+    if not os.path.exists(img_path):
+        print(f"Image not found: {img_path}")
+        # Assume default NeRF resolution of 800x800
+        width = height = 800
+        print(f"Image not found, assuming default NeRF resolution of {width}x{height}")
+    else:
+        img = Image.open(img_path)
+        width, height = img.size
+        print(f"Found image with dimensions {width}x{height}")
+    
+    # Calculate focal length from FOV
+    # focal_length = (width / 2) / tan(fov_x / 2)
+    focal_length = (width / 2) / np.tan(fov_x / 2)
+    
+    # Construct intrinsic matrix K
+    K = np.array([
+        [focal_length, 0, width / 2],
+        [0, focal_length, height / 2],
+        [0, 0, 1]
+    ])
+    
+    print(f"Loaded NeRF intrinsics with focal length: {focal_length:.2f}")
+    print(f"K = \n{K}")
+    
+    return K
 
 def get_fitted_gaussians_info(directory: str) -> Dict[str, str]:
     """Get mappings between image names and their fitted Gaussian pkl files."""
@@ -282,7 +278,6 @@ def get_fitted_gaussians_info(directory: str) -> Dict[str, str]:
         image_name = basename.replace("_fitted_gaussians.pkl", ".png")
         # Also handle other common naming conventions
         if not os.path.exists(os.path.join(os.path.dirname(directory), "images", image_name)):
-            # Try alternative naming patterns
             for ext in ['.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
                 alt_name = image_name.replace('.png', ext)
                 if os.path.exists(os.path.join(os.path.dirname(directory), "images", alt_name)):
@@ -473,10 +468,6 @@ def perform_bundle_adjustment(
     # 観測データ構築 - point3D_observations 構造を使用
     observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
     
-    if not observation_map:
-        print("No valid observations found for BA. Skipping.")
-        return reconstruction_data
-    
     # 観測データをBundleAdjusterの形式に変換
     num_cameras = len(reconstruction_data["camera_params_list"])
     match_points_2d = ObservationBuilder.convert_to_match_points_2d(
@@ -502,9 +493,9 @@ def perform_bundle_adjustment(
             # Fallback to first camera's K
             intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
     
-    image_names = reconstruction_data.get("used_images", None)
+    image_names = reconstruction_data["used_images"]
     
-    # COLMAP風のロバスト損失スケールを初期値として使用
+    # Used for robust loss
     initial_loss_scale = 2.0
     
     ba = BundleAdjuster(
@@ -517,24 +508,39 @@ def perform_bundle_adjustment(
         loss_scale=initial_loss_scale  # COLMAP standard scale
     )
     
-    # BA最適化実行 - COLMAPスタイルの段階的最適化サポート
+    # BA optimization
     ba_results = ba.optimize(
         n_iterations=ba_iterations, 
         verbose=verbose,
-        use_staged=use_staged  # 段階的最適化を使用
+        use_staged=use_staged  # Use staged optimization (COLMAP style)
     )
     
-    if ba_results["success"]:
+    # Check if the final RMSE improved over initial
+    improved = False
+    
+    if "initial_rmse" in ba_results and "final_rmse" in ba_results:
+        if not np.isnan(ba_results["initial_rmse"]) and not np.isnan(ba_results["final_rmse"]):
+            improved = ba_results["final_rmse"] < ba_results["initial_rmse"]
+    
+    # Consider BA successful if either it formally succeeded or it improved the error
+    if ba_results["success"] or improved:
         # 段階的BAの場合は結果メッセージを調整
         if use_staged:
-            print(f"Staged Bundle Adjustment completed successfully.")
+            print(f"Staged Bundle Adjustment completed {'successfully' if ba_results['success'] else 'with error reduction'}.")
         else:
-            print(f"Bundle Adjustment completed successfully.")
+            print(f"Bundle Adjustment completed {'successfully' if ba_results['success'] else 'with error reduction'}.")
             
         # 結果のRMSE情報を表示    
-        if "initial_rmse" in ba_results:
+        if "initial_rmse" in ba_results and not np.isnan(ba_results["initial_rmse"]):
             print(f"Initial RMSE: {ba_results['initial_rmse']:.4f} pixels")
-        print(f"Final RMSE: {ba_results.get('final_rmse', 'N/A'):.4f} pixels")
+        
+        if "final_rmse" in ba_results and not np.isnan(ba_results["final_rmse"]):
+            print(f"Final RMSE: {ba_results['final_rmse']:.4f} pixels")
+            
+            # Show improvement percentage
+            if "initial_rmse" in ba_results and not np.isnan(ba_results["initial_rmse"]):
+                improvement = (ba_results["initial_rmse"] - ba_results["final_rmse"]) / ba_results["initial_rmse"] * 100
+                print(f"Error reduction: {improvement:.2f}%")
         
         # 再構成データを更新
         reconstruction_data["camera_params_list"] = ba_results["optimized_cameras"]
@@ -646,93 +652,38 @@ def perform_initial_reconstruction(
     gaussians2_path = os.path.join(fitted_gaussians_dir, f"{img2_name.split('.')[0]}_fitted_gaussians.pkl")
     
     # Load fitted Gaussians
-    _, gaussians1, _, K1 = load_gaussians_torch(gaussians1_path, device)
-    _, gaussians2, _, K2 = load_gaussians_torch(gaussians2_path, device)
+    _, gaussians1, _, K_from_gs1 = load_gaussians_torch(gaussians1_path, device)
+    _, gaussians2, _, K_from_gs2 = load_gaussians_torch(gaussians2_path, device)
     
-    # Attempt to load COLMAP data
-    colmap_path = os.path.join(data_dir, colmap_dir)
-    has_colmap_data = os.path.exists(colmap_path) and os.path.isdir(colmap_path)
-    
-    if has_colmap_data:
-        try:
-            cameras = load_cameras_from_colmap(colmap_path)
-            images_data = load_images_from_colmap(colmap_path)
-            print(f"Successfully loaded COLMAP data with {len(cameras)} cameras and {len(images_data)} images")
-        except Exception as e:
-            print(f"Error loading COLMAP data: {e}")
-            has_colmap_data = False
-            cameras = {}
-            images_data = {}
-    else:
-        print(f"COLMAP directory {colmap_path} not found or not valid")
-        cameras = {}
-        images_data = {}
-    
-    # Priority for camera intrinsics:
+    # Camera intrinsics handling - explicit path selection with clear priorities:
     # 1. NeRF intrinsics (if provided)
-    # 2. COLMAP camera data
-    # 3. Intrinsics from Gaussian fitting
-    # 4. Default intrinsic matrix
+    # 2. Intrinsics from Gaussian fitting
+    # 3. Default intrinsic matrix as last resort
     
-    # First check for NeRF intrinsics
     if nerf_K is not None:
+        # Use NeRF intrinsics if available (highest priority)
         K1 = nerf_K
         K2 = nerf_K
         print("Using intrinsic matrix from NeRF dataset's transforms_train.json")
+    elif K_from_gs1 is not None:
+        # Use intrinsics from Gaussian fitting if available
+        K1 = K_from_gs1
+        K2 = K_from_gs1  # Using same K for both images
+        print("Using intrinsic matrix from 2D Gaussians data")
     else:
-        # Next try COLMAP data
-        use_colmap_cameras = has_colmap_data and bool(cameras) and bool(images_data)
+        # Last resort: Use default intrinsic matrix
+        H, W = 800, 800  # Default image size
+        fx, fy = 1.2*W, 1.2*W  # Default focal length (1.2x image width)
+        cx, cy = W/2, H/2  # Principal point at center
         
-        if use_colmap_cameras:
-            # Get image IDs from COLMAP data
-            image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
-            print(f"Available images in COLMAP data: {image_name_to_id}")
-    
-            image1_id = image_name_to_id.get(img1_name)
-            image2_id = image_name_to_id.get(img2_name)
-            
-            # Double check that both images are in COLMAP data
-            if image1_id is None or image2_id is None:
-                print(f"Warning: Image {img1_name} or {img2_name} not found in COLMAP data.")
-                print("Will use a single generic intrinsic matrix for all cameras.")
-                use_colmap_cameras = False
-        else:
-            print("No valid COLMAP data found. Will use a single generic intrinsic matrix for all cameras.")
-        
-        if use_colmap_cameras:
-            # Create camera models from COLMAP data
-            camera1_id = images_data[image1_id]['camera_id']
-            camera2_id = images_data[image2_id]['camera_id']
-            
-            camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
-            camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
-            
-            K1 = camera1.K
-            K2 = camera2.K
-        else:
-            # Use a common intrinsic matrix
-            # Get information from 2D Gaussians if available
-            _, _, _, K_from_gs1 = load_gaussians_torch(gaussians1_path, device)
-            _, _, _, K_from_gs2 = load_gaussians_torch(gaussians2_path, device)
-            
-            if K_from_gs1 is not None:
-                K1 = K_from_gs1
-                K2 = K_from_gs1
-                print(f"Using intrinsic matrix from 2D Gaussians data.")
-            else:
-                # Use a default intrinsic matrix (centered principal point, focal length based on arbitrary values)
-                H, W = 800, 800  # Random image size, adjust as needed
-                fx, fy = 1.2*W, 1.2*W  # Random focal length (1.2x image width)
-                cx, cy = W/2, H/2  # Principal point at center
-                
-                K1 = np.array([
-                    [fx, 0, cx],
-                    [0, fy, cy],
-                    [0, 0, 1]
-                ])
-                K2 = K1
-                print(f"Using default intrinsic matrix with focal length: {fx:.2f}")
-                print(f"K = \n{K1}")
+        K1 = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ])
+        K2 = K1
+        print(f"Using default intrinsic matrix with focal length: {fx:.2f}")
+        print(f"K = \n{K1}")
     
     solver = OptimalTransportSolver(
         gaussians1=gaussians1,
@@ -758,7 +709,7 @@ def perform_initial_reconstruction(
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         transport_matrix_np = transport_matrix.cpu().numpy()
     
-    # Set up reconstructor (homographyの可能性あるからまだh_dummy捨てない)
+    # Set up reconstructor - using fixed h_dummy matrix since we don't use homography
     h_dummy = np.eye(3)
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
     
@@ -769,18 +720,39 @@ def perform_initial_reconstruction(
         auto_threshold=True
     )
     
-    # Get optimized R, t
+    # Get optimized R, t from the solver
     r_optimized = solver.rvec.detach().cpu().numpy()
     t_optimized = solver.tvec.detach().cpu().numpy()
     R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()
     
-    # Set camera matrices
+    # Set camera matrices explicitly - camera 1 is at origin (identity rotation, zero translation)
     reconstructor.set_camera_matrices_explicitly(
         r1=np.eye(3),
         t1=np.zeros(3),
         r2=R_est,
         t2=t_optimized
     )
+    
+    # Track correspondences between views for initial all_matches
+    # Determine top_k based on the number of Gaussians (smaller of the two)
+    top_k_value = min(len(gaussians1.means), len(gaussians2.means))
+    
+    observations1 = ObservationBuilder.track_observations(
+        transport_matrix=transport_matrix_np.T,  # Transpose for first camera perspective
+        means_2d=gaussians1.means,
+        top_k=top_k_value,
+        use_combined_filtering=True  # Apply both top-k and threshold filtering
+    )
+    
+    observations2 = ObservationBuilder.track_observations(
+        transport_matrix=transport_matrix_np,
+        means_2d=gaussians2.means,
+        top_k=top_k_value,
+        use_combined_filtering=True  # Apply both top-k and threshold filtering
+    )
+    
+    # Initialize all_matches for Bundle Adjustment
+    all_matches = [observations1, observations2]
     
     # Triangulate Gaussian centers
     print("Triangulating Gaussian centers...")
@@ -806,7 +778,7 @@ def perform_initial_reconstruction(
         final_target_volume = target_volume
         
     print(f"Using target volume: {final_target_volume:.2f}")
-    reconstructor.compute_3d_gaussian_covariances(lambda_volume=0.0, target_volume=final_target_volume)
+    reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=final_target_volume)
     
     # Save the target volume for future viewpoints
     reconstruction_data_target_volume = final_target_volume
@@ -886,23 +858,11 @@ def perform_initial_reconstruction(
         # Metadata
         "used_images": [img1_name, img2_name],
         "total_3d_gaussians": len(reconstructor.points_3d),
-        "all_matches": [],  # Initialize for future BA
+        "all_matches": all_matches, 
         
         # Store the calculated target volume for future viewpoints
         "target_volume": reconstruction_data_target_volume
     }
-    
-    # Track observations for BA
-    observations1 = []
-    observations2 = []
-    
-
-    for i, (idx1, idx2) in enumerate(reconstructor.match_pairs):
-        if i < len(reconstructor.points_3d):
-            observations1.append((i, gaussians1.means[idx1]))
-            observations2.append((i, gaussians2.means[idx2]))
-    
-    results["all_matches"] = [observations1, observations2]
     
     # Perform initial bundle adjustment if enabled
     if enable_ba and len(reconstructor.points_3d) >= 3:
@@ -1223,10 +1183,21 @@ def add_new_viewpoint(
         transport_matrix = extender.transport_solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         transport_matrix_np = transport_matrix.cpu().numpy()
         
-        # 輸送行列を観測情報として追跡
-        observations = extender.track_observations(transport_matrix_np)
+        # 輸送行列を観測情報として追跡 - use the standard method from ObservationBuilder
+        # Determine top_k for the new viewpoint
+        top_k_value = min(transport_matrix_np.shape[0], len(new_2d_gaussians.means))
         
-        # 新しいカメラの観測情報を追加
+        observations = ObservationBuilder.track_observations(
+            transport_matrix=transport_matrix_np,
+            means_2d=new_2d_gaussians.means,
+            top_k=top_k_value,
+            use_combined_filtering=True  # Apply both top-k and threshold filtering
+        )
+        
+        # 新しいカメラの観測情報を追加 - ensure all_matches exists
+        if 'all_matches' not in reconstruction_data:
+            reconstruction_data['all_matches'] = []
+            
         reconstruction_data['all_matches'].append(observations)
         
         # # Ensure transport_matrices exists
@@ -1338,21 +1309,20 @@ def run_complete_pipeline(args):
     all_images = get_image_names(image_dir)
     gaussian_files = get_fitted_gaussians_info(args.fitted_gaussians_dir)
     
-    # Check if we should use NeRF intrinsics
+    # Handle camera intrinsics with clear priority
     nerf_K = None
-    if args.use_nerf_intrinsics:
-        try:
-            print("Using camera intrinsics from NeRF dataset's transforms_train.json")
-            nerf_K = load_nerf_intrinsics(args.data_dir)
-        except Exception as e:
-            print(f"Error loading NeRF intrinsics: {e}")
-            print("Falling back to other intrinsics options")
     
-    # Check if COLMAP directory exists (read camera intrinsics from colmap data)
+    # Always check if COLMAP data exists (needed later in the pipeline)
     has_colmap_data = os.path.exists(colmap_dir) and os.path.isdir(colmap_dir)
-    if not has_colmap_data or args.force_single_intrinsic:
-        if not args.use_nerf_intrinsics:
-            print(f"{'Warning: COLMAP directory not found' if not has_colmap_data else 'User requested single intrinsic matrix'}. Will use a single intrinsic matrix for all cameras.")
+    
+    if args.use_nerf_intrinsics:
+        print("Using camera intrinsics from NeRF dataset's transforms_train.json")
+        nerf_K = load_nerf_intrinsics(args.data_dir)
+    else:
+        # Only check COLMAP if not using NeRF intrinsics
+        if not has_colmap_data or args.force_single_intrinsic:
+            reason = "COLMAP directory not found" if not has_colmap_data else "User requested single intrinsic matrix"
+            print(f"Warning: {reason}. Will use a single intrinsic matrix for all cameras.")
     
     # Filter to only images with fitted Gaussians 
     available_images = [img for img in all_images if img in gaussian_files]
