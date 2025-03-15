@@ -315,7 +315,6 @@ def main():
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
         transport_matrix_np = transport_matrix.cpu().numpy()
         
-    from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
     h_dummy = np.eye(3)
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
     
