@@ -1042,13 +1042,13 @@ if __name__ == "__main__":
     main()
 
 #png w ba
-#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/final/colmap/points3d.txt --use_true_intrinsics
 
 #colmap
-#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/images_correct.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/points3D.txt
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/images_correct.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63/sparse/0/points3D.txt --use_true_intrinsics
 
 #colmap netf-synthetic
-#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/images.bin --points /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/points3D.bin
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/images.bin --points /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless/sparse/0/points3D.bin --use_true_intrinsics
 
 
 #nerf materials gt
