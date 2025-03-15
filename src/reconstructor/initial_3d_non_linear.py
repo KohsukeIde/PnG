@@ -222,7 +222,7 @@ class Initial3DReconstructor:
     def identify_source_gaussians(
         self, 
         transport_matrix: np.ndarray, 
-        threshold: float = 0.1,
+        threshold: float = 0.85,
         auto_threshold: bool = True
     ) -> None:
         """初期輸送行列から湧出ガウスを特定して保存する
@@ -259,12 +259,13 @@ class Initial3DReconstructor:
             print(f"Using mean as threshold: Row={mean_row:.4f}, Col={mean_col:.4f}")
         else:
             # 手動指定の閾値を使用
+            print(f"Using threshold: {threshold:.4f}")
             self.source_gaussians1 = np.where(row_sums < threshold)[0]
             self.source_gaussians2 = np.where(col_sums < threshold)[0]
         
         # 以前の実装（
         """
-        # Autot threshold
+        
         if auto_threshold:
             # 行和の統計
             mean_row = np.mean(row_sums)
@@ -678,8 +679,8 @@ class Initial3DReconstructor:
         for idx, result in enumerate(results):
             if result[3]:  # 最適化が成功
                 covariances_3d_list.append(result[0])
-                quaternions_list.append(result[1])  # 四元数を保存
-                scales_list.append(result[2])       # スケールを保存
+                quaternions_list.append(result[1]) 
+                scales_list.append(result[2])       
                 valid_indices.append(idx)
             else:
                 failed_indices.append(idx)
@@ -694,7 +695,6 @@ class Initial3DReconstructor:
             print("Warning: No valid Gaussians after covariance optimization.")
             self.points_3d = np.zeros((0, 3), dtype=np.float64)
             self.covariances_3d = np.zeros((0, 3, 3), dtype=np.float64)
-            # 空の四元数とスケール配列を初期化（重要な修正点）
             self.quaternions = np.zeros((0, 4), dtype=np.float64)
             self.scales = np.zeros((0, 3), dtype=np.float64)
             # match_pairsなども更新
@@ -708,7 +708,6 @@ class Initial3DReconstructor:
         self.points_3d = self.points_3d[valid_indices]
         self.covariances_3d = np.array(covariances_3d_list)
         
-        # 四元数とスケールを明示的に保存
         self.quaternions = np.array(quaternions_list)
         self.scales = np.array(scales_list)
         
