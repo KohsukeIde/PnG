@@ -17,8 +17,6 @@ from src.reconstructor.view_selector import ViewSelector
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 from src.reconstructor.viewpoint_extender import ViewpointExtender
 from src.primitive.twod_gaussians_rs import TwoDGaussians
-from src.camera.camera_model import CameraModel
-from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from utils.gs_pkl_loader import load_gaussians_torch
 from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_gaussians_as_ply
