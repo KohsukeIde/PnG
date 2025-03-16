@@ -662,7 +662,7 @@ class Initial3DReconstructor:
                 # 四元数とスケールも返す
                 return (sigma_3_final, qq_final, ss_final, True)
             else:
-                print(f"Failed to optimize covariance for Gaussian {idx}, adding to source gaussians.")
+                print(f"Failed to optimize covariance for Gaussian {idx}, ignoring Gaussian {idx}")
                 return (None, None, None, False)
 
         # 並列処理で共分散行列を計算
