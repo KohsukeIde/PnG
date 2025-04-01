@@ -218,7 +218,7 @@ class OptimalTransportSolver:
         Returns : (3,3) 回転行列
         """
         # ノルム(回転角)
-        theta = torch.norm(rvec) + 1e-12
+        theta = torch.clamp(torch.norm(rvec), min=1e-12)
         # 単位方向
         r_axis = rvec / theta
 
