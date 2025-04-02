@@ -223,7 +223,7 @@ class Initial3DReconstructor:
         self, 
         transport_matrix: np.ndarray, 
         threshold: float = 0.85,
-        auto_threshold: bool = True
+        auto_threshold: bool = False
     ) -> None:
         """初期輸送行列から湧出ガウスを特定して保存する
         
@@ -707,7 +707,6 @@ class Initial3DReconstructor:
         # 有効なガウスのみを保持
         self.points_3d = self.points_3d[valid_indices]
         self.covariances_3d = np.array(covariances_3d_list)
-        
         self.quaternions = np.array(quaternions_list)
         self.scales = np.array(scales_list)
         
