@@ -474,7 +474,7 @@ class Initial3DReconstructor:
             self.p2 = self.k2 @ np.hstack((self.r2, self.t2.reshape(3, 1)))
 
     def triangulate_gaussian_centers(
-        self, transport_matrix: np.ndarray, threshold: float = 1e-3, top_k: int = 1e9
+        self, transport_matrix: np.ndarray, threshold: float = 0.0, top_k: int = 1e9
     ) -> None:
         """Triangulate 3D points by extracting correspondences from the transport matrix."""
         if self.p1 is None or self.p2 is None:
@@ -492,6 +492,11 @@ class Initial3DReconstructor:
         k2_num = centers2.shape[0]
 
         print(f"transport matrix shape {transport_matrix.shape}")
+        
+        # 非ゼロの輸送値の数をカウント
+        non_zero_count = np.sum(transport_matrix > 0)
+        print(f"Number of transport values > 0: {non_zero_count}")
+        
         # Flatten the transport matrix.
         t_flat = transport_matrix.ravel()
         # Get all indices.
