@@ -44,6 +44,7 @@ torch = "^2.4.0"
 scikit-learn = "^1.5.2"
 tyro = "^0.8.11"
 clip = {git = "https://github.com/openai/CLIP.git"}
+matplotlib-venn = "^1.1.2"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
