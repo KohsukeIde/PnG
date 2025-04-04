@@ -5,6 +5,7 @@ import argparse
 import torch
 import numpy as np
 import cv2
+import json
 from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
@@ -177,7 +178,53 @@ def render_gaussians_alpha_blend(
 
     return color_buffer, alpha_buffer
 
-
+def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
+    """NeRF形式のカメラ内部パラメータを読み込む関数
+    
+    Args:
+        data_dir: NeRFデータディレクトリのパス
+        
+    Returns:
+        K: 3x3カメラ内部パラメータ行列
+    """
+    transforms_file = os.path.join(data_dir, 'transforms.json')
+    
+    # transformsファイルが存在しない場合はエラー
+    if not os.path.exists(transforms_file):
+        raise FileNotFoundError(f"NeRF transforms file not found at {transforms_file}")
+    
+    with open(transforms_file, 'r') as f:
+        transforms = json.load(f)
+    
+    # カメラパラメータを抽出
+    H = transforms.get('h', 800)
+    W = transforms.get('w', 800)
+    
+    # 焦点距離を取得（angle_xから計算することもある）
+    if 'fl_x' in transforms and 'fl_y' in transforms:
+        fx = transforms['fl_x']
+        fy = transforms['fl_y']
+    elif 'camera_angle_x' in transforms:
+        # camera_angle_xから焦点距離を計算
+        angle_x = transforms['camera_angle_x']
+        fx = 0.5 * W / np.tan(0.5 * angle_x)
+        fy = fx
+    else:
+        raise ValueError("Could not find camera focal length information in transforms.json")
+    
+    # 主点座標（通常は画像中心）
+    cx = transforms.get('cx', W/2)
+    cy = transforms.get('cy', H/2)
+    
+    # カメラ内部パラメータ行列
+    K = np.array([
+        [fx, 0, cx],
+        [0, fy, cy],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    
+    print(f"Loaded NeRF camera intrinsics: K=\n{K}")
+    return K
 
 def parse_args():
     """Parse command-line arguments for path configuration.
@@ -193,7 +240,7 @@ def parse_args():
     parser.add_argument(
         "--data_dir_gmm",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
         help="Path to the directory that contains fitted Gaussian pkls."
     )
     parser.add_argument(
@@ -225,6 +272,24 @@ def parse_args():
         type=str,
         default="0023_fitted_gaussians.pkl",
         help="Filename of the second fitted Gaussians pickle."
+    )
+    parser.add_argument(
+        "--use_nerf_intrinsics",
+        action="store_true",
+        default=False,
+        help="Use NeRF format camera intrinsics instead of COLMAP intrinsics."
+    )
+    parser.add_argument(
+        "--nerf_transforms_dir",
+        type=str,
+        default=None,
+        help="Path to the directory containing NeRF transforms.json file."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./results",
+        help="Directory to save output files."
     )
 
     return parser.parse_args()
@@ -262,25 +327,54 @@ def main():
     print(f"Calculated target volume: {target_volume:.2f}")
 
     ##############################
-    # 3) Load camera + COLMAP(内部パラメータ) info
+    # 3) Load camera + COLMAP/NeRF(内部パラメータ) info
     ##############################
-    cameras = load_cameras_from_colmap(colmap_dir)
-    images_data = load_images_from_colmap(colmap_dir)
-
-    image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
-    image1_id = image_name_to_id.get(image1_name)
-    image2_id = image_name_to_id.get(image2_name)
-    if image1_id is None or image2_id is None:
-        print(f"Error: {image1_name} or {image2_name} not found in COLMAP.")
-        sys.exit(1)
-
-    camera1_id = images_data[image1_id]['camera_id']
-    camera2_id = images_data[image2_id]['camera_id']
-
-    camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
-    camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
-    K1 = camera1.K
-    K2 = camera2.K
+    
+    # NeRF形式のカメラパラメータが指定されている場合は、それを使用
+    if args.use_nerf_intrinsics:
+        nerf_transforms_dir = args.nerf_transforms_dir or data_dir
+        K_nerf = load_nerf_intrinsics(nerf_transforms_dir)
+        print("Using NeRF intrinsics instead of COLMAP intrinsics")
+        # NeRF intrinsicsでGaussians fitted時のK1, K2を上書き
+        K1 = K_nerf
+        K2 = K_nerf
+        
+        # カメラ外部パラメータはCOLMAPから読み込む（まだ必要）
+        cameras = load_cameras_from_colmap(colmap_dir)
+        images_data = load_images_from_colmap(colmap_dir)
+        
+        image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
+        image1_id = image_name_to_id.get(image1_name)
+        image2_id = image_name_to_id.get(image2_name)
+        if image1_id is None or image2_id is None:
+            print(f"Error: {image1_name} or {image2_name} not found in COLMAP.")
+            sys.exit(1)
+            
+        camera1 = CameraModel(cameras[images_data[image1_id]['camera_id']], image1_id, images_data)
+        camera2 = CameraModel(cameras[images_data[image2_id]['camera_id']], image2_id, images_data)
+        
+        # カメラ内部パラメータをNeRFのものに置き換え
+        camera1.K = K1
+        camera2.K = K2
+    else:
+        # 従来通りCOLMAPからカメラパラメータを読み込む
+        cameras = load_cameras_from_colmap(colmap_dir)
+        images_data = load_images_from_colmap(colmap_dir)
+        
+        image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
+        image1_id = image_name_to_id.get(image1_name)
+        image2_id = image_name_to_id.get(image2_name)
+        if image1_id is None or image2_id is None:
+            print(f"Error: {image1_name} or {image2_name} not found in COLMAP.")
+            sys.exit(1)
+            
+        camera1_id = images_data[image1_id]['camera_id']
+        camera2_id = images_data[image2_id]['camera_id']
+        
+        camera1 = CameraModel(cameras[camera1_id], image1_id, images_data)
+        camera2 = CameraModel(cameras[camera2_id], image2_id, images_data)
+        K1 = camera1.K
+        K2 = camera2.K
 
     ##############################
     # 4) Setup OptimalTransportSolver (unbalanced version)
@@ -355,8 +449,12 @@ def main():
     print("\n--- Computing 3D Gaussian Covariances with Volume Prior ---")
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
 
-    ply_points_out = os.path.join('results', 'triangulated_points.ply')
-    os.makedirs('results', exist_ok=True)
+    # 結果保存ディレクトリの作成
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    
+    ply_points_out = os.path.join(output_dir, 'triangulated_points.ply')
+    os.makedirs(output_dir, exist_ok=True)
     
     camera_params_list = [(np.eye(3), np.zeros(3)), (R_est, t_optimized)]
     save_point_cloud_as_ply(points_3d, ply_points_out, camera_params=camera_params_list)
@@ -371,7 +469,7 @@ def main():
     ##############################
     # 10) Build ellipsoids => PLY
     ##############################
-    ply_out = os.path.join('results', '3d_gaussians_ellipsoids.ply')
+    ply_out = os.path.join(output_dir, '3d_gaussians_ellipsoids.ply')
     save_ellipsoids_as_ply(
         points_3d=reconstructor.points_3d,
         covariances_3d=reconstructor.covariances_3d,
@@ -398,7 +496,7 @@ def main():
 
     camera_params_list = [(R1, t1), (R2, t2)]
     
-    ply_out = os.path.join('results', '3d_gaussians_ellipsoids_withCams.ply')
+    ply_out = os.path.join(output_dir, '3d_gaussians_ellipsoids_withCams.ply')
     save_ellipsoids_as_ply(
         points_3d=reconstructor.points_3d,
         covariances_3d=reconstructor.covariances_3d,
@@ -413,13 +511,7 @@ def main():
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
     ##############################
     if True:
-        print("\n--- Rendering 3D Gaussians back into camera1's 2D image (alpha-blend) ---")
-
-        R_cam = np.eye(3)
-        t_cam = np.zeros(3)
-
-        out_width  = int(camera1.K[0,2]*2)
-        out_height = int(camera1.K[1,2]*2)
+        print("\n--- Rendering 3D Gaussians back into both camera views (alpha-blend) ---")
 
         transport_values = None
         if hasattr(reconstructor, 'transport_values') and len(reconstructor.transport_values) > 0:
@@ -430,78 +522,120 @@ def main():
             print("No transport values available, using default alpha values only.")
             sys.exit(1)
 
-        mixture_img, coverage_img = render_gaussians_alpha_blend(
+        # First camera rendering
+        print("Rendering from camera 1 viewpoint...")
+        R_cam1 = np.eye(3)  # Camera 1 is our reference frame
+        t_cam1 = np.zeros(3)
+
+        out_width1 = int(camera1.K[0,2]*2)
+        out_height1 = int(camera1.K[1,2]*2)
+
+        mixture_img1, coverage_img1 = render_gaussians_alpha_blend(
             points_3d=reconstructor.points_3d,
             covariances_3d=reconstructor.covariances_3d,
             color_3d=reconstructor.color_3d,
             alpha_3d=reconstructor.alpha_3d,
-            R_cam=R_cam,
-            t_cam=t_cam,
+            R_cam=R_cam1,
+            t_cam=t_cam1,
             K=camera1.K,
-            out_width=out_width,
-            out_height=out_height,
+            out_width=out_width1,
+            out_height=out_height1,
             transport=transport_values 
         )
             
-        rendered_rgba = np.zeros((out_height, out_width, 4), dtype=np.float32)
-        rendered_rgba[..., :3] = mixture_img
-        rendered_rgba[..., 3] = coverage_img
+        rendered_rgba1 = np.zeros((out_height1, out_width1, 4), dtype=np.float32)
+        rendered_rgba1[..., :3] = mixture_img1
+        rendered_rgba1[..., 3] = coverage_img1
 
-        rendered_8u = np.clip(rendered_rgba*255.0, 0, 255).astype(np.uint8)
+        rendered_8u1 = np.clip(rendered_rgba1*255.0, 0, 255).astype(np.uint8)
         
-        rendered_8u_bgra = rendered_8u.copy()
-        rendered_8u_bgra[...,0] = rendered_8u[...,2]
-        rendered_8u_bgra[...,2] = rendered_8u[...,0]
+        rendered_8u_bgra1 = rendered_8u1.copy()
+        rendered_8u_bgra1[...,0] = rendered_8u1[...,2]
+        rendered_8u_bgra1[...,2] = rendered_8u1[...,0]
 
-        cv2.imwrite("results/rendered_splats.png", rendered_8u_bgra)
-        print("Saved alpha-blended splatting to results/rendered_splats.png")
+        cv2.imwrite(os.path.join(output_dir, "rendered_splats_cam1.png"), rendered_8u_bgra1)
+        print(f"Saved alpha-blended splatting for camera 1 to {os.path.join(output_dir, 'rendered_splats_cam1.png')}")
+
+        # Second camera rendering
+        print("Rendering from camera 2 viewpoint...")
+        R_cam2 = R2  # Camera 2's rotation relative to world
+        t_cam2 = t2  # Camera 2's translation relative to world
+
+        out_width2 = int(camera2.K[0,2]*2)
+        out_height2 = int(camera2.K[1,2]*2)
+
+        mixture_img2, coverage_img2 = render_gaussians_alpha_blend(
+            points_3d=reconstructor.points_3d,
+            covariances_3d=reconstructor.covariances_3d,
+            color_3d=reconstructor.color_3d,
+            alpha_3d=reconstructor.alpha_3d,
+            R_cam=R_cam2,
+            t_cam=t_cam2,
+            K=camera2.K,
+            out_width=out_width2,
+            out_height=out_height2,
+            transport=transport_values 
+        )
+            
+        rendered_rgba2 = np.zeros((out_height2, out_width2, 4), dtype=np.float32)
+        rendered_rgba2[..., :3] = mixture_img2
+        rendered_rgba2[..., 3] = coverage_img2
+
+        rendered_8u2 = np.clip(rendered_rgba2*255.0, 0, 255).astype(np.uint8)
+        
+        rendered_8u_bgra2 = rendered_8u2.copy()
+        rendered_8u_bgra2[...,0] = rendered_8u2[...,2]
+        rendered_8u_bgra2[...,2] = rendered_8u2[...,0]
+
+        cv2.imwrite(os.path.join(output_dir, "rendered_splats_cam2.png"), rendered_8u_bgra2)
+        print(f"Saved alpha-blended splatting for camera 2 to {os.path.join(output_dir, 'rendered_splats_cam2.png')}")
         print("\nDone.")
 
-    ##############################
-    # 12) Save final results
-    ##############################
-    results = {
-        'fundamental_matrix': F_optimized,
-        'cost_matrix': cost_matrix.cpu().numpy(),
-        'transport_matrix': transport_matrix_np,
-        'camera1_K': K1,
-        'camera2_K': K2,
-        'points_3d': points_3d,
-        'covariances_3d': reconstructor.covariances_3d,
-        'color_3d': reconstructor.color_3d,
-        'alpha_3d': reconstructor.alpha_3d,
-        'transport_values': getattr(reconstructor, 'transport_values', None), 
-        'source_gaussians1': reconstructor.source_gaussians1,
-        'source_gaussians2': reconstructor.source_gaussians2,
-        'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
-        'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
-        'camera_params_list': camera_params_list,  
-        'R1': R1,
-        't1': t1,
-        'R2': R2,
-        't2': t2,
-        'camera1_R': R1,
-        'camera1_t': t1,
-        'camera2_R': R2,
-        'camera2_t': t2,
-        'existing_3d_gaussians': [
-            {
-                "center": points_3d[i],
-                "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # Default unit quaternion (これいらないかも)
-                "scale3d": np.sqrt(np.maximum(np.linalg.eigvalsh(reconstructor.covariances_3d[i]), 1e-10)),
-                "color": reconstructor.color_3d[i],
-                "alpha": reconstructor.alpha_3d[i]
-            }
-            for i in range(len(points_3d))
-        ]
-    }
+    # ##############################
+    # # 12) Save final results
+    # ##############################
+    # results = {
+    #     'fundamental_matrix': F_optimized,
+    #     'cost_matrix': cost_matrix.cpu().numpy(),
+    #     'transport_matrix': transport_matrix_np,
+    #     'camera1_K': K1,
+    #     'camera2_K': K2,
+    #     'points_3d': points_3d,
+    #     'covariances_3d': reconstructor.covariances_3d,
+    #     'color_3d': reconstructor.color_3d,
+    #     'alpha_3d': reconstructor.alpha_3d,
+    #     'transport_values': getattr(reconstructor, 'transport_values', None), 
+    #     'source_gaussians1': reconstructor.source_gaussians1,
+    #     'source_gaussians2': reconstructor.source_gaussians2,
+    #     'source_gaussians1_data': getattr(reconstructor, 'source_gaussians1_data', None),
+    #     'source_gaussians2_data': getattr(reconstructor, 'source_gaussians2_data', None),
+    #     'camera_params_list': camera_params_list,  
+    #     'R1': R1,
+    #     't1': t1,
+    #     'R2': R2,
+    #     't2': t2,
+    #     'camera1_R': R1,
+    #     'camera1_t': t1,
+    #     'camera2_R': R2,
+    #     'camera2_t': t2,
+    #     'existing_3d_gaussians': [
+    #         {
+    #             "center": points_3d[i],
+    #             "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # Default unit quaternion (これいらないかも)
+    #             "scale3d": np.sqrt(np.maximum(np.linalg.eigvalsh(reconstructor.covariances_3d[i]), 1e-10)),
+    #             "color": reconstructor.color_3d[i],
+    #             "alpha": reconstructor.alpha_3d[i]
+    #         }
+    #         for i in range(len(points_3d))
+    #     ]
+    # }
     
-    out_pkl = os.path.join('results', 'initial_3dgs_results.pkl')
-    with open(out_pkl, 'wb') as f:
-        pickle.dump(results, f)
+    # out_pkl = os.path.join(output_dir, 'initial_3dgs_results.pkl')
+    # with open(out_pkl, 'wb') as f:
+    #     pickle.dump(results, f)
 
-    print(f"\nSaved pipeline results to {out_pkl}")
-    print("\nDone.")
+    # print(f"\nSaved pipeline results to {out_pkl}")
+    # print("\nDone.")
 
 
 if __name__ == '__main__':
