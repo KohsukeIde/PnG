@@ -264,13 +264,13 @@ def parse_args():
     parser.add_argument(
         "--gaussians1_filename",
         type=str,
-        default="0022_fitted_gaussians.pkl",
+        default="0026_fitted_gaussians.pkl",
         help="Filename of the first fitted Gaussians pickle."
     )
     parser.add_argument(
         "--gaussians2_filename",
         type=str,
-        default="0023_fitted_gaussians.pkl",
+        default="0095_fitted_gaussians.pkl",
         help="Filename of the second fitted Gaussians pickle."
     )
     parser.add_argument(
@@ -415,7 +415,7 @@ def main():
     print("\n--- Identifying Source Gaussians ---")
     reconstructor.identify_source_gaussians(
         transport_matrix=transport_matrix_np,
-        auto_threshold=True
+        auto_threshold=False
     )
     ##############################
     # 7) Triangulate
@@ -439,7 +439,7 @@ def main():
     t2=t_optimized
     #dont delete any gaussian (UOTの枠組みでthresholdは必要なくなったので)
     threshold = 0.0
-    reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold, top_k=100000)
+    reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold)
     points_3d = reconstructor.points_3d
     print(f"\nTriangulated {points_3d.shape[0]} 3D points")
 
