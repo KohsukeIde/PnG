@@ -1111,6 +1111,24 @@ files = [
 traitlets = "*"
 
 [[package]]
+name = "matplotlib-venn"
+version = "1.1.2"
+description = "Functions for plotting area-proportional two- and three-way Venn diagrams in matplotlib."
+optional = false
+python-versions = "*"
+files = [
+    {file = "matplotlib-venn-1.1.2.tar.gz", hash = "sha256:6f2b07a03e9bb5a62de2f32f965216739e175176f9d654dd19e7af2c22ec36e3"},
+]
+
+[package.dependencies]
+matplotlib = "*"
+numpy = "*"
+scipy = "*"
+
+[package.extras]
+shapely = ["shapely"]
+
+[[package]]
 name = "mdformat"
 version = "0.7.22"
 description = "CommonMark compliant Markdown formatter"
@@ -2757,4 +2775,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.9"
-content-hash = "b7ee9362f5e58d9eec3cb0dd9416aa098d62f1a59f76e015ecd2f92ecec40c7c"
+content-hash = "bf9d2153362645c533bd4dbb927f29c5818baa81f33316123f24583a3fc761bc"
