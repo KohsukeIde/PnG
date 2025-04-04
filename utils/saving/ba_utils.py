@@ -315,7 +315,6 @@ def render_gaussians_alpha_blend(
                 C_new = rgb
                 A_out = A_in + A_new * (1.0 - A_in)
                 if A_out > 1e-8:
-                    # C_out = (C_new*A_new + C_in*A_in*(1 - A_new)) / A_out
                     C_out = (C_new * A_new + C_in * A_in * (1 - A_new)) / A_out
                 else:
                     C_out = C_in
@@ -578,6 +577,12 @@ def visualize_initial_pair_renders(
 ) -> None:
     """初期ペア（最初の2つのカメラ）についてBA前後のガウシアンレンダリング結果を比較視覚化する
     
+    主な出力:
+    - rendered_splats_camX_before_ba.png: BA前のレンダリング結果(BGRAフォーマット)
+    - rendered_splats_camX_after_ba.png: BA後のレンダリング結果(BGRAフォーマット)
+    - comparison_camX.png: 元画像とBA前後の結果を並べた比較画像
+    - comparison_error_camX.png: 誤差解析画像
+    
     Args:
         reconstruction_data: 再構成データ
         ba_results: BAの結果
@@ -617,9 +622,6 @@ def visualize_initial_pair_renders(
             continue
         
         print(f"Rendering comparison for camera {idx+1} ({image_name})...")
-        
-        # 各カメラごとの保存ファイル名
-        save_path = os.path.join(save_dir, f"camera{idx+1}_render_comparison.png")
         
         # カメラパラメータ取得
         if 'initial_cameras' in ba_results and idx < len(ba_results['initial_cameras']):
@@ -691,7 +693,41 @@ def visualize_initial_pair_renders(
             transport=transport_values  # Apply transport values here
         )
         
-        # 比較可視化
+        # [1] BGRA形式のPNGとして保存（primary output - BGRA format with alpha channel）
+        # BA前のレンダリング結果
+        rendered_rgba_before = np.zeros((H, W, 4), dtype=np.float32)
+        rendered_rgba_before[..., :3] = color_before
+        rendered_rgba_before[..., 3] = alpha_before
+        rendered_8u_before = np.clip(rendered_rgba_before*255.0, 0, 255).astype(np.uint8)
+        rendered_8u_bgra_before = rendered_8u_before.copy()
+        rendered_8u_bgra_before[..., 0] = rendered_8u_before[..., 2]  # R -> B
+        rendered_8u_bgra_before[..., 2] = rendered_8u_before[..., 0]  # B -> R
+        
+        # BA後のレンダリング結果
+        rendered_rgba_after = np.zeros((H, W, 4), dtype=np.float32)
+        rendered_rgba_after[..., :3] = color_after
+        rendered_rgba_after[..., 3] = alpha_after
+        rendered_8u_after = np.clip(rendered_rgba_after*255.0, 0, 255).astype(np.uint8)
+        rendered_8u_bgra_after = rendered_8u_after.copy()
+        rendered_8u_bgra_after[..., 0] = rendered_8u_after[..., 2]  # R -> B
+        rendered_8u_bgra_after[..., 2] = rendered_8u_after[..., 0]  # B -> R
+        
+        # PNG形式で保存（主要な出力）
+        png_before_path = os.path.join(save_dir, f"rendered_splats_cam{idx+1}_before_ba.png")
+        png_after_path = os.path.join(save_dir, f"rendered_splats_cam{idx+1}_after_ba.png")
+        cv2.imwrite(png_before_path, rendered_8u_bgra_before)
+        cv2.imwrite(png_after_path, rendered_8u_bgra_after)
+        print(f"Saved raw renderings to {png_before_path} and {png_after_path}")
+        
+        # [2] 比較可視化（secondary output - for visual comparison）
+        # 保存したファイルを読み込み直して使用（描画スタイルを統一）
+        rendered_before_img = cv2.imread(png_before_path, cv2.IMREAD_UNCHANGED)
+        rendered_after_img = cv2.imread(png_after_path, cv2.IMREAD_UNCHANGED)
+        
+        # BGRからRGBに変換
+        rendered_before_rgb = cv2.cvtColor(rendered_before_img, cv2.COLOR_BGRA2RGBA)
+        rendered_after_rgb = cv2.cvtColor(rendered_after_img, cv2.COLOR_BGRA2RGBA)
+        
         plt.figure(figsize=(15, 5))
         
         # 元画像
@@ -702,49 +738,63 @@ def visualize_initial_pair_renders(
         
         # BA前のレンダリング
         plt.subplot(132)
-        plt.imshow(color_before)
+        plt.imshow(rendered_before_rgb)
         plt.title("Before BA")
         plt.axis('off')
         
         # BA後のレンダリング
         plt.subplot(133)
-        plt.imshow(color_after)
+        plt.imshow(rendered_after_rgb)
         plt.title("After BA")
         plt.axis('off')
         
         plt.tight_layout()
-        plt.savefig(save_path)
+        comparison_path = os.path.join(save_dir, f"comparison_cam{idx+1}.png")
+        plt.savefig(comparison_path)
         plt.close()
         
-        # エラー可視化（オリジナルとのピクセル差分）
+        # [3] エラー可視化（secondary output - for error analysis）
+        # アルファチャンネルを考慮した誤差計算
+        alpha_mask_before = rendered_before_rgb[..., 3:4] / 255.0
+        alpha_mask_after = rendered_after_rgb[..., 3:4] / 255.0
+        
+        # アルファをRGBに適用
+        rendered_before_premult = rendered_before_rgb[..., :3] / 255.0 * alpha_mask_before
+        rendered_after_premult = rendered_after_rgb[..., :3] / 255.0 * alpha_mask_after
+        
+        # 元画像を[0,1]範囲に正規化
+        orig_norm = orig_img / 255.0
+        
+        # マスクされた領域のみで誤差計算
+        error_before = np.abs(rendered_before_premult - orig_norm).mean(axis=2)
+        error_after = np.abs(rendered_after_premult - orig_norm).mean(axis=2)
+        
         plt.figure(figsize=(15, 5))
         
         # BA前の誤差
-        error_before = np.abs(color_before - orig_img/255.0).mean(axis=2)
         plt.subplot(131)
-        plt.imshow(error_before, cmap='hot')
+        plt.imshow(error_before, cmap='hot', vmin=0, vmax=0.5)
         plt.title(f"Error Before BA (Mean: {error_before.mean():.4f})")
         plt.colorbar()
         
         # BA後の誤差
-        error_after = np.abs(color_after - orig_img/255.0).mean(axis=2)
         plt.subplot(132)
-        plt.imshow(error_after, cmap='hot')
+        plt.imshow(error_after, cmap='hot', vmin=0, vmax=0.5)
         plt.title(f"Error After BA (Mean: {error_after.mean():.4f})")
         plt.colorbar()
         
         # 誤差の改善
         error_diff = error_before - error_after
         plt.subplot(133)
-        plt.imshow(error_diff, cmap='coolwarm')
+        plt.imshow(error_diff, cmap='coolwarm', vmin=-0.2, vmax=0.2)
         plt.title(f"Error Improvement (Mean: {error_diff.mean():.4f})")
         plt.colorbar()
         
-        error_save_path = save_path.replace('.png', '_error.png')
+        error_comparison_path = os.path.join(save_dir, f"comparison_error_cam{idx+1}.png")
         plt.tight_layout()
-        plt.savefig(error_save_path)
+        plt.savefig(error_comparison_path)
         plt.close()
         
-        print(f"Saved renderings for camera {idx+1} to {save_path}")
+        print(f"Saved comparison visualizations to {comparison_path} and {error_comparison_path}")
     
     print(f"Initial pair renderings saved to {save_dir}")
