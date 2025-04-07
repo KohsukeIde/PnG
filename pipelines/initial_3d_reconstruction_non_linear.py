@@ -13,7 +13,7 @@ from src.camera.camera_model import CameraModel
 from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_colmap
 from utils.gs_pkl_loader import load_gaussians_torch
 from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_point_cloud_as_ply
-
+from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
@@ -187,7 +187,7 @@ def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
     Returns:
         K: 3x3カメラ内部パラメータ行列
     """
-    transforms_file = os.path.join(data_dir, 'transforms.json')
+    transforms_file = os.path.join(data_dir, 'transforms_train.json')
     
     # transformsファイルが存在しない場合はエラー
     if not os.path.exists(transforms_file):
@@ -234,7 +234,7 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless",
         help="Path to the main data directory (e.g. DTU scan folder)."
     )
     parser.add_argument(
@@ -264,19 +264,19 @@ def parse_args():
     parser.add_argument(
         "--gaussians1_filename",
         type=str,
-        default="0026_fitted_gaussians.pkl",
+        default="0079_fitted_gaussians.pkl",
         help="Filename of the first fitted Gaussians pickle."
     )
     parser.add_argument(
         "--gaussians2_filename",
         type=str,
-        default="0095_fitted_gaussians.pkl",
+        default="0094_fitted_gaussians.pkl",
         help="Filename of the second fitted Gaussians pickle."
     )
     parser.add_argument(
         "--use_nerf_intrinsics",
         action="store_true",
-        default=False,
+        default=True,
         help="Use NeRF format camera intrinsics instead of COLMAP intrinsics."
     )
     parser.add_argument(
@@ -293,6 +293,78 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2):
+    """特徴点ベースでカメラ姿勢推定を行う関数
+    
+    Args:
+        image1_path: 1枚目の画像パス
+        image2_path: 2枚目の画像パス
+        K1: 1枚目のカメラ内部パラメータ
+        K2: 2枚目のカメラ内部パラメータ
+        
+    Returns:
+        R: カメラ2の回転行列（カメラ1基準）
+        t: カメラ2の並進ベクトル（カメラ1基準）
+        F: 基礎行列
+        inlier_matches: インライアーとなったマッチング点
+    """
+    # 画像読み込み
+    img1 = cv2.imread(image1_path, cv2.IMREAD_COLOR)
+    img2 = cv2.imread(image2_path, cv2.IMREAD_COLOR)
+    
+    if img1 is None or img2 is None:
+        raise ValueError(f"Failed to load images: {image1_path} or {image2_path}")
+    
+    # グレースケール変換
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    
+    # SIFT特徴点検出
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(gray1, None)
+    kp2, des2 = sift.detectAndCompute(gray2, None)
+    
+    print(f"Detected {len(kp1)} keypoints in image1 and {len(kp2)} keypoints in image2")
+    
+    # 特徴点マッチング
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des1, des2, k=2)
+    
+    # Lowe's ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good_matches.append(m)
+    
+    print(f"Found {len(good_matches)} good matches after ratio test")
+    
+    # マッチした点の座標を取得
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+    
+    # 基礎行列の計算（RANSAC）
+    F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, 1.0, 0.99)
+    
+    # インライアーのみ残す
+    mask = mask.ravel().astype(bool)
+    pts1_inliers = pts1[mask]
+    pts2_inliers = pts2[mask]
+    
+    print(f"Found {np.sum(mask)} inliers for fundamental matrix")
+    
+    # 必要点数チェック
+    if np.sum(mask) < 8:
+        raise ValueError("Not enough inliers for reliable pose estimation")
+    
+    # 基礎行列からカメラ姿勢を復元
+    E = K2.T @ F @ K1  # 基本行列の計算
+    _, R, t, _ = cv2.recoverPose(E, pts1_inliers, pts2_inliers, K1)
+    
+    # インライアーとなったマッチング
+    inlier_matches = [good_matches[i] for i in range(len(good_matches)) if mask[i]]
+    
+    return R, t, F, inlier_matches
 
 def main():
     args = parse_args()
@@ -311,6 +383,11 @@ def main():
 
     gaussians1_path = os.path.join(data_dir_gmm, args.gaussians1_filename)
     gaussians2_path = os.path.join(data_dir_gmm, args.gaussians2_filename)
+    
+    # 画像ファイルパスの追加
+    images_dir = os.path.join(data_dir, "images")
+    image1_path = os.path.join(images_dir, image1_name)
+    image2_path = os.path.join(images_dir, image2_name)
 
     ##############################
     # 1) Load Gaussians
@@ -338,24 +415,6 @@ def main():
         # NeRF intrinsicsでGaussians fitted時のK1, K2を上書き
         K1 = K_nerf
         K2 = K_nerf
-        
-        # カメラ外部パラメータはCOLMAPから読み込む（まだ必要）
-        cameras = load_cameras_from_colmap(colmap_dir)
-        images_data = load_images_from_colmap(colmap_dir)
-        
-        image_name_to_id = {data['name']: image_id for image_id, data in images_data.items()}
-        image1_id = image_name_to_id.get(image1_name)
-        image2_id = image_name_to_id.get(image2_name)
-        if image1_id is None or image2_id is None:
-            print(f"Error: {image1_name} or {image2_name} not found in COLMAP.")
-            sys.exit(1)
-            
-        camera1 = CameraModel(cameras[images_data[image1_id]['camera_id']], image1_id, images_data)
-        camera2 = CameraModel(cameras[images_data[image2_id]['camera_id']], image2_id, images_data)
-        
-        # カメラ内部パラメータをNeRFのものに置き換え
-        camera1.K = K1
-        camera2.K = K2
     else:
         # 従来通りCOLMAPからカメラパラメータを読み込む
         cameras = load_cameras_from_colmap(colmap_dir)
@@ -379,7 +438,6 @@ def main():
     ##############################
     # 4) Setup OptimalTransportSolver (unbalanced version)
     ##############################
-    from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
     solver = OptimalTransportSolver(
         gaussians1=gaussians1,
         gaussians2=gaussians2,
@@ -388,13 +446,13 @@ def main():
         epsilon=0.01,
         lambda_mean=0.0,
         lambda_cov=0.0,
-        lambda_color=0.0,
+        lambda_color=0.2,
         lambda_epipolar=1.0,
         device=device
     )
 
     ##############################
-    # 5) Fundamental matrix optimization (using R,t)
+    # 5.A) Fundamental matrix optimization (using R,t)
     ##############################
     print("\n--- Optimizing Fundamental Matrix ---")
     solver.optimize_with_RT(max_iter=1000, tol=1e-6)
@@ -402,7 +460,25 @@ def main():
     print("\nOptimized Fundamental matrix (from R,t):\n", F_optimized)
 
     ##############################
-    # 6) Final cost & unbalanced transport
+    # 5.B) SIFT-based camera pose estimation
+    ##############################
+    print("\n--- Estimating camera pose from SIFT features ---")
+    try:
+        R_sift, t_sift, F_sift, inlier_matches = estimate_camera_pose_from_features(
+            image1_path, image2_path, K1, K2)
+        print(f"SIFT-based camera pose estimation successful with {len(inlier_matches)} inliers")
+        print("R_sift:\n", R_sift)
+        print("t_sift:\n", t_sift)
+        print("F_sift:\n", F_sift)
+    except Exception as e:
+        print(f"Failed to estimate camera pose from SIFT features: {e}")
+        print("Skipping SIFT-based triangulation")
+        R_sift = None
+        t_sift = None
+        F_sift = None
+
+    ##############################
+    # 6.A) Final cost & unbalanced transport (original)
     ##############################
     with torch.no_grad():
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
@@ -417,26 +493,33 @@ def main():
         transport_matrix=transport_matrix_np,
         auto_threshold=False
     )
+    
     ##############################
-    # 7) Triangulate
+    # 7.A) Triangulate (original)
     ##############################
     # Get R,t from solver
     r_optimized = solver.rvec.detach().cpu().numpy()
     t_optimized = solver.tvec.detach().cpu().numpy()
-    R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()
-    print("R_est:\n", R_est)
+    r_est, _ = cv2.Rodrigues(r_optimized) 
+    
+    t_norm = np.linalg.norm(t_optimized)
+    if t_norm > 1e-10:
+        t_optimized = t_optimized / t_norm
+        
+    print("r_est:\n", r_est)
     print("t_est:\n", t_optimized)
     
     reconstructor.set_camera_matrices_explicitly(
         r1=np.eye(3), 
         t1=np.zeros(3), 
-        r2=R_est, 
+        r2=r_est, 
         t2=t_optimized
     )
-    R1=np.eye(3), 
-    t1=np.zeros(3),
-    R2=R_est,
+    R1=np.eye(3)
+    t1=np.zeros(3)
+    R2=r_est
     t2=t_optimized
+    
     #dont delete any gaussian (UOTの枠組みでthresholdは必要なくなったので)
     threshold = 0.0
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold)
@@ -456,15 +539,58 @@ def main():
     ply_points_out = os.path.join(output_dir, 'triangulated_points.ply')
     os.makedirs(output_dir, exist_ok=True)
     
-    camera_params_list = [(np.eye(3), np.zeros(3)), (R_est, t_optimized)]
+    camera_params_list = [(np.eye(3), np.zeros(3)), (r_est, t_optimized)]
     save_point_cloud_as_ply(points_3d, ply_points_out, camera_params=camera_params_list)
+
+    ##############################
+    # 6.B & 7.B) SIFT-based transport and triangulation
+    ##############################
+    if R_sift is not None and t_sift is not None and F_sift is not None:
+        print("\n--- Using SIFT-based F for transport and triangulation ---")
+        
+        # SIFTから得られたFundamental matrixをtorch tensorに変換
+        F_sift_tensor = torch.from_numpy(F_sift).float().to(device)
+        
+        # SIFTベースの輸送行列計算
+        with torch.no_grad():
+            cost_matrix_sift = solver.compute_cost_matrix_fundamental(F_sift_tensor)
+            transport_matrix_sift = solver.unbalanced_sinkhorn_algorithm(cost_matrix_sift)
+            transport_matrix_sift_np = transport_matrix_sift.cpu().numpy()
+        
+        # 新しいreconstructorインスタンスを作成
+        reconstructor_sift = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
+        
+        print("\n--- Identifying Source Gaussians (SIFT-based) ---")
+        reconstructor_sift.identify_source_gaussians(
+            transport_matrix=transport_matrix_sift_np,
+            auto_threshold=False
+        )
+        
+        # SIFTベースのR,tを設定
+        reconstructor_sift.set_camera_matrices_explicitly(
+            r1=np.eye(3), 
+            t1=np.zeros(3), 
+            r2=R_sift, 
+            t2=t_sift.flatten()  # 形状を(3,)に変換
+        )
+        
+        # TriangulateしてPLY保存
+        reconstructor_sift.triangulate_gaussian_centers(transport_matrix_sift_np, threshold=threshold)
+        points_3d_sift = reconstructor_sift.points_3d
+        print(f"\nTriangulated {points_3d_sift.shape[0]} 3D points using SIFT-based pose")
+        
+        ply_points_sift_out = os.path.join(output_dir, 'triangulated_points_sift.ply')
+        # t_siftもflatten()して正しい形状に変換
+        camera_params_list_sift = [(np.eye(3), np.zeros(3)), (R_sift, t_sift.flatten())]
+        save_point_cloud_as_ply(points_3d_sift, ply_points_sift_out, camera_params=camera_params_list_sift)
+        print(f"Saved SIFT-based triangulated points to {ply_points_sift_out}")
 
     ##############################
     # 9) Compute color & alpha
     ##############################
     print("\n--- Computing 3D Gaussian Colors & Alphas ---")
     reconstructor.compute_3d_gaussian_colors(color_mode="average")
-    reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
+    reconstructor.compute_3d_gaussian_alphas(alpha_mode="max")
 
     ##############################
     # 10) Build ellipsoids => PLY
@@ -491,7 +617,7 @@ def main():
     # actual camera frustum coord
     R1 = np.eye(3)
     t1= np.zeros(3)
-    R2 = R_est
+    R2 = r_est
     t2 = t_optimized
 
     camera_params_list = [(R1, t1), (R2, t2)]
@@ -527,8 +653,15 @@ def main():
         R_cam1 = np.eye(3)  # Camera 1 is our reference frame
         t_cam1 = np.zeros(3)
 
-        out_width1 = int(camera1.K[0,2]*2)
-        out_height1 = int(camera1.K[1,2]*2)
+        # カメラオブジェクトがあればそれを使用、なければK1から直接サイズを計算
+        if 'camera1' in locals() and camera1 is not None:
+            out_width1 = int(camera1.K[0,2]*2)
+            out_height1 = int(camera1.K[1,2]*2)
+            K_render1 = camera1.K
+        else:
+            out_width1 = int(K1[0,2]*2)
+            out_height1 = int(K1[1,2]*2)
+            K_render1 = K1
 
         mixture_img1, coverage_img1 = render_gaussians_alpha_blend(
             points_3d=reconstructor.points_3d,
@@ -537,7 +670,7 @@ def main():
             alpha_3d=reconstructor.alpha_3d,
             R_cam=R_cam1,
             t_cam=t_cam1,
-            K=camera1.K,
+            K=K_render1,
             out_width=out_width1,
             out_height=out_height1,
             transport=transport_values 
@@ -561,8 +694,15 @@ def main():
         R_cam2 = R2  # Camera 2's rotation relative to world
         t_cam2 = t2  # Camera 2's translation relative to world
 
-        out_width2 = int(camera2.K[0,2]*2)
-        out_height2 = int(camera2.K[1,2]*2)
+        # カメラオブジェクトがあればそれを使用、なければK2から直接サイズを計算
+        if 'camera2' in locals() and camera2 is not None:
+            out_width2 = int(camera2.K[0,2]*2)
+            out_height2 = int(camera2.K[1,2]*2)
+            K_render2 = camera2.K
+        else:
+            out_width2 = int(K2[0,2]*2)
+            out_height2 = int(K2[1,2]*2)
+            K_render2 = K2
 
         mixture_img2, coverage_img2 = render_gaussians_alpha_blend(
             points_3d=reconstructor.points_3d,
@@ -571,7 +711,7 @@ def main():
             alpha_3d=reconstructor.alpha_3d,
             R_cam=R_cam2,
             t_cam=t_cam2,
-            K=camera2.K,
+            K=K_render2,  # K_render2を使用
             out_width=out_width2,
             out_height=out_height2,
             transport=transport_values 
