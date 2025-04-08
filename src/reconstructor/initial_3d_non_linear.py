@@ -349,8 +349,8 @@ class Initial3DReconstructor:
         """Compute camera projection matrices p1 and p2 from the homography matrix.
 
         Note:
-            If you plan to use a Fundamental matrix approach (rather than a plane-induced homography),
-            you can skip this method and set p1, p2 explicitly with your own extrinsics.
+            If using Fundamental matrix approach (rather than a plane-induced homography),
+            you can skip this method and set p1, p2 explicitly.
         """
         decomp = cv2.decomposeHomographyMat(self.h, self.k1)
 
@@ -493,6 +493,15 @@ class Initial3DReconstructor:
 
         print(f"transport matrix shape {transport_matrix.shape}")
         
+        # 診断用のコード
+        # exactly_zero = np.sum(transport_matrix == 0.0)
+        # zero_or_greater = np.sum(transport_matrix >= 0.0)
+        # greater_than_zero = np.sum(transport_matrix > 0.0)
+        # print(f"正確に0の要素数: {exactly_zero}")
+        # print(f"0以上の要素数: {zero_or_greater}")
+        # print(f"0より大きい要素数: {greater_than_zero}")
+        # print(f"差分: {zero_or_greater - greater_than_zero}")
+        
         # 非ゼロの輸送値の数をカウント
         non_zero_count = np.sum(transport_matrix > 0)
         print(f"Number of transport values > 0: {non_zero_count}")
@@ -502,7 +511,7 @@ class Initial3DReconstructor:
         # Get all indices.
         all_indices = np.arange(t_flat.size)
         # Filter indices with values >= threshold.
-        mask = t_flat >= threshold
+        mask = t_flat > threshold
         valid_indices = all_indices[mask]
         # If no valid indices are found, return empty 3D points and match pairs.
         if len(valid_indices) == 0:
