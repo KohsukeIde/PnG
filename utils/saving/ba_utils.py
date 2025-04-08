@@ -343,10 +343,11 @@ def visualize_rendered_comparison(
         save_path: 保存先パス
     """
     # 画像読み込み
-    orig_img = cv2.imread(original_image_path)
-    if orig_img is None:
-        raise FileNotFoundError(f"Image not found: {original_image_path}")
-    orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
+    orig_img = cv2.imread(original_image_path, cv2.IMREAD_UNCHANGED)
+    if orig_img.shape[2] == 4:  # アルファチャンネルがある場合
+        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGRA2RGBA)
+    else:
+        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
     
     H, W = orig_img.shape[:2]
     
@@ -644,12 +645,11 @@ def visualize_initial_pair_renders(
             continue
         
         # 画像読み込み
-        orig_img = cv2.imread(image_path)
-        if orig_img is None:
-            print(f"Warning: Could not read image {image_path}")
-            continue
-        
-        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
+        orig_img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if orig_img.shape[2] == 4:  # アルファチャンネルがある場合
+            orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGRA2RGBA)
+        else:
+            orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
         H, W = orig_img.shape[:2]
         
         # BA前後の3D Gaussian
@@ -763,7 +763,7 @@ def visualize_initial_pair_renders(
         rendered_after_premult = rendered_after_rgb[..., :3] / 255.0 * alpha_mask_after
         
         # 元画像を[0,1]範囲に正規化
-        orig_norm = orig_img / 255.0
+        orig_norm = orig_img[..., :3] / 255.0  # RGB部分のみを使用
         
         # マスクされた領域のみで誤差計算
         error_before = np.abs(rendered_before_premult - orig_norm).mean(axis=2)
