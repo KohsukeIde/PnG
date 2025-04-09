@@ -1,5 +1,6 @@
 # src/selector/view_selector.py
 import os
+import sys
 import numpy as np
 import torch
 import cv2
@@ -264,6 +265,9 @@ class ViewSelector:
                 print(f"Features for {path} not found. Skipping histogram computation.")
     
     def add_reference_images(self, image_names: List[str]) -> None:
+    
+    
+    
         """ Add known reference viewpoints
         
         Args:
@@ -273,53 +277,31 @@ class ViewSelector:
             # Convert to full path
             path = os.path.join(self.image_dir, name)
             
-            # Extract features if not already done, based on feature type
+            # Simply add to reference_images if features exist
             if self.feature_type == 'clip':
-                if path not in self.clip_features:
-                    clip_features = self.extract_clip_features(path)
-                    if clip_features is not None:
-                        self.clip_features[path] = clip_features
-                        self.reference_images.append(path)
-                    else:
-                        print(f"Failed to extract CLIP features from {path}")
-                else:
+                if path in self.clip_features:
                     self.reference_images.append(path)
+                else:
+                    sys.exit(f"Warning: Cannot add {name} as reference - CLIP features not found")
             else:
                 # For traditional features
-                if path not in self.image_histograms:
-                    if path not in self.image_features:
-                        keypoints, descriptors = self.extract_features(path)
-                        if descriptors is not None and len(descriptors) > 0:
-                            self.image_features[path] = {
-                                'keypoints': keypoints,
-                                'descriptors': descriptors
-                            }
-                            
-                            # Compute histogram if we have a codebook
-                            if self.codebook is not None:
-                                histogram = self.compute_image_histogram(descriptors)
-                                self.image_histograms[path] = histogram
-                                self.reference_images.append(path)
-                            else:
-                                print(f"No codebook available for {path}")
-                        else:
-                            print(f"No features found in {path}")
-                    else:
-                        # Features exist, create histogram
-                        descriptors = self.image_features[path]['descriptors']
-                        if self.codebook is not None:
-                            histogram = self.compute_image_histogram(descriptors)
-                            self.image_histograms[path] = histogram
-                            self.reference_images.append(path)
-                else:
-                    # Already has histogram
+                if path in self.image_histograms:
                     self.reference_images.append(path)
-        
+                else:
+                    # Try to compute histogram if features exist but histogram doesn't
+                    if path in self.image_features and self.codebook is not None:
+                        descriptors = self.image_features[path]['descriptors']
+                        histogram = self.compute_image_histogram(descriptors)
+                        self.image_histograms[path] = histogram
+                        self.reference_images.append(path)
+                    else:
+                        sys.exit(f"Warning: Cannot add {name} as reference - features or histograms not found")
+                        
+                        
         print(f"Added {len(self.reference_images)} reference images")
-    
+        
     def set_source_gaussians_data(self, source_gaussians_data: Dict) -> None:
-        """
-        Set source Gaussian information
+        """Set source Gaussian information
         
         Args:
             source_gaussians_data: Dictionary containing source Gaussian information
@@ -336,13 +318,13 @@ class ViewSelector:
                 if 'means' in data:
                     # Use position information as features (simplified)
                     self.source_features['image1'] = data['means']
-            
+                else:
+                    sys.exit(f"Warning: Cannot add source gaussians from image 1 - 'means' not found")
             # Source Gaussians from image 2
             if 'source_gaussians2_data' in self.source_gaussians_data:
                 data = self.source_gaussians_data['source_gaussians2_data']
                 if 'means' in data:
                     self.source_features['image2'] = data['means']
-    
     def compute_similarity_matrix(self, candidate_paths: List[str]) -> np.ndarray:
         """Compute similarity matrix between candidate images and reference images
         based on selected feature type (CLIP or BoVW)
@@ -535,6 +517,7 @@ class ViewSelector:
             print(f"  {name}: similarity={max_similarities[idx]:.3f}, avg_sim={avg_similarities[idx]:.3f}, score={scores[best_indices[i]]:.3f}")
         
         return selected_names
+    
         
     def _calculate_source_gaussian_scores(self, candidate_paths: List[str], similarities: np.ndarray) -> np.ndarray:
         """Calculate scores for candidates based on potential to see unprocessed source gaussians
