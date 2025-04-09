@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import json
 from tqdm import tqdm
+from typing import List, Tuple, Optional
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.camera.camera_model import CameraModel
@@ -14,169 +15,85 @@ from src.utils.colmap_utils import load_cameras_from_colmap, load_images_from_co
 from utils.gs_pkl_loader import load_gaussians_torch
 from utils.saving.geometry_utils import save_ellipsoids_as_ply, save_point_cloud_as_ply
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
+from utils.export.export_utils import export_points_as_ply
+from utils.saving.ba_utils import render_gaussians_alpha_blend
+
 
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
 
 from src.reconstructor.initial_3d_non_linear import Initial3DReconstructor
 
-def render_gaussians_alpha_blend(
-    points_3d,
-    covariances_3d,
-    color_3d,
-    alpha_3d,
-    R_cam,
-    t_cam,
-    K,
-    out_width,
-    out_height,
-    splat_radius_factor=3.0,
-    transport=None
-):
-    """3Dガウスをアルファブレンド(Over)でレンダリングする関数
-    
-    手順:
-        1) ガウスの中心深度 Z_c (カメラ座標系) が大きい順に並び替え (遠い->近い)
-        2) 後ろから順にガウスをレンダリングし、アルファブレンドする
-        alpha_composite: 
-                C_out = C_new * A_new + C_in * (1 - A_new)
-                A_out = A_in + A_new * (1 - A_in)
-        3) 結果を (H,W,3) の color_img と (H,W) の alpha_img にして返す
-
-    Args:
-        points_3d (N,3)          : 3Dガウスの中心 (world座標)
-        covariances_3d (N,3,3)   : 3Dガウスの共分散行列 (world座標)
-        color_3d (N,3)           : 各ガウスの色 (0~1)
-        alpha_3d (N,)            : 各ガウスの基準アルファ (0~1)
-        R_cam, t_cam             : ワールド->カメラ変換 (3x3, (3,))
-        K                        : カメラ内部パラメータ (3x3)
-        out_width, out_height    : 出力画像サイズ
-        splat_radius_factor (float):
-            ガウス投影時の描画範囲を標準偏差の何倍にするか
-        transport (N,) or None:
-            各3Dガウスの "輸送量" や "重み"。
-            Noneでない場合は alpha_3d に乗算してアルファを決定する。
-            例: final_alpha[i] = clip( alpha_3d[i] * transport[i], 0, 1 )
-    
-    Returns:
-        color_img (H,W,3): 最終的なカラー画像 (float32, 0~1)
-        alpha_img (H,W)  : 最終的なアルファ画像 (float32, 0~1)
+def parse_args():
+    """Parse command-line arguments for path configuration.
     """
-    # 出力バッファ（カラー+アルファ）
-    color_buffer = np.zeros((out_height, out_width, 3), dtype=np.float32)
-    alpha_buffer = np.zeros((out_height, out_width),     dtype=np.float32)
+    parser = argparse.ArgumentParser(description="Pipeline to reconstruct 3D ellipsoids from 2D Gaussian data.")
 
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63",
+        help="Path to the main data directory (e.g. DTU scan folder)."
+    )
+    parser.add_argument(
+        "--data_dir_gmm",
+        type=str,
+        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked",
+        help="Path to the directory that contains fitted Gaussian pkls."
+    )
+    parser.add_argument(
+        "--colmap_dir",
+        type=str,
+        default="sparse/0",
+        help="Relative or absolute path to the COLMAP sparse folder."
+    )
+    parser.add_argument(
+        "--image1_name",
+        type=str,
+        default="0022.png",
+        help="Filename of the first image."
+    )
+    parser.add_argument(
+        "--image2_name",
+        type=str,
+        default="0023.png",
+        help="Filename of the second image."
+    )
+    parser.add_argument(
+        "--gaussians1_filename",
+        type=str,
+        default="0022_fitted_gaussians.pkl",
+        help="Filename of the first fitted Gaussians pickle."
+    )
+    parser.add_argument(
+        "--gaussians2_filename",
+        type=str,
+        default="0023_fitted_gaussians.pkl",
+        help="Filename of the second fitted Gaussians pickle."
+    )
+    parser.add_argument(
+        "--use_nerf_intrinsics",
+        action="store_true",
+        default=False,
+        help="Use NeRF format camera intrinsics instead of COLMAP intrinsics."
+    )
+    parser.add_argument(
+        "--nerf_transforms_dir",
+        type=str,
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/materials/",
+        help="Path to the directory containing NeRF transforms.json file."
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./results",
+        help="Directory to save output files."
+    )
 
-    N = points_3d.shape[0]
+    return parser.parse_args()
 
-    #---------- (1) ガウスを「奥(Z大) -> 手前(Z小)」の順にソート ----------
-    z_list = []
-    for i in range(N):
-        X_w = points_3d[i]
-        X_c = R_cam @ X_w + t_cam
-        z_list.append((X_c[2], i))
-    z_list.sort(key=lambda x: x[0], reverse=True)  # Z降順(奥->手前)
 
-    # transportが与えられたら alpha_3d に乗算しておく
-    # (クリップで [0,1] に収まるようにする)
-    if transport is not None:
-        alpha_final = np.minimum(alpha_3d * transport, 1.0)  # shape(N,)
-        print("transport matrix used!")
-    else:
-        print("no transport!")
-        alpha_final = alpha_3d.copy()
-
-    #---------- (2) ソート順にガウスを描画(アルファブレンド) ----------
-    for _, i in tqdm(z_list, desc="Rendering Gaussians (alpha blend)"):
-        X_w = points_3d[i]
-        Sigma_3 = covariances_3d[i]
-        rgb     = color_3d[i]
-        alpha_i = alpha_final[i]  # 輸送量を掛けたアルファ
-
-        # カメラ座標に変換
-        X_c = R_cam @ X_w + t_cam
-        z_c = X_c[2]
-        # Zが正でない(背面)はスキップ
-        if z_c <= 1e-8:
-            continue
-
-        # 2D投影座標 (u,v)
-        u = fx*(X_c[0]/z_c) + cx
-        v = fy*(X_c[1]/z_c) + cy
-        
-        px_center = int(np.round(u))
-        py_center = int(np.round(v))
-
-        # 画面外かどうかチェック
-        if not (0 <= px_center < out_width and 0 <= py_center < out_height):
-            # bounding boxの一部が可視領域に入るかもしれないので、ここでは一応続行
-            pass
-
-        # カメラ座標系でのガウス共分散
-        Sigma_cam = R_cam @ Sigma_3 @ R_cam.T
-
-        # ヤコビアンで 2D共分散行列 Sigma_2D を算出
-        X, Y, Z = X_c
-        J = np.array([
-            [fx/Z,   0.0,    -fx*X/(Z**2)],
-            [0.0,    fy/Z,   -fy*Y/(Z**2)]
-        ], dtype=np.float32)
-        
-        Sigma_2D = J @ Sigma_cam @ J.T
-        e_vals, _ = np.linalg.eig(Sigma_2D)
-        e_vals = np.clip(e_vals, 1e-12, None)
-        std_x = np.sqrt(e_vals[0])
-        std_y = np.sqrt(e_vals[1])
-
-        # スプラット描画範囲
-        radius_x = int(np.ceil(std_x * splat_radius_factor))
-        radius_y = int(np.ceil(std_y * splat_radius_factor))
-
-        min_x = max(px_center - radius_x, 0)
-        max_x = min(px_center + radius_x, out_width  - 1)
-        min_y = max(py_center - radius_y, 0)
-        max_y = min(py_center + radius_y, out_height - 1)
-
-        inv_Sigma_2D = np.linalg.inv(Sigma_2D)
-
-        # (min_x..max_x, min_y..max_y) のピクセルに対してガウス値を計算して Overブレンド
-        for py in range(min_y, max_y + 1):
-            dy = py - v
-            for px in range(min_x, max_x + 1):
-                dx = px - u
-                disp = np.array([dx, dy], dtype=np.float32)
-                val = disp @ inv_Sigma_2D @ disp
-                gauss_val = np.exp(-0.5 * val)
-
-                # blend_alpha = gauss_val * (輸送量を掛けたα_i)
-                blend_alpha = gauss_val * alpha_i
-                # 最大1にクリップ
-                if blend_alpha > 1.0:
-                    blend_alpha = 1.0
-                # ほとんど寄与しない場合はスキップ（高速化）
-                if blend_alpha <= 1e-8:
-                    continue
-
-                # 現状バッファの色(A_in, C_in)を取り出す
-                C_in = color_buffer[py, px]
-                A_in = alpha_buffer[py, px]
-
-                # Overブレンド
-                A_new = blend_alpha
-                C_new = rgb
-                A_out = A_in + A_new * (1.0 - A_in)
-                if A_out > 1e-8:
-                    # C_out = (C_new*A_new + C_in*A_in*(1 - A_new)) / A_out
-                    C_out = (C_new * A_new + C_in * A_in * (1 - A_new)) / A_out
-                else:
-                    C_out = C_in
-
-                # 書き戻し
-                color_buffer[py, px] = C_out
-                alpha_buffer[py, px] = A_out
-
-    return color_buffer, alpha_buffer
 
 def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
     """NeRF形式のカメラ内部パラメータを読み込む関数
@@ -226,75 +143,7 @@ def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
     print(f"Loaded NeRF camera intrinsics: K=\n{K}")
     return K
 
-def parse_args():
-    """Parse command-line arguments for path configuration.
-    """
-    parser = argparse.ArgumentParser(description="Pipeline to reconstruct 3D ellipsoids from 2D Gaussian data.")
-
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless",
-        help="Path to the main data directory (e.g. DTU scan folder)."
-    )
-    parser.add_argument(
-        "--data_dir_gmm",
-        type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
-        help="Path to the directory that contains fitted Gaussian pkls."
-    )
-    parser.add_argument(
-        "--colmap_dir",
-        type=str,
-        default="sparse/0",
-        help="Relative or absolute path to the COLMAP sparse folder."
-    )
-    parser.add_argument(
-        "--image1_name",
-        type=str,
-        default="0022.png",
-        help="Filename of the first image."
-    )
-    parser.add_argument(
-        "--image2_name",
-        type=str,
-        default="0023.png",
-        help="Filename of the second image."
-    )
-    parser.add_argument(
-        "--gaussians1_filename",
-        type=str,
-        default="0079_fitted_gaussians.pkl",
-        help="Filename of the first fitted Gaussians pickle."
-    )
-    parser.add_argument(
-        "--gaussians2_filename",
-        type=str,
-        default="0094_fitted_gaussians.pkl",
-        help="Filename of the second fitted Gaussians pickle."
-    )
-    parser.add_argument(
-        "--use_nerf_intrinsics",
-        action="store_true",
-        default=True,
-        help="Use NeRF format camera intrinsics instead of COLMAP intrinsics."
-    )
-    parser.add_argument(
-        "--nerf_transforms_dir",
-        type=str,
-        default=None,
-        help="Path to the directory containing NeRF transforms.json file."
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./results",
-        help="Directory to save output files."
-    )
-
-    return parser.parse_args()
-
-def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2):
+def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2, debug_dir=None):
     """特徴点ベースでカメラ姿勢推定を行う関数
     
     Args:
@@ -302,6 +151,7 @@ def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2):
         image2_path: 2枚目の画像パス
         K1: 1枚目のカメラ内部パラメータ
         K2: 2枚目のカメラ内部パラメータ
+        debug_dir: デバッグ情報を保存するディレクトリ（省略可）
         
     Returns:
         R: カメラ2の回転行列（カメラ1基準）
@@ -315,6 +165,17 @@ def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2):
     
     if img1 is None or img2 is None:
         raise ValueError(f"Failed to load images: {image1_path} or {image2_path}")
+    
+    # デバッグ情報の出力
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(debug_dir, "debug_image1.png"), img1)
+        cv2.imwrite(os.path.join(debug_dir, "debug_image2.png"), img2)
+        
+        print(f"Image1 exists: {os.path.exists(image1_path)}")
+        print(f"Image2 exists: {os.path.exists(image2_path)}")
+        print(f"Image1 size: {img1.shape if img1 is not None else 'None'}")
+        print(f"Image2 size: {img2.shape if img2 is not None else 'None'}")
     
     # グレースケール変換
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
@@ -337,14 +198,27 @@ def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2):
         if m.distance < 0.7 * n.distance:
             good_matches.append(m)
     
-    print(f"Found {len(good_matches)} good matches after ratio test")
+    print(f"特徴点マッチング数: {len(good_matches)}")
+    
+    # 十分なマッチングがない場合の早期チェック追加
+    if len(good_matches) < 5:
+        raise ValueError(f"Not enough good matches for fundamental matrix estimation: {len(good_matches)} < 5")
     
     # マッチした点の座標を取得
     pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches])
     
-    # 基礎行列の計算（RANSAC）
+    print(f"pts1.shape: {pts1.shape}, pts2.shape: {pts2.shape}")
+    
+    # マッチング結果を可視化（デバッグ用）
+    if debug_dir:
+        match_img = cv2.drawMatches(img1, kp1, img2, kp2, good_matches, None)
+        cv2.imwrite(os.path.join(debug_dir, "debug_matches.png"), match_img)
+    
+    # 基礎行列の計算（RANSAC）- エラーハンドリングを追加
     F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, 1.0, 0.99)
+    if F is None or mask is None:
+        raise ValueError("findFundamentalMat failed to find a solution")
     
     # インライアーのみ残す
     mask = mask.ravel().astype(bool)
@@ -365,6 +239,351 @@ def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2):
     inlier_matches = [good_matches[i] for i in range(len(good_matches)) if mask[i]]
     
     return R, t, F, inlier_matches
+
+def compute_point_cloud_statistics(points_3d):
+    """点群の統計情報を計算する
+    
+    Args:
+        points_3d: 点群座標 (N, 3)
+        
+    Returns:
+        stats: 統計情報を含む辞書
+    """
+    if len(points_3d) == 0:
+        return {
+            'num_points': 0,
+            'min': None,
+            'max': None,
+            'mean': None,
+            'std': None,
+            'median': None,
+            'bounding_box': None
+        }
+    
+    stats = {
+        'num_points': len(points_3d),
+        'min': points_3d.min(axis=0),
+        'max': points_3d.max(axis=0),
+        'mean': points_3d.mean(axis=0),
+        'std': points_3d.std(axis=0),
+        'median': np.median(points_3d, axis=0),
+        'bounding_box': {
+            'size': points_3d.max(axis=0) - points_3d.min(axis=0),
+            'center': (points_3d.max(axis=0) + points_3d.min(axis=0)) / 2
+        }
+    }
+    return stats
+
+def save_statistics_to_file(stats, filename):
+    """統計情報をテキストファイルに保存する
+    
+    Args:
+        stats: 統計情報を含む辞書
+        filename: 保存先ファイル名
+    """
+    with open(filename, 'w') as f:
+        f.write(f"Number of points: {stats['num_points']}\n\n")
+        
+        if stats['num_points'] > 0:
+            f.write(f"Min (x,y,z): {stats['min']}\n")
+            f.write(f"Max (x,y,z): {stats['max']}\n")
+            f.write(f"Mean (x,y,z): {stats['mean']}\n")
+            f.write(f"Std (x,y,z): {stats['std']}\n")
+            f.write(f"Median (x,y,z): {stats['median']}\n\n")
+            
+            f.write("Bounding Box:\n")
+            f.write(f"  Size (x,y,z): {stats['bounding_box']['size']}\n")
+            f.write(f"  Center (x,y,z): {stats['bounding_box']['center']}\n")
+
+def compute_rotation_difference(R1, R2):
+    """2つの回転行列間の差異を計算する
+    
+    Args:
+        R1, R2: 3x3回転行列
+        
+    Returns:
+        angle_deg: 回転差異の角度（度）
+        frobenius_norm: 行列間のフロベニウスノルム
+    """
+    # R1とR2がどれだけ違うかを計算 (R_diff = R1 @ R2.T)
+    R_diff = R1 @ R2.T
+    
+    # 回転行列から角度を計算
+    trace = np.trace(R_diff)
+    trace = min(3.0, max(-1.0, trace))  # 数値誤差対策
+    angle_rad = np.arccos((trace - 1) / 2)
+    angle_deg = angle_rad * 180 / np.pi
+    
+    # フロベニウスノルム（行列要素の二乗和の平方根）
+    frobenius_norm = np.linalg.norm(R1 - R2, 'fro')
+    
+    return angle_deg, frobenius_norm
+
+def compare_camera_poses(R1, t1, R2, t2, filename):
+    """2つのカメラ姿勢を比較してファイルに出力
+    
+    Args:
+        R1, t1: 1つ目のカメラの回転行列と平行移動ベクトル
+        R2, t2: 2つ目のカメラの回転行列と平行移動ベクトル
+        filename: 出力ファイル名
+    """
+    with open(filename, 'w') as f:
+        f.write("CAMERA POSE COMPARISON\n")
+        f.write("=====================\n\n")
+        
+        # 回転行列の出力
+        f.write("Rotation Matrix 1 (optimize_with_RT):\n")
+        for row in R1:
+            f.write(f"  {row}\n")
+        f.write("\n")
+        
+        f.write("Rotation Matrix 2 (SIFT):\n")
+        for row in R2:
+            f.write(f"  {row}\n")
+        f.write("\n")
+        
+        # 平行移動ベクトルの出力
+        f.write(f"Translation Vector 1 (optimize_with_RT): {t1}\n")
+        f.write(f"Translation Vector 2 (SIFT): {t2}\n")
+        f.write(f"Translation Vector 1 Norm: {np.linalg.norm(t1):.6f}\n")
+        f.write(f"Translation Vector 2 Norm: {np.linalg.norm(t2):.6f}\n\n")
+        
+        # 方向の比較（コサイン類似度）
+        if np.linalg.norm(t1) > 1e-8 and np.linalg.norm(t2) > 1e-8:
+            cos_sim = np.dot(t1, t2) / (np.linalg.norm(t1) * np.linalg.norm(t2))
+            angle_rad = np.arccos(np.clip(cos_sim, -1.0, 1.0))
+            angle_deg = angle_rad * 180 / np.pi
+            f.write(f"Translation Direction Cosine Similarity: {cos_sim:.6f}\n")
+            f.write(f"Translation Direction Angle Difference: {angle_deg:.2f} degrees\n\n")
+        else:
+            f.write("Cannot compute direction similarity (zero translation)\n\n")
+        
+        # 回転の差異
+        angle_diff, frobenius_norm = compute_rotation_difference(R1, R2)
+        f.write(f"Rotation Difference Angle: {angle_diff:.2f} degrees\n")
+        f.write(f"Rotation Matrix Frobenius Norm Difference: {frobenius_norm:.6f}\n\n")
+        
+        # カメラ姿勢の差が再構成に与える影響
+        f.write("ANALYSIS OF RECONSTRUCTION DIFFERENCES\n")
+        f.write("====================================\n\n")
+        
+        # スケール差の原因分析
+        if np.linalg.norm(t1) > 1e-8 and np.linalg.norm(t2) > 1e-8:
+            t_scale_ratio = np.linalg.norm(t1) / np.linalg.norm(t2)
+            f.write(f"Translation Scale Ratio (optimize_with_RT/SIFT): {t_scale_ratio:.6f}\n")
+            if t_scale_ratio < 0.1:
+                f.write("  NOTE: optimize_with_RT translation is much smaller than SIFT translation.\n")
+                f.write("  This likely causes the large depth values in triangulation results.\n")
+            elif t_scale_ratio > 10:
+                f.write("  NOTE: optimize_with_RT translation is much larger than SIFT translation.\n")
+        
+        # 回転差の影響
+        if angle_diff > 10:
+            f.write(f"  WARNING: Large rotation difference ({angle_diff:.2f} degrees) between methods.\n")
+            f.write("  This can cause significant differences in triangulation results.\n")
+
+def compare_losses(solver, F_optimized, F_sift, filename):
+    """最適化とSIFTによる基本行列のロスを比較する
+    
+    Args:
+        solver: OptimalTransportSolverインスタンス
+        F_optimized: optimize_with_RTで得られた基本行列（numpy array）
+        F_sift: SIFTで得られた基本行列（numpy array）
+        filename: 出力ファイル名
+    """
+    # numpy -> torch tensor変換
+    device = solver.device
+    F_optimized_tensor = torch.from_numpy(F_optimized).float().to(device)
+    F_sift_tensor = torch.from_numpy(F_sift).float().to(device)
+    
+    # 各Fに対するコスト行列計算
+    with torch.no_grad():
+        cost_matrix_optimized = solver.compute_cost_matrix_fundamental(F_optimized_tensor)
+        cost_matrix_sift = solver.compute_cost_matrix_fundamental(F_sift_tensor)
+        
+        # 各コスト行列に対する輸送行列計算
+        transport_optimized = solver.unbalanced_sinkhorn_algorithm(cost_matrix_optimized)
+        transport_sift = solver.unbalanced_sinkhorn_algorithm(cost_matrix_sift)
+        
+        # ロス計算
+        loss_optimized = torch.sum(transport_optimized * cost_matrix_optimized).item()
+        loss_sift = torch.sum(transport_sift * cost_matrix_sift).item()
+        
+        # 追加情報：コスト行列と輸送行列の統計情報
+        opt_cost_stats = {
+            'min': cost_matrix_optimized.min().item(),
+            'max': cost_matrix_optimized.max().item(),
+            'mean': cost_matrix_optimized.mean().item()
+        }
+        sift_cost_stats = {
+            'min': cost_matrix_sift.min().item(),
+            'max': cost_matrix_sift.max().item(),
+            'mean': cost_matrix_sift.mean().item()
+        }
+        opt_transport_stats = {
+            'min': transport_optimized.min().item(),
+            'max': transport_optimized.max().item(),
+            'mean': transport_optimized.mean().item(),
+            'sum': transport_optimized.sum().item()
+        }
+        sift_transport_stats = {
+            'min': transport_sift.min().item(),
+            'max': transport_sift.max().item(),
+            'mean': transport_sift.mean().item(),
+            'sum': transport_sift.sum().item()
+        }
+    
+    # 結果をファイルに書き出し
+    with open(filename, 'w') as f:
+        f.write("LOSS COMPARISON BETWEEN OPTIMIZE_WITH_RT AND SIFT\n")
+        f.write("===============================================\n\n")
+        
+        f.write(f"Optimize_with_RT Loss: {loss_optimized:.6f}\n")
+        f.write(f"SIFT Loss: {loss_sift:.6f}\n\n")
+        
+        # lossの比率
+        if loss_sift > 0:
+            ratio = loss_optimized / loss_sift
+            f.write(f"Loss Ratio (Optimize_with_RT / SIFT): {ratio:.6f}\n\n")
+        
+        # 各行列の統計情報
+        f.write("Cost Matrix Statistics:\n")
+        f.write(f"  Optimize_with_RT: min={opt_cost_stats['min']:.6f}, max={opt_cost_stats['max']:.6f}, mean={opt_cost_stats['mean']:.6f}\n")
+        f.write(f"  SIFT: min={sift_cost_stats['min']:.6f}, max={sift_cost_stats['max']:.6f}, mean={sift_cost_stats['mean']:.6f}\n\n")
+        
+        f.write("Transport Matrix Statistics:\n")
+        f.write(f"  Optimize_with_RT: min={opt_transport_stats['min']:.6f}, max={opt_transport_stats['max']:.6f}, mean={opt_transport_stats['mean']:.6f}, sum={opt_transport_stats['sum']:.6f}\n")
+        f.write(f"  SIFT: min={sift_transport_stats['min']:.6f}, max={sift_transport_stats['max']:.6f}, mean={sift_transport_stats['mean']:.6f}, sum={sift_transport_stats['sum']:.6f}\n\n")
+        
+        # 解析
+        f.write("ANALYSIS:\n")
+        if loss_optimized < loss_sift:
+            f.write("  - Optimize_with_RT achieves lower loss as expected from optimization.\n")
+        else:
+            f.write("  - Unexpected result: SIFT solution has lower loss despite not being directly optimized for this cost function.\n")
+        
+        if opt_transport_stats['sum'] != sift_transport_stats['sum']:
+            f.write(f"  - Transport matrices have different total mass (sum), which may affect loss comparison.\n")
+
+def export_to_colmap_format(
+    output_dir: str,
+    points_3d: np.ndarray,
+    camera_params_list: List[Tuple[np.ndarray, np.ndarray]],
+    intrinsics_list: List[np.ndarray],
+    colors_3d: Optional[np.ndarray] = None,
+    image_names: Optional[List[str]] = None
+) -> None:
+    """再構成データをCOLMAP形式でエクスポート（extrinsics_visualizer.py用に最適化）
+    
+    Args:
+        output_dir: 出力ディレクトリ
+        points_3d: 3D点の座標 [N, 3]
+        camera_params_list: カメラごとの (R, t) のリスト
+        intrinsics_list: カメラ内部パラメータ行列のリスト
+        colors_3d: 3D点のRGB色（省略可）[N, 3]
+        image_names: 画像名のリスト（省略可）
+    """
+    import scipy.spatial.transform as transform
+    
+    os.makedirs(output_dir, exist_ok=True)
+    num_cameras = len(camera_params_list)
+    
+    # 1. 内部パラメータを保存 (cameras.txt)
+    with open(os.path.join(output_dir, 'cameras.txt'), 'w') as f:
+        f.write("# Camera list with one line of data per camera:\n")
+        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        
+        # 各カメラの内部パラメータ（ここではすべて同じと仮定）
+        for cam_id, K in enumerate(intrinsics_list):
+            camera_id = cam_id + 1  # カメラIDは1から始まる
+            width = int(K[0, 2] * 2)  # 主点座標から幅を推定
+            height = int(K[1, 2] * 2)  # 主点座標から高さを推定
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+            
+            # PINHOLE モデルを使用
+            f.write(f"{camera_id} PINHOLE {width} {height} {fx} {fy} {cx} {cy}\n")
+    
+    # 2. 3D点群を保存 (points3D.txt) - TRACKデータ付き
+    with open(os.path.join(output_dir, 'points3D.txt'), 'w') as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        
+        for i, point in enumerate(points_3d):
+            point_id = i + 1
+            
+            # 色情報
+            if colors_3d is not None and i < len(colors_3d):
+                color = colors_3d[i]
+                if color.max() <= 1.0:
+                    r, g, b = (color * 255).astype(np.uint8)
+                else:
+                    r, g, b = color.astype(np.uint8)
+            else:
+                r, g, b = 255, 255, 255
+            
+            # TRACK情報（各カメラからの観測）
+            track_str = ""
+            for cam_idx in range(num_cameras):
+                # 各カメラが各点を観測
+                image_id = cam_idx + 1
+                point2d_idx = i  # 点のインデックスをそのまま使用
+                track_str += f"{image_id} {point2d_idx} "
+            
+            # 点の座標、色情報、TRACK情報を書き込み
+            f.write(f"{point_id} {point[0]} {point[1]} {point[2]} {r} {g} {b} 0.0 {track_str}\n")
+    
+    # 3. カメラ姿勢を保存 (images.txt) - 2D点情報付き
+    with open(os.path.join(output_dir, 'images.txt'), 'w') as f:
+        f.write("# Image list with two lines of data per image:\n")
+        f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        
+        for i, (R, t) in enumerate(camera_params_list):
+            image_id = i + 1
+            camera_id = i + 1  # 各画像は対応するカメラIDを使用
+            
+            # 回転行列からクォータニオンに変換（COLMAPは[w,x,y,z]の順）
+            rot = transform.Rotation.from_matrix(R)
+            quat = rot.as_quat()  # scipy: [x,y,z,w]
+            qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]  # COLMAPは[w,x,y,z]
+            
+            # 画像名
+            name = image_names[i] if image_names and i < len(image_names) else f"image_{i:08d}.png"
+            
+            # カメラパラメータ行
+            f.write(f"{image_id} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} {camera_id} {name}\n")
+            
+            # 2D点情報行 - すべての3D点がこのカメラから見えると仮定
+            K = intrinsics_list[i] if i < len(intrinsics_list) else intrinsics_list[0]
+            points2d_line = ""
+            
+            for j in range(len(points_3d)):
+                # 投影点の座標（単純化のため画像中心付近に配置）
+                x, y = K[0, 2], K[1, 2]
+                point3d_id = j + 1
+                points2d_line += f"{x} {y} {point3d_id} "
+            
+            f.write(f"{points2d_line}\n")
+    
+    # PLY形式の点群も出力
+    export_points_as_ply(
+        os.path.join(output_dir, 'points3D.ply'),
+        points_3d,
+        colors=colors_3d
+    )
+    
+    # 使用方法のヒントを書き出す
+    with open(os.path.join(output_dir, 'visualization_commands.txt'), 'w') as f:
+        f.write("extrinsics_visualizer.pyでの可視化コマンド例:\n\n")
+        f.write(f"# 実際のカメラ内部パラメータを使用（推奨）:\n")
+        f.write(f"python extrinsics_visualizer.py --images {output_dir}/images.txt --points {output_dir}/points3D.txt --cameras {output_dir}/cameras.txt --use_true_intrinsics\n\n")
+        f.write(f"# 近似のフラスタムを使用:\n")
+        f.write(f"python extrinsics_visualizer.py --images {output_dir}/images.txt --points {output_dir}/points3D.txt\n")
+    
+    print(f"COLMAP形式でデータをエクスポートしました: {output_dir}")
+    print(f"extrinsics_visualizer.pyでの可視化コマンド例:")
+    print(f"python extrinsics_visualizer.py --images {output_dir}/images.txt --points {output_dir}/points3D.txt --cameras {output_dir}/cameras.txt --use_true_intrinsics")
 
 def main():
     args = parse_args()
@@ -388,6 +607,7 @@ def main():
     images_dir = os.path.join(data_dir, "images")
     image1_path = os.path.join(images_dir, image1_name)
     image2_path = os.path.join(images_dir, image2_name)
+    print(image1_path)
 
     ##############################
     # 1) Load Gaussians
@@ -465,11 +685,17 @@ def main():
     print("\n--- Estimating camera pose from SIFT features ---")
     try:
         R_sift, t_sift, F_sift, inlier_matches = estimate_camera_pose_from_features(
-            image1_path, image2_path, K1, K2)
+            image1_path, image2_path, K1, K2, debug_dir=args.output_dir)
         print(f"SIFT-based camera pose estimation successful with {len(inlier_matches)} inliers")
         print("R_sift:\n", R_sift)
         print("t_sift:\n", t_sift)
         print("F_sift:\n", F_sift)
+        
+        # SIFTとoptimize_with_RTのロスを比較
+        losses_file = os.path.join(args.output_dir, 'loss_comparison.txt')
+        compare_losses(solver, F_optimized, F_sift, losses_file)
+        print(f"Saved loss comparison to {losses_file}")
+        
     except Exception as e:
         print(f"Failed to estimate camera pose from SIFT features: {e}")
         print("Skipping SIFT-based triangulation")
@@ -526,6 +752,12 @@ def main():
     points_3d = reconstructor.points_3d
     print(f"\nTriangulated {points_3d.shape[0]} 3D points")
 
+    # 点群の統計情報を計算・保存
+    stats = compute_point_cloud_statistics(points_3d)
+    stats_file = os.path.join(args.output_dir, 'triangulated_points_stats.txt')
+    save_statistics_to_file(stats, stats_file)
+    print(f"Saved point cloud statistics to {stats_file}")
+
     ##############################
     # 8) Compute Covariances with Volume Prior
     ##############################
@@ -579,11 +811,51 @@ def main():
         points_3d_sift = reconstructor_sift.points_3d
         print(f"\nTriangulated {points_3d_sift.shape[0]} 3D points using SIFT-based pose")
         
+        # SIFT点群の統計情報を計算・保存
+        stats_sift = compute_point_cloud_statistics(points_3d_sift)
+        stats_sift_file = os.path.join(output_dir, 'triangulated_points_sift_stats.txt')
+        save_statistics_to_file(stats_sift, stats_sift_file)
+        print(f"Saved SIFT-based point cloud statistics to {stats_sift_file}")
+        
+        # 両方の点群の統計情報を比較するファイルも作成
+        comparison_file = os.path.join(output_dir, 'point_clouds_comparison.txt')
+        with open(comparison_file, 'w') as f:
+            f.write("COMPARISON BETWEEN OPTIMIZE_WITH_RT AND SIFT POINT CLOUDS\n")
+            f.write("=======================================================\n\n")
+            
+            f.write(f"Points count - Optimize_with_RT: {stats['num_points']}, SIFT: {stats_sift['num_points']}\n\n")
+            
+            if stats['num_points'] > 0 and stats_sift['num_points'] > 0:
+                f.write("Bounding Box Size Comparison:\n")
+                f.write(f"  Optimize_with_RT: {stats['bounding_box']['size']}\n")
+                f.write(f"  SIFT: {stats_sift['bounding_box']['size']}\n\n")
+                
+                f.write("Bounding Box Center Comparison:\n")
+                f.write(f"  Optimize_with_RT: {stats['bounding_box']['center']}\n")
+                f.write(f"  SIFT: {stats_sift['bounding_box']['center']}\n\n")
+                
+                # スケール比の計算（最大サイズの比率）
+                opt_size = stats['bounding_box']['size']
+                sift_size = stats_sift['bounding_box']['size']
+                opt_max_dim = max(opt_size)
+                sift_max_dim = max(sift_size)
+                
+                if sift_max_dim > 0:
+                    scale_ratio = opt_max_dim / sift_max_dim
+                    f.write(f"Scale ratio (Optimize_with_RT / SIFT): {scale_ratio:.6f}\n")
+        
+        print(f"Saved point clouds comparison to {comparison_file}")
+        
         ply_points_sift_out = os.path.join(output_dir, 'triangulated_points_sift.ply')
         # t_siftもflatten()して正しい形状に変換
         camera_params_list_sift = [(np.eye(3), np.zeros(3)), (R_sift, t_sift.flatten())]
         save_point_cloud_as_ply(points_3d_sift, ply_points_sift_out, camera_params=camera_params_list_sift)
         print(f"Saved SIFT-based triangulated points to {ply_points_sift_out}")
+
+        # カメラ姿勢の比較情報を出力
+        camera_poses_file = os.path.join(output_dir, 'camera_poses_comparison.txt')
+        compare_camera_poses(r_est, t_optimized, R_sift, t_sift.flatten(), camera_poses_file)
+        print(f"Saved camera poses comparison to {camera_poses_file}")
 
     ##############################
     # 9) Compute color & alpha
@@ -595,15 +867,15 @@ def main():
     ##############################
     # 10) Build ellipsoids => PLY
     ##############################
-    ply_out = os.path.join(output_dir, '3d_gaussians_ellipsoids.ply')
-    save_ellipsoids_as_ply(
-        points_3d=reconstructor.points_3d,
-        covariances_3d=reconstructor.covariances_3d,
-        colors_3d=reconstructor.color_3d,
-        alphas_3d=reconstructor.alpha_3d,
-        filename=ply_out,
-        use_alpha=True
-    )
+    # ply_out = os.path.join(output_dir, '3d_gaussians_ellipsoids.ply')
+    # save_ellipsoids_as_ply(
+    #     points_3d=reconstructor.points_3d,
+    #     covariances_3d=reconstructor.covariances_3d,
+    #     colors_3d=reconstructor.color_3d,
+    #     alphas_3d=reconstructor.alpha_3d,
+    #     filename=ply_out,
+    #     use_alpha=True
+    # )
     
     ##############################
     # 10) Build ellipsoids => PLY (with camera frustums)
@@ -622,16 +894,16 @@ def main():
 
     camera_params_list = [(R1, t1), (R2, t2)]
     
-    ply_out = os.path.join(output_dir, '3d_gaussians_ellipsoids_withCams.ply')
-    save_ellipsoids_as_ply(
-        points_3d=reconstructor.points_3d,
-        covariances_3d=reconstructor.covariances_3d,
-        colors_3d=reconstructor.color_3d,
-        alphas_3d=reconstructor.alpha_3d,
-        filename=ply_out,
-        camera_params=camera_params_list,
-        use_alpha=True
-    )
+    # ply_out = os.path.join(output_dir, '3d_gaussians_ellipsoids_withCams.ply')
+    # save_ellipsoids_as_ply(
+    #     points_3d=reconstructor.points_3d,
+    #     covariances_3d=reconstructor.covariances_3d,
+    #     colors_3d=reconstructor.color_3d,
+    #     alphas_3d=reconstructor.alpha_3d,
+    #     filename=ply_out,
+    #     camera_params=camera_params_list,
+    #     use_alpha=True
+    # )
 
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
@@ -731,9 +1003,9 @@ def main():
         print(f"Saved alpha-blended splatting for camera 2 to {os.path.join(output_dir, 'rendered_splats_cam2.png')}")
         print("\nDone.")
 
-    # ##############################
-    # # 12) Save final results
-    # ##############################
+    ##############################
+    # 12) Save final results　(NOT USING ANYMORE but keep for future reference)
+    ##############################
     # results = {
     #     'fundamental_matrix': F_optimized,
     #     'cost_matrix': cost_matrix.cpu().numpy(),
@@ -777,6 +1049,46 @@ def main():
     # print(f"\nSaved pipeline results to {out_pkl}")
     # print("\nDone.")
 
+    # COLMAP形式でエクスポート
+    print("\n--- Exporting to COLMAP format for visualization ---")
+    colmap_export_dir = os.path.join(output_dir, 'colmap')
+    os.makedirs(colmap_export_dir, exist_ok=True)
+    
+    # 内部パラメータリスト
+    intrinsics_list = [K1, K2]
+    # 画像名リスト
+    image_names = [image1_name, image2_name]
+    
+    export_to_colmap_format(
+        output_dir=colmap_export_dir,
+        points_3d=reconstructor.points_3d,
+        camera_params_list=camera_params_list,
+        intrinsics_list=intrinsics_list,
+        colors_3d=reconstructor.color_3d,
+        image_names=image_names
+    )
+    
+    # SIFTベースの処理
+    if R_sift is not None and t_sift is not None and F_sift is not None:
+        # SIFTベースのCOLMAP形式でのエクスポート
+        colmap_sift_dir = os.path.join(output_dir, 'colmap_sift')
+        os.makedirs(colmap_sift_dir, exist_ok=True)
+        
+        camera_params_list_sift = [(np.eye(3), np.zeros(3)), (R_sift, t_sift.flatten())]
+        
+        export_to_colmap_format(
+            output_dir=colmap_sift_dir,
+            points_3d=points_3d_sift,
+            camera_params_list=camera_params_list_sift,
+            intrinsics_list=intrinsics_list,
+            colors_3d=reconstructor_sift.color_3d if hasattr(reconstructor_sift, 'color_3d') else None,
+            image_names=image_names
+        )
+        
+        # 両方の結果を比較するためのヒントを表示
+        print("\n両方の再構成結果を比較するためのコマンド例:")
+        print(f"1. optimize_with_RT結果: python extrinsics_visualizer.py --images {colmap_export_dir}/images.txt --points {colmap_export_dir}/points3D.txt")
+        print(f"2. SIFT結果: python extrinsics_visualizer.py --images {colmap_sift_dir}/images.txt --points {colmap_sift_dir}/points3D.txt")
 
 if __name__ == '__main__':
     main()
