@@ -200,7 +200,7 @@ def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2, debug_d
     
     print(f"特徴点マッチング数: {len(good_matches)}")
     
-    # 十分なマッチングがない場合の早期チェック追加
+    # 十分なマッチングがない場合のチェック
     if len(good_matches) < 5:
         raise ValueError(f"Not enough good matches for fundamental matrix estimation: {len(good_matches)} < 5")
     
@@ -215,7 +215,7 @@ def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2, debug_d
         match_img = cv2.drawMatches(img1, kp1, img2, kp2, good_matches, None)
         cv2.imwrite(os.path.join(debug_dir, "debug_matches.png"), match_img)
     
-    # 基礎行列の計算（RANSAC）- エラーハンドリングを追加
+    # 基礎行列の計算（RANSAC）
     F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, 1.0, 0.99)
     if F is None or mask is None:
         raise ValueError("findFundamentalMat failed to find a solution")
@@ -409,7 +409,7 @@ def compare_losses(solver, F_optimized, F_sift, filename):
         loss_optimized = torch.sum(transport_optimized * cost_matrix_optimized).item()
         loss_sift = torch.sum(transport_sift * cost_matrix_sift).item()
         
-        # 追加情報：コスト行列と輸送行列の統計情報
+        # コスト行列と輸送行列の統計情報
         opt_cost_stats = {
             'min': cost_matrix_optimized.min().item(),
             'max': cost_matrix_optimized.max().item(),
@@ -603,7 +603,6 @@ def main():
     gaussians1_path = os.path.join(data_dir_gmm, args.gaussians1_filename)
     gaussians2_path = os.path.join(data_dir_gmm, args.gaussians2_filename)
     
-    # 画像ファイルパスの追加
     images_dir = os.path.join(data_dir, "images")
     image1_path = os.path.join(images_dir, image1_name)
     image2_path = os.path.join(images_dir, image2_name)
@@ -749,20 +748,26 @@ def main():
     #dont delete any gaussian (UOTの枠組みでthresholdは必要なくなったので)
     threshold = 0.0
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold)
-    points_3d = reconstructor.points_3d
-    print(f"\nTriangulated {points_3d.shape[0]} 3D points")
+    points_3d_opt_rt = reconstructor.points_3d
+    print(f"\nTriangulated {points_3d_opt_rt.shape[0]} 3D points")
 
-    # 点群の統計情報を計算・保存
-    stats = compute_point_cloud_statistics(points_3d)
-    stats_file = os.path.join(args.output_dir, 'triangulated_points_stats.txt')
-    save_statistics_to_file(stats, stats_file)
-    print(f"Saved point cloud statistics to {stats_file}")
+    # 三角測量直後の統計情報を計算・保存（optimize_with_RT）
+    stats_opt_rt_before_cov = compute_point_cloud_statistics(points_3d_opt_rt)
+    stats_file_opt_rt_before_cov = os.path.join(args.output_dir, 'triangulated_points_opt_rt_before_cov_stats.txt')
+    save_statistics_to_file(stats_opt_rt_before_cov, stats_file_opt_rt_before_cov)
+    print(f"Saved optimize_with_RT point cloud statistics (before covariance estimation) to {stats_file_opt_rt_before_cov}")
 
     ##############################
     # 8) Compute Covariances with Volume Prior
     ##############################
     print("\n--- Computing 3D Gaussian Covariances with Volume Prior ---")
     reconstructor.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
+
+    # 共分散最適化後の統計情報を計算・保存（optimize_with_RT）
+    stats_opt_rt_after_cov = compute_point_cloud_statistics(reconstructor.points_3d)
+    stats_file_opt_rt_after_cov = os.path.join(args.output_dir, 'triangulated_points_opt_rt_after_cov_stats.txt')
+    save_statistics_to_file(stats_opt_rt_after_cov, stats_file_opt_rt_after_cov)
+    print(f"Saved optimize_with_RT point cloud statistics (after covariance estimation) to {stats_file_opt_rt_after_cov}")
 
     # 結果保存ディレクトリの作成
     output_dir = args.output_dir
@@ -772,7 +777,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     
     camera_params_list = [(np.eye(3), np.zeros(3)), (r_est, t_optimized)]
-    save_point_cloud_as_ply(points_3d, ply_points_out, camera_params=camera_params_list)
+    save_point_cloud_as_ply(points_3d_opt_rt, ply_points_out, camera_params=camera_params_list)
 
     ##############################
     # 6.B & 7.B) SIFT-based transport and triangulation
@@ -812,40 +817,99 @@ def main():
         print(f"\nTriangulated {points_3d_sift.shape[0]} 3D points using SIFT-based pose")
         
         # SIFT点群の統計情報を計算・保存
-        stats_sift = compute_point_cloud_statistics(points_3d_sift)
-        stats_sift_file = os.path.join(output_dir, 'triangulated_points_sift_stats.txt')
-        save_statistics_to_file(stats_sift, stats_sift_file)
-        print(f"Saved SIFT-based point cloud statistics to {stats_sift_file}")
+        stats_sift_before_cov = compute_point_cloud_statistics(points_3d_sift)
+        stats_file_sift_before_cov = os.path.join(output_dir, 'triangulated_points_sift_before_cov_stats.txt')
+        save_statistics_to_file(stats_sift_before_cov, stats_file_sift_before_cov)
+        print(f"Saved SIFT-based point cloud statistics (before covariance estimation) to {stats_file_sift_before_cov}")
         
-        # 両方の点群の統計情報を比較するファイルも作成
-        comparison_file = os.path.join(output_dir, 'point_clouds_comparison.txt')
-        with open(comparison_file, 'w') as f:
-            f.write("COMPARISON BETWEEN OPTIMIZE_WITH_RT AND SIFT POINT CLOUDS\n")
-            f.write("=======================================================\n\n")
+        # SIFT方式の共分散計算
+        print("\n--- Computing 3D Gaussian Covariances with Volume Prior (SIFT-based) ---")
+        reconstructor_sift.compute_3d_gaussian_covariances(lambda_volume=1.0, target_volume=target_volume)
+
+        # 共分散最適化後の統計情報を計算・保存（SIFT）
+        stats_sift_after_cov = compute_point_cloud_statistics(reconstructor_sift.points_3d)
+        stats_file_sift_after_cov = os.path.join(output_dir, 'triangulated_points_sift_after_cov_stats.txt')
+        save_statistics_to_file(stats_sift_after_cov, stats_file_sift_after_cov)
+        print(f"Saved SIFT-based point cloud statistics (after covariance estimation) to {stats_file_sift_after_cov}")
+
+        # SIFT方式の色とアルファの計算
+        print("\n--- Computing 3D Gaussian Colors (SIFT-based) ---")
+        reconstructor_sift.compute_3d_gaussian_colors(color_mode="average")
+
+        print("\n--- Computing 3D Gaussian Alphas (SIFT-based) ---")
+        reconstructor_sift.compute_3d_gaussian_alphas(alpha_mode="max")
+
+        # 比較ファイルの作成（三角測量直後）
+        comparison_file_before_cov = os.path.join(output_dir, 'point_clouds_comparison_before_cov.txt')
+        with open(comparison_file_before_cov, 'w') as f:
+            f.write("COMPARISON BETWEEN OPTIMIZE_WITH_RT AND SIFT POINT CLOUDS (BEFORE COVARIANCE OPTIMIZATION)\n")
+            f.write("===================================================================================\n\n")
             
-            f.write(f"Points count - Optimize_with_RT: {stats['num_points']}, SIFT: {stats_sift['num_points']}\n\n")
+            f.write(f"Points count - Optimize_with_RT: {stats_opt_rt_before_cov['num_points']}, SIFT: {stats_sift_before_cov['num_points']}\n\n")
             
-            if stats['num_points'] > 0 and stats_sift['num_points'] > 0:
+            if stats_opt_rt_before_cov['num_points'] > 0 and stats_sift_before_cov['num_points'] > 0:
                 f.write("Bounding Box Size Comparison:\n")
-                f.write(f"  Optimize_with_RT: {stats['bounding_box']['size']}\n")
-                f.write(f"  SIFT: {stats_sift['bounding_box']['size']}\n\n")
+                f.write(f"  Optimize_with_RT: {stats_opt_rt_before_cov['bounding_box']['size']}\n")
+                f.write(f"  SIFT: {stats_sift_before_cov['bounding_box']['size']}\n\n")
                 
                 f.write("Bounding Box Center Comparison:\n")
-                f.write(f"  Optimize_with_RT: {stats['bounding_box']['center']}\n")
-                f.write(f"  SIFT: {stats_sift['bounding_box']['center']}\n\n")
+                f.write(f"  Optimize_with_RT: {stats_opt_rt_before_cov['bounding_box']['center']}\n")
+                f.write(f"  SIFT: {stats_sift_before_cov['bounding_box']['center']}\n\n")
                 
-                # スケール比の計算（最大サイズの比率）
-                opt_size = stats['bounding_box']['size']
-                sift_size = stats_sift['bounding_box']['size']
-                opt_max_dim = max(opt_size)
+                # スケール比
+                opt_rt_size = stats_opt_rt_before_cov['bounding_box']['size']
+                sift_size = stats_sift_before_cov['bounding_box']['size']
+                opt_rt_max_dim = max(opt_rt_size)
                 sift_max_dim = max(sift_size)
                 
                 if sift_max_dim > 0:
-                    scale_ratio = opt_max_dim / sift_max_dim
+                    scale_ratio = opt_rt_max_dim / sift_max_dim
                     f.write(f"Scale ratio (Optimize_with_RT / SIFT): {scale_ratio:.6f}\n")
-        
-        print(f"Saved point clouds comparison to {comparison_file}")
-        
+
+        print(f"Saved point clouds comparison (before covariance optimization) to {comparison_file_before_cov}")
+
+        # 比較ファイルの作成（共分散最適化後）
+        comparison_file_after_cov = os.path.join(output_dir, 'point_clouds_comparison_after_cov.txt')
+        with open(comparison_file_after_cov, 'w') as f:
+            f.write("COMPARISON BETWEEN OPTIMIZE_WITH_RT AND SIFT POINT CLOUDS (AFTER COVARIANCE OPTIMIZATION)\n")
+            f.write("===================================================================================\n\n")
+            
+            f.write(f"Points count - Optimize_with_RT: {stats_opt_rt_after_cov['num_points']}, SIFT: {stats_sift_after_cov['num_points']}\n\n")
+            
+            if stats_opt_rt_after_cov['num_points'] > 0 and stats_sift_after_cov['num_points'] > 0:
+                f.write("Bounding Box Size Comparison:\n")
+                f.write(f"  Optimize_with_RT: {stats_opt_rt_after_cov['bounding_box']['size']}\n")
+                f.write(f"  SIFT: {stats_sift_after_cov['bounding_box']['size']}\n\n")
+                
+                f.write("Bounding Box Center Comparison:\n")
+                f.write(f"  Optimize_with_RT: {stats_opt_rt_after_cov['bounding_box']['center']}\n")
+                f.write(f"  SIFT: {stats_sift_after_cov['bounding_box']['center']}\n\n")
+                
+                # スケール比
+                opt_rt_size = stats_opt_rt_after_cov['bounding_box']['size']
+                sift_size = stats_sift_after_cov['bounding_box']['size']
+                opt_rt_max_dim = max(opt_rt_size)
+                sift_max_dim = max(sift_size)
+                
+                if sift_max_dim > 0:
+                    scale_ratio = opt_rt_max_dim / sift_max_dim
+                    f.write(f"Scale ratio (Optimize_with_RT / SIFT): {scale_ratio:.6f}\n")
+                
+                # 共分散最適化の成功率
+                opt_rt_orig_count = stats_opt_rt_before_cov['num_points']
+                sift_orig_count = stats_sift_before_cov['num_points']
+                opt_rt_final_count = stats_opt_rt_after_cov['num_points']
+                sift_final_count = stats_sift_after_cov['num_points']
+                
+                opt_rt_success_rate = opt_rt_final_count / opt_rt_orig_count * 100 if opt_rt_orig_count > 0 else 0
+                sift_success_rate = sift_final_count / sift_orig_count * 100 if sift_orig_count > 0 else 0
+                
+                f.write("\nCovariance Optimization Success Rate:\n")
+                f.write(f"  Optimize_with_RT: {opt_rt_success_rate:.1f}% ({opt_rt_final_count}/{opt_rt_orig_count})\n")
+                f.write(f"  SIFT: {sift_success_rate:.1f}% ({sift_final_count}/{sift_orig_count})\n")
+
+        print(f"Saved point clouds comparison (after covariance optimization) to {comparison_file_after_cov}")
+
         ply_points_sift_out = os.path.join(output_dir, 'triangulated_points_sift.ply')
         # t_siftもflatten()して正しい形状に変換
         camera_params_list_sift = [(np.eye(3), np.zeros(3)), (R_sift, t_sift.flatten())]
@@ -1002,6 +1066,87 @@ def main():
         cv2.imwrite(os.path.join(output_dir, "rendered_splats_cam2.png"), rendered_8u_bgra2)
         print(f"Saved alpha-blended splatting for camera 2 to {os.path.join(output_dir, 'rendered_splats_cam2.png')}")
         print("\nDone.")
+
+        # SIFT-based rendering
+        if R_sift is not None and t_sift is not None:
+            print("Rendering from SIFT-based camera 1 viewpoint...")
+            R_cam1_sift = np.eye(3)  # Camera 1 is our reference frame
+            t_cam1_sift = np.zeros(3)
+
+            out_width1_sift = int(K1[0,2]*2)
+            out_height1_sift = int(K1[1,2]*2)
+            K_render1_sift = K1
+
+            # SIFTのtransportを使用
+            transport_values_sift = None
+            if hasattr(reconstructor_sift, 'transport_values') and len(reconstructor_sift.transport_values) > 0:
+                transport_values_sift = reconstructor_sift.transport_values
+                print(f"Using SIFT transport values from triangulation: min={transport_values_sift.min():.4f}, "
+                      f"max={transport_values_sift.max():.4f}, mean={transport_values_sift.mean():.4f}")
+            else:
+                print("No SIFT transport values available")
+                sys.exit(1)
+
+            mixture_img1_sift, coverage_img1_sift = render_gaussians_alpha_blend(
+                points_3d=reconstructor_sift.points_3d,
+                covariances_3d=reconstructor_sift.covariances_3d,
+                color_3d=reconstructor_sift.color_3d,
+                alpha_3d=reconstructor_sift.alpha_3d,
+                R_cam=R_cam1_sift,
+                t_cam=t_cam1_sift,
+                K=K_render1_sift,
+                out_width=out_width1_sift,
+                out_height=out_height1_sift,
+                transport=transport_values_sift 
+            )
+            
+            rendered_rgba1_sift = np.zeros((out_height1_sift, out_width1_sift, 4), dtype=np.float32)
+            rendered_rgba1_sift[..., :3] = mixture_img1_sift
+            rendered_rgba1_sift[..., 3] = coverage_img1_sift
+
+            rendered_8u1_sift = np.clip(rendered_rgba1_sift*255.0, 0, 255).astype(np.uint8)
+            
+            rendered_8u_bgra1_sift = rendered_8u1_sift.copy()
+            rendered_8u_bgra1_sift[...,0] = rendered_8u1_sift[...,2]
+            rendered_8u_bgra1_sift[...,2] = rendered_8u1_sift[...,0]
+
+            cv2.imwrite(os.path.join(output_dir, "rendered_splats_sift_cam1.png"), rendered_8u_bgra1_sift)
+            print(f"Saved SIFT-based alpha-blended splatting for camera 1 to {os.path.join(output_dir, 'rendered_splats_sift_cam1.png')}")
+
+            print("Rendering from SIFT-based camera 2 viewpoint...")
+            R_cam2_sift = R_sift  # Camera 2's rotation relative to world
+            t_cam2_sift = t_sift.flatten()  # Camera 2's translation relative to world
+
+            out_width2_sift = int(K2[0,2]*2)
+            out_height2_sift = int(K2[1,2]*2)
+            K_render2_sift = K2
+
+            mixture_img2_sift, coverage_img2_sift = render_gaussians_alpha_blend(
+                points_3d=reconstructor_sift.points_3d,
+                covariances_3d=reconstructor_sift.covariances_3d,
+                color_3d=reconstructor_sift.color_3d,
+                alpha_3d=reconstructor_sift.alpha_3d,
+                R_cam=R_cam2_sift,
+                t_cam=t_cam2_sift,
+                K=K_render2_sift,
+                out_width=out_width2_sift,
+                out_height=out_height2_sift,
+                transport=transport_values_sift 
+            )
+            
+            rendered_rgba2_sift = np.zeros((out_height2_sift, out_width2_sift, 4), dtype=np.float32)
+            rendered_rgba2_sift[..., :3] = mixture_img2_sift
+            rendered_rgba2_sift[..., 3] = coverage_img2_sift
+
+            rendered_8u2_sift = np.clip(rendered_rgba2_sift*255.0, 0, 255).astype(np.uint8)
+            
+            rendered_8u_bgra2_sift = rendered_8u2_sift.copy()
+            rendered_8u_bgra2_sift[...,0] = rendered_8u2_sift[...,2]
+            rendered_8u_bgra2_sift[...,2] = rendered_8u2_sift[...,0]
+
+            cv2.imwrite(os.path.join(output_dir, "rendered_splats_sift_cam2.png"), rendered_8u_bgra2_sift)
+            print(f"Saved SIFT-based alpha-blended splatting for camera 2 to {os.path.join(output_dir, 'rendered_splats_sift_cam2.png')}")
+            print("\nDone.")
 
     ##############################
     # 12) Save final results　(NOT USING ANYMORE but keep for future reference)
