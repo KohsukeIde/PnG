@@ -2,6 +2,7 @@ import copy
 import os
 import sys
 from typing import Optional, Tuple
+import cv2
 
 import numpy as np
 import torch
@@ -260,6 +261,27 @@ class OptimalTransportSolver:
         F = K2_inv_T @ E @ K1_inv
         return F
 
+    def _build_F_from_wc(self, R_wc: torch.Tensor, t_wc: torch.Tensor) -> torch.Tensor:
+        """R_wc, t_wc から F を構築。(build_f_from_rtの代替関数)
+        F = K2^-T [t]_x R K1^-1
+        """
+        # [t]_x (外積行列)
+        tx = torch.zeros((3,3), device=self.device)
+        tx[0,1] = -t_wc[2]
+        tx[0,2] =  t_wc[1]
+        tx[1,0] =  t_wc[2]
+        tx[1,2] = -t_wc[0]
+        tx[2,0] = -t_wc[1]
+        tx[2,1] =  t_wc[0]
+
+        E = tx @ R_wc  # Essential matrix
+
+        K1_inv = torch.inverse(self.k1)
+        K2_inv = torch.inverse(self.k2)
+        K2_inv_T = K2_inv.transpose(0,1)
+
+        F = K2_inv_T @ E @ K1_inv
+        return F
 
     # def _matrix_sqrt(self, matrices: torch.Tensor) -> torch.Tensor:
     #     """Compute the square root of batched 2x2 symmetric positive-definite matrices.
@@ -717,33 +739,147 @@ class OptimalTransportSolver:
 
     
     
-    def optimize_with_RT(self, max_iter=1000, tol=1e-6):
-        """R,tを直接最適化してFを構築して self.f に反映させる。
-        最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
-        """
+    # def optimize_with_RT(self, max_iter=1000, tol=1e-6):
+    #     """R,tを直接最適化してFを構築して self.f に反映させる。
+    #     最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
+    #     """
 
-        # R,tを最適化パラメータ設定  (これは相対変換)
-        if not hasattr(self, 'rvec'):
-            self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
-        if not hasattr(self, 'tvec'):
-            self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
+    #     # R,tを最適化パラメータ設定  (これは相対変換)
+    #     if not hasattr(self, 'rvec'):
+    #         self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+    #     if not hasattr(self, 'tvec'):
+    #         self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
         
-        optimizer = torch.optim.Adam([self.rvec, self.tvec], lr=1e-3)
+    #     optimizer = torch.optim.Adam([self.rvec, self.tvec], lr=1e-3)
+    #     prev_loss_val = float('inf')
+    #     loss_history = []
+
+    #     transport_dir = os.path.join("results", "transport_RT")
+    #     os.makedirs(transport_dir, exist_ok=True)
+
+    #     pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
+        
+    #     for iteration in pbar:
+    #         optimizer.zero_grad()
+
+    #         F = self.build_f_from_rt(self.rvec, self.tvec)
+
+    #         cost_matrix = self.compute_cost_matrix_fundamental(F)
+
+    #         transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
+
+    #         # ロス計算 + 逆伝播
+    #         loss = torch.sum(transport * cost_matrix)
+    #         loss.backward()
+
+    #         # パラメータ更新
+    #         optimizer.step()
+
+    #         current_loss = loss.item()
+    #         loss_history.append(current_loss)
+
+    #         # 収束判定
+    #         loss_diff = abs(prev_loss_val - current_loss)
+    #         if iteration > 5 and loss_diff < tol:
+    #             pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
+    #             break
+    #         prev_loss_val = current_loss
+
+    #         if iteration % 10 == 0:
+    #             grad_r = self.rvec.grad.norm().item()
+    #             grad_t = self.tvec.grad.norm().item()
+    #             pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
+
+    #             # Transport matrix 可視化
+    #             if iteration % 10 == 0 or iteration == max_iter - 1:
+    #                 with torch.no_grad():
+    #                     t_np = transport.detach().cpu().numpy()
+                        
+    #                     # 行列の次元に応じてサイズとアスペクト比を調整
+    #                     rows, cols = t_np.shape
+    #                     aspect_ratio = cols / rows
+                        
+    #                     if rows > cols:
+    #                         fig_width = 8  # 基本幅
+    #                         fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
+    #                     else:
+    #                         fig_height = 6  # 基本高さ
+    #                         fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
+                        
+    #                     plt.figure(figsize=(fig_width, fig_height))
+                        
+    #                     # 大きな行列の場合はダウンサンプリング
+    #                     if rows > 1000 or cols > 1000:
+    #                         downsample_factor = max(1, int(max(rows, cols) / 1000))
+    #                         t_np_display = t_np[::downsample_factor, ::downsample_factor]
+    #                         plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+    #                         plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
+    #                     else:
+    #                         plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
+    #                         plt.title(f"Transport Plan at Iteration {iteration}")
+                        
+    #                     plt.colorbar(label="Transport Plan Value")
+    #                     plt.xlabel("Image 2 Gaussians")
+    #                     plt.ylabel("Image 1 Gaussians")
+                        
+    #                     # 軸ラベルの位置調整
+    #                     plt.tight_layout()
+    #                     plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+    #                     plt.savefig(plt_path, dpi=150)
+    #                     plt.close()
+
+    #     # print("Optimized rvec:", self.rvec)
+    #     # print("Optimized tvec:", self.tvec)
+
+    #     # build_f_from_rt から最終Fを取り出す
+    #     final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
+    #     # print("Final F:\n", final_F.cpu().numpy())
+
+    #     # solver.f にコピー
+    #     with torch.no_grad():
+    #         self.f = final_F
+
+    #     plt.figure()
+    #     plt.plot(loss_history, '-o')
+    #     plt.title("Loss (optimize_with_RT)")
+    #     plt.xlabel("Iteration")
+    #     plt.ylabel("Loss")
+    #     plt.grid(True)
+    #     plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
+    #     plt.close()
+
+    def optimize_with_RT(self, max_iter=1000, tol=1e-6):
+        """Camera-to-Worldパラメータ(カメラの回転と中心位置)を最適化してFを構築。
+        カメラ中心位置とカメラ座標系→ワールド座標系の回転を最適化するため勾配のスケールが揃いやすい。
+        """
+        # C2Wパラメータの初期化
+        if not hasattr(self, 'rvec_cw'):
+            self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+        if not hasattr(self, 'center'):
+            # カメラ中心位置：少し離れた位置に初期化
+            self.center = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
+        
+        optimizer = torch.optim.Adam([self.rvec_cw, self.center], lr=1e-3)
         prev_loss_val = float('inf')
         loss_history = []
 
         transport_dir = os.path.join("results", "transport_RT")
         os.makedirs(transport_dir, exist_ok=True)
 
-        pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
+        pbar = tqdm(range(max_iter), desc="Optimizing C2W", leave=True)
         
         for iteration in pbar:
             optimizer.zero_grad()
 
-            F = self.build_f_from_rt(self.rvec, self.tvec)
+            # C2W -> W2C への変換
+            R_cw = self.rodrigues(self.rvec_cw)  # カメラ→ワールドの回転行列
+            R_wc = R_cw.transpose(0, 1)          # ワールド→カメラの回転行列
+            t_wc = -R_wc @ self.center           # ワールド→カメラの並進ベクトル
+            
+            # rvecとtvecから直接Fを構築する代わりに、変換したR_wcとt_wcを使用
+            F = self._build_F_from_wc(R_wc, t_wc)
 
             cost_matrix = self.compute_cost_matrix_fundamental(F)
-
             transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
 
             # ロス計算 + 逆伝播
@@ -764,11 +900,11 @@ class OptimalTransportSolver:
             prev_loss_val = current_loss
 
             if iteration % 10 == 0:
-                grad_r = self.rvec.grad.norm().item()
-                grad_t = self.tvec.grad.norm().item()
-                pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
+                grad_r = self.rvec_cw.grad.norm().item() if self.rvec_cw.grad is not None else 0
+                grad_c = self.center.grad.norm().item() if self.center.grad is not None else 0
+                pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_c=f"{grad_c:.6f}")
 
-                # Transport matrix 可視化
+                # Transport matrix 可視化 (元のコードと同じ)
                 if iteration % 10 == 0 or iteration == max_iter - 1:
                     with torch.no_grad():
                         t_np = transport.detach().cpu().numpy()
@@ -806,16 +942,24 @@ class OptimalTransportSolver:
                         plt.savefig(plt_path, dpi=150)
                         plt.close()
 
-        # print("Optimized rvec:", self.rvec)
-        # print("Optimized tvec:", self.tvec)
-
-        # build_f_from_rt から最終Fを取り出す
-        final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
-        # print("Final F:\n", final_F.cpu().numpy())
-
-        # solver.f にコピー
+        # 最終的なF行列を計算して保存
         with torch.no_grad():
+            # C2W回転ベクトルから回転行列を計算
+            R_cw = self.rodrigues(self.rvec_cw)          
+            # W2C回転行列を計算（単純に転置）
+            R_wc = R_cw.transpose(0, 1)                  
+            # W2C並進ベクトルを計算
+            t_wc = -R_wc @ self.center                   
+            
+            # 回転行列を使用してF行列を構築
+            final_F = self._build_F_from_wc(R_wc, t_wc)
             self.f = final_F
+            
+            # 互換性のために、最適化したC2Wから元のW2Cパラメータを計算して保存
+            # 回転行列からRodrigues回転ベクトルへの逆変換
+            rvec_numpy, _ = cv2.Rodrigues(R_wc.cpu().numpy())
+            self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
+            self.tvec = nn.Parameter(t_wc)
 
         plt.figure()
         plt.plot(loss_history, '-o')
@@ -825,3 +969,4 @@ class OptimalTransportSolver:
         plt.grid(True)
         plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
         plt.close()
+
