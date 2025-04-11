@@ -387,7 +387,6 @@ class ViewSelector:
     def select_next_view(self, candidate_names: List[str], n_select: int = 1) -> List[str]:
         """Select next viewpoint using features and source gaussian information
         
-        Enhanced strategy:
         1. Ensure sufficient overlap with existing views (at least min_overlap_ratio)
         2. Ensure viewpoint diversity (less than max_overlap_ratio)
         3. Prioritize views that can see unprocessed source gaussians
@@ -395,55 +394,56 @@ class ViewSelector:
         Args:
             candidate_names: List of candidate image names
             n_select: Number of images to select
-            
+
         Returns:
             List[str]: List of selected image names
         """
         # Convert to full paths
         candidate_paths = [os.path.join(self.image_dir, name) for name in candidate_names]
         
-        # Process unprocessed images based on feature type
-        if self.feature_type == 'clip':
-            # Process with CLIP
-            for path in candidate_paths[:]:  # Use a copy for iteration while removing items
-                if path not in self.clip_features:
-                    clip_features = self.extract_clip_features(path)
-                    if clip_features is not None:
-                        self.clip_features[path] = clip_features
-                    else:
-                        print(f"Failed to extract CLIP features from {path}, removing from candidates")
-                        candidate_paths.remove(path)
-        else:
-            # Process with traditional features
-            for path in candidate_paths[:]:  # Use a copy for iteration while removing items
-                if path not in self.image_histograms:
-                    if path not in self.image_features:
-                        keypoints, descriptors = self.extract_features(path)
-                        if descriptors is not None and len(descriptors) > 0:
-                            self.image_features[path] = {
-                                'keypoints': keypoints,
-                                'descriptors': descriptors
-                            }
+        # Abundant processing : process_images got this covered. keep it just in case.
+        # # Process unprocessed images based on feature type
+        # if self.feature_type == 'clip':
+        #     # Process with CLIP
+        #     for path in candidate_paths[:]:  # Use a copy for iteration while removing items
+        #         if path not in self.clip_features:
+        #             clip_features = self.extract_clip_features(path)
+        #             if clip_features is not None:
+        #                 self.clip_features[path] = clip_features
+        #             else:
+        #                 print(f"Failed to extract CLIP features from {path}, removing from candidates")
+        #                 candidate_paths.remove(path)
+        # else:
+        #     # Process with traditional features
+        #     for path in candidate_paths[:]:  # Use a copy for iteration while removing items
+        #         if path not in self.image_histograms:
+        #             if path not in self.image_features:
+        #                 keypoints, descriptors = self.extract_features(path)
+        #                 if descriptors is not None and len(descriptors) > 0:
+        #                     self.image_features[path] = {
+        #                         'keypoints': keypoints,
+        #                         'descriptors': descriptors
+        #                     }
                             
-                            # Calculate histogram
-                            if self.codebook is not None:
-                                histogram = self.compute_image_histogram(descriptors)
-                                self.image_histograms[path] = histogram
-                            else:
-                                print(f"No codebook available for {path}, removing from candidates")
-                                candidate_paths.remove(path)
-                        else:
-                            print(f"No features found in {path}, removing from candidates")
-                            candidate_paths.remove(path)
-                    else:
-                        # Features exist but no histogram yet
-                        descriptors = self.image_features[path]['descriptors']
-                        if self.codebook is not None:
-                            histogram = self.compute_image_histogram(descriptors)
-                            self.image_histograms[path] = histogram
-                        else:
-                            print(f"No codebook available for {path}, removing from candidates")
-                            candidate_paths.remove(path)
+        #                     # Calculate histogram
+        #                     if self.codebook is not None:
+        #                         histogram = self.compute_image_histogram(descriptors)
+        #                         self.image_histograms[path] = histogram
+        #                     else:
+        #                         print(f"No codebook available for {path}, removing from candidates")
+        #                         candidate_paths.remove(path)
+        #                 else:
+        #                     print(f"No features found in {path}, removing from candidates")
+        #                     candidate_paths.remove(path)
+        #             else:
+        #                 # Features exist but no histogram yet
+        #                 descriptors = self.image_features[path]['descriptors']
+        #                 if self.codebook is not None:
+        #                     histogram = self.compute_image_histogram(descriptors)
+        #                     self.image_histograms[path] = histogram
+        #                 else:
+        #                     print(f"No codebook available for {path}, removing from candidates")
+        #                     candidate_paths.remove(path)
         
         if not candidate_paths:
             raise ValueError("No valid candidate images to select from")
