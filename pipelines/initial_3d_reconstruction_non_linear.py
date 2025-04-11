@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import cv2
 import json
-from tqdm import tqdm
+import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
@@ -90,6 +90,12 @@ def parse_args():
         default="./results",
         help="Directory to save output files."
     )
+    parser.add_argument(
+        "--render_gaussians",
+        action="store_true",
+        default=False,
+        help="Render Gaussians for OT optimized/SIFT base camera pose."
+    )
 
     return parser.parse_args()
 
@@ -142,6 +148,571 @@ def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
     
     print(f"Loaded NeRF camera intrinsics: K=\n{K}")
     return K
+
+def analyze_transport_matrices(
+    solver, 
+    F_optimized, 
+    F_sift, 
+    gaussians1, 
+    gaussians2, 
+    image1_path, 
+    image2_path, 
+    output_dir
+):
+    """最適化されたF行列とSIFTベースのF行列による輸送行列を分析・比較する
+    
+    Args:
+        solver: OptimalTransportSolverインスタンス
+        F_optimized: 最適化で得られた基本行列
+        F_sift: SIFTで得られた基本行列
+        gaussians1: 1枚目の画像の2Dガウス
+        gaussians2: 2枚目の画像の2Dガウス
+        image1_path: 1枚目の画像パス
+        image2_path: 2枚目の画像パス
+        output_dir: 出力ディレクトリ
+    """
+    # 出力ディレクトリの作成
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 両方のF行列から輸送行列を計算
+    device = solver.device
+    F_opt_tensor = torch.tensor(F_optimized, dtype=torch.float32, device=device)
+    F_sift_tensor = torch.tensor(F_sift, dtype=torch.float32, device=device)
+    
+    with torch.no_grad():
+        # コスト行列計算
+        cost_matrix_opt = solver.compute_cost_matrix_fundamental(F_opt_tensor)
+        cost_matrix_sift = solver.compute_cost_matrix_fundamental(F_sift_tensor)
+        
+        # 輸送行列計算
+        transport_opt = solver.unbalanced_sinkhorn_algorithm(cost_matrix_opt)
+        transport_sift = solver.unbalanced_sinkhorn_algorithm(cost_matrix_sift)
+        
+        # NumPy配列に変換
+        T_opt = transport_opt.cpu().numpy()
+        T_sift = transport_sift.cpu().numpy()
+    
+    # 1. 輸送行列のヒートマップ可視化
+    visualize_transport_matrices(T_opt, T_sift, output_dir)
+    
+    # 2. 高輸送量ペアの抽出と可視化
+    visualize_high_transport_pairs(
+        T_opt, T_sift, gaussians1, gaussians2, 
+        image1_path, image2_path, output_dir, 
+        top_n=10  # 上位100ペアを可視化
+    )
+    
+    # 3. 対応点の性質分析
+    analyze_correspondence_properties(
+        T_opt, T_sift, gaussians1, gaussians2, output_dir
+    )
+    
+def visualize_transport_matrices(T_opt, T_sift, output_dir):
+    """輸送行列をヒートマップとして可視化
+    
+    Args:
+        T_opt: 最適化で得られた輸送行列
+        T_sift: SIFTで得られた輸送行列
+        output_dir: 出力ディレクトリ
+    """
+    plt.figure(figsize=(20, 10))
+    
+    # 1. 最適化F行列の輸送行列
+    plt.subplot(1, 2, 1)
+    im1 = plt.imshow(T_opt, cmap='hot', interpolation='nearest')
+    plt.colorbar(im1)
+    plt.title('Transport Matrix (Optimized F)')
+    plt.xlabel('Image 2 Gaussians')
+    plt.ylabel('Image 1 Gaussians')
+    
+    # 2. SIFT F行列の輸送行列
+    plt.subplot(1, 2, 2)
+    im2 = plt.imshow(T_sift, cmap='hot', interpolation='nearest')
+    plt.colorbar(im2)
+    plt.title('Transport Matrix (SIFT F)')
+    plt.xlabel('Image 2 Gaussians')
+    plt.ylabel('Image 1 Gaussians')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'transport_matrices_comparison.png'), dpi=300)
+    plt.close()
+    
+    # 輸送行列の統計情報を分析
+    analyze_transport_statistics(T_opt, T_sift, output_dir)
+    
+def analyze_transport_statistics(T_opt, T_sift, output_dir):
+    """輸送行列の統計情報を分析し、テキストファイルに出力
+    
+    Args:
+        T_opt: 最適化で得られた輸送行列
+        T_sift: SIFTで得られた輸送行列
+        output_dir: 出力ディレクトリ
+    """
+    stats_file = os.path.join(output_dir, 'transport_statistics.txt')
+    
+    with open(stats_file, 'w') as f:
+        f.write("TRANSPORT MATRIX STATISTICS COMPARISON\n")
+        f.write("=====================================\n\n")
+        
+        # 基本統計量
+        f.write("Basic Statistics:\n")
+        f.write(f"Optimized F - Min: {T_opt.min():.6f}, Max: {T_opt.max():.6f}, Mean: {T_opt.mean():.6f}, Sum: {T_opt.sum():.6f}\n")
+        f.write(f"SIFT F      - Min: {T_sift.min():.6f}, Max: {T_sift.max():.6f}, Mean: {T_sift.mean():.6f}, Sum: {T_sift.sum():.6f}\n\n")
+        
+        # スパース性の分析
+        nonzero_opt = np.count_nonzero(T_opt > 1e-5)
+        nonzero_sift = np.count_nonzero(T_sift > 1e-5)
+        total_elements = T_opt.size
+        
+        f.write("Sparsity Analysis (threshold = 1e-5):\n")
+        f.write(f"Optimized F - Nonzero: {nonzero_opt}/{total_elements} ({nonzero_opt/total_elements*100:.2f}%)\n")
+        f.write(f"SIFT F      - Nonzero: {nonzero_sift}/{total_elements} ({nonzero_sift/total_elements*100:.2f}%)\n\n")
+        
+        # 集中度の分析（上位N%の要素が全体の何%を占めるか）
+        for top_percent in [1, 5, 10, 20]:
+            num_elements = int(total_elements * top_percent / 100)
+            
+            # 要素をソートし、上位N%の合計を計算
+            sorted_opt = np.sort(T_opt.flatten())[::-1]
+            sorted_sift = np.sort(T_sift.flatten())[::-1]
+            
+            sum_top_opt = np.sum(sorted_opt[:num_elements])
+            sum_top_sift = np.sum(sorted_sift[:num_elements])
+            
+            percent_opt = sum_top_opt / T_opt.sum() * 100
+            percent_sift = sum_top_sift / T_sift.sum() * 100
+            
+            f.write(f"Concentration (top {top_percent}% elements):\n")
+            f.write(f"Optimized F - Sum: {sum_top_opt:.6f}, Percentage of total: {percent_opt:.2f}%\n")
+            f.write(f"SIFT F      - Sum: {sum_top_sift:.6f}, Percentage of total: {percent_sift:.2f}%\n\n")
+        
+        # 行/列の合計の分布
+        row_sums_opt = np.sum(T_opt, axis=1)
+        row_sums_sift = np.sum(T_sift, axis=1)
+        col_sums_opt = np.sum(T_opt, axis=0)
+        col_sums_sift = np.sum(T_sift, axis=0)
+        
+        f.write("Row Sums (Image 1 Gaussians):\n")
+        f.write(f"Optimized F - Min: {row_sums_opt.min():.6f}, Max: {row_sums_opt.max():.6f}, Mean: {row_sums_opt.mean():.6f}\n")
+        f.write(f"SIFT F      - Min: {row_sums_sift.min():.6f}, Max: {row_sums_sift.max():.6f}, Mean: {row_sums_sift.mean():.6f}\n\n")
+        
+        f.write("Column Sums (Image 2 Gaussians):\n")
+        f.write(f"Optimized F - Min: {col_sums_opt.min():.6f}, Max: {col_sums_opt.max():.6f}, Mean: {col_sums_opt.mean():.6f}\n")
+        f.write(f"SIFT F      - Min: {col_sums_sift.min():.6f}, Max: {col_sums_sift.max():.6f}, Mean: {col_sums_sift.mean():.6f}\n\n")
+    
+    print(f"Transport statistics saved to {stats_file}")
+    
+def visualize_high_transport_pairs(
+    T_opt, T_sift, gaussians1, gaussians2, 
+    image1_path, image2_path, output_dir, 
+    top_n=100
+):
+    """高輸送量のペアを抽出し、画像上に可視化
+    
+    Args:
+        T_opt: 最適化で得られた輸送行列
+        T_sift: SIFTで得られた輸送行列
+        gaussians1: 1枚目の画像の2Dガウス
+        gaussians2: 2枚目の画像の2Dガウス
+        image1_path: 1枚目の画像パス
+        image2_path: 2枚目の画像パス
+        output_dir: 出力ディレクトリ
+        top_n: 可視化する上位ペアの数
+    """
+    # 画像読み込み
+    img1 = cv2.imread(image1_path)
+    img2 = cv2.imread(image2_path)
+    
+    if img1 is None or img2 is None:
+        print(f"Error: Failed to load images from {image1_path} or {image2_path}")
+        return
+    
+    # 結合画像を作成（左が画像1、右が画像2）
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+    
+    # 高さをそろえる
+    h_max = max(h1, h2)
+    img1_resized = cv2.copyMakeBorder(img1, 0, h_max - h1, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    img2_resized = cv2.copyMakeBorder(img2, 0, h_max - h2, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    
+    # 高輸送量ペアの抽出
+    # Optimized F
+    opt_values = T_opt.flatten()
+    opt_indices = np.argsort(opt_values)[::-1][:top_n]
+    opt_pairs = [np.unravel_index(idx, T_opt.shape) for idx in opt_indices]
+    
+    # SIFT F
+    sift_values = T_sift.flatten()
+    sift_indices = np.argsort(sift_values)[::-1][:top_n]
+    sift_pairs = [np.unravel_index(idx, T_sift.shape) for idx in sift_indices]
+    
+    # gaussians1とgaussians2の座標を取得
+    means1 = gaussians1.means.cpu().numpy() if isinstance(gaussians1.means, torch.Tensor) else gaussians1.means
+    means2 = gaussians2.means.cpu().numpy() if isinstance(gaussians2.means, torch.Tensor) else gaussians2.means
+    
+    # Optimized F のペアを可視化
+    combined_opt = np.hstack([img1_resized, img2_resized])
+    
+    for (i, j), idx in zip(opt_pairs, opt_indices):
+        # 画像1上の点
+        pt1 = (int(means1[i, 0]), int(means1[i, 1]))
+        # 画像2上の点（x座標をオフセット）
+        pt2 = (int(means2[j, 0]) + w1, int(means2[j, 1]))
+        
+        # 輸送量が大きいほど線を太く、色を濃く
+        transport_value = opt_values[idx]
+        thickness = max(1, min(5, int(transport_value * 20)))
+        color_intensity = min(255, int(transport_value * 1000))
+        color = (0, color_intensity, 255 - color_intensity)  # 輸送量によって色が変化
+        
+        # 対応線の描画
+        cv2.line(combined_opt, pt1, pt2, color, thickness)
+        # 点も描画
+        cv2.circle(combined_opt, pt1, 5, (0, 255, 0), -1)
+        cv2.circle(combined_opt, pt2, 5, (0, 255, 0), -1)
+    
+    cv2.imwrite(os.path.join(output_dir, 'high_transport_pairs_optimized.png'), combined_opt)
+    
+    # SIFT F のペアを可視化
+    combined_sift = np.hstack([img1_resized, img2_resized])
+    
+    for (i, j), idx in zip(sift_pairs, sift_indices):
+        # 画像1上の点
+        pt1 = (int(means1[i, 0]), int(means1[i, 1]))
+        # 画像2上の点（x座標をオフセット）
+        pt2 = (int(means2[j, 0]) + w1, int(means2[j, 1]))
+        
+        # 輸送量が大きいほど線を太く、色を濃く
+        transport_value = sift_values[idx]
+        thickness = max(1, min(5, int(transport_value * 20)))
+        color_intensity = min(255, int(transport_value * 1000))
+        color = (0, color_intensity, 255 - color_intensity)  # 輸送量によって色が変化
+        
+        # 対応線の描画
+        cv2.line(combined_sift, pt1, pt2, color, thickness)
+        # 点も描画
+        cv2.circle(combined_sift, pt1, 5, (0, 255, 0), -1)
+        cv2.circle(combined_sift, pt2, 5, (0, 255, 0), -1)
+    
+    cv2.imwrite(os.path.join(output_dir, 'high_transport_pairs_sift.png'), combined_sift)
+    
+    print(f"High transport pairs visualization saved to {output_dir}")
+    
+    # 上位ペアの対応関係をクロスチェックして分析
+    analyze_correspondence_overlap(opt_pairs, sift_pairs, output_dir)
+    
+def analyze_correspondence_overlap(opt_pairs, sift_pairs, output_dir):
+    """最適化FとSIFT Fから得られた対応点の重複を分析
+    
+    Args:
+        opt_pairs: 最適化Fの上位対応ペア
+        sift_pairs: SIFT Fの上位対応ペア
+        output_dir: 出力ディレクトリ
+    """
+    # 対応ペアをセットに変換
+    opt_set = set((i, j) for i, j in opt_pairs)
+    sift_set = set((i, j) for i, j in sift_pairs)
+    
+    # 共通するペアを見つける
+    common_pairs = opt_set.intersection(sift_set)
+    
+    # 分析結果を出力
+    with open(os.path.join(output_dir, 'correspondence_overlap.txt'), 'w') as f:
+        f.write("CORRESPONDENCE OVERLAP ANALYSIS\n")
+        f.write("===============================\n\n")
+        
+        f.write(f"Number of top pairs analyzed: {len(opt_pairs)}\n")
+        f.write(f"Common pairs between Optimized F and SIFT F: {len(common_pairs)}\n")
+        f.write(f"Overlap percentage: {len(common_pairs)/len(opt_pairs)*100:.2f}%\n\n")
+        
+        # 完全一致しなくても、同じガウスが関与しているケースの分析
+        # Image 1側のガウスの重複
+        opt_img1_gaussians = set(i for i, _ in opt_pairs)
+        sift_img1_gaussians = set(i for i, _ in sift_pairs)
+        common_img1 = opt_img1_gaussians.intersection(sift_img1_gaussians)
+        
+        # Image 2側のガウスの重複
+        opt_img2_gaussians = set(j for _, j in opt_pairs)
+        sift_img2_gaussians = set(j for _, j in sift_pairs)
+        common_img2 = opt_img2_gaussians.intersection(sift_img2_gaussians)
+        
+        f.write("Partial overlap analysis:\n")
+        f.write(f"Image 1 Gaussians - Optimized F: {len(opt_img1_gaussians)}, SIFT F: {len(sift_img1_gaussians)}, Common: {len(common_img1)} ({len(common_img1)/len(opt_img1_gaussians)*100:.2f}%)\n")
+        f.write(f"Image 2 Gaussians - Optimized F: {len(opt_img2_gaussians)}, SIFT F: {len(sift_img2_gaussians)}, Common: {len(common_img2)} ({len(common_img2)/len(opt_img2_gaussians)*100:.2f}%)\n\n")
+        
+        # 対応関係の詳細分析
+        # 各Image 1ガウスがいくつのImage 2ガウスに対応しているか
+        opt_img1_count = {}
+        sift_img1_count = {}
+        
+        for i, _ in opt_pairs:
+            opt_img1_count[i] = opt_img1_count.get(i, 0) + 1
+        
+        for i, _ in sift_pairs:
+            sift_img1_count[i] = sift_img1_count.get(i, 0) + 1
+        
+        opt_img1_counts = list(opt_img1_count.values())
+        sift_img1_counts = list(sift_img1_count.values())
+        
+        f.write("Correspondence distribution (Image 1 Gaussians):\n")
+        f.write(f"Optimized F - Min: {min(opt_img1_counts)}, Max: {max(opt_img1_counts)}, Mean: {sum(opt_img1_counts)/len(opt_img1_counts):.2f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_img1_counts)}, Max: {max(sift_img1_counts)}, Mean: {sum(sift_img1_counts)/len(sift_img1_counts):.2f}\n\n")
+        
+        # 各Image 2ガウスがいくつのImage 1ガウスに対応しているか
+        opt_img2_count = {}
+        sift_img2_count = {}
+        
+        for _, j in opt_pairs:
+            opt_img2_count[j] = opt_img2_count.get(j, 0) + 1
+        
+        for _, j in sift_pairs:
+            sift_img2_count[j] = sift_img2_count.get(j, 0) + 1
+        
+        opt_img2_counts = list(opt_img2_count.values())
+        sift_img2_counts = list(sift_img2_count.values())
+        
+        f.write("Correspondence distribution (Image 2 Gaussians):\n")
+        f.write(f"Optimized F - Min: {min(opt_img2_counts)}, Max: {max(opt_img2_counts)}, Mean: {sum(opt_img2_counts)/len(opt_img2_counts):.2f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_img2_counts)}, Max: {max(sift_img2_counts)}, Mean: {sum(sift_img2_counts)/len(sift_img2_counts):.2f}\n")
+
+def analyze_correspondence_overlap(opt_pairs, sift_pairs, output_dir):
+    """最適化FとSIFT Fから得られた対応点の重複を分析
+    
+    Args:
+        opt_pairs: 最適化Fの上位対応ペア
+        sift_pairs: SIFT Fの上位対応ペア
+        output_dir: 出力ディレクトリ
+    """
+    # 対応ペアをセットに変換
+    opt_set = set((i, j) for i, j in opt_pairs)
+    sift_set = set((i, j) for i, j in sift_pairs)
+    
+    # 共通するペアを見つける
+    common_pairs = opt_set.intersection(sift_set)
+    
+    # 分析結果を出力
+    with open(os.path.join(output_dir, 'correspondence_overlap.txt'), 'w') as f:
+        f.write("CORRESPONDENCE OVERLAP ANALYSIS\n")
+        f.write("===============================\n\n")
+        
+        f.write(f"Number of top pairs analyzed: {len(opt_pairs)}\n")
+        f.write(f"Common pairs between Optimized F and SIFT F: {len(common_pairs)}\n")
+        f.write(f"Overlap percentage: {len(common_pairs)/len(opt_pairs)*100:.2f}%\n\n")
+        
+        # 完全一致しなくても、同じガウスが関与しているケースの分析
+        # Image 1側のガウスの重複
+        opt_img1_gaussians = set(i for i, _ in opt_pairs)
+        sift_img1_gaussians = set(i for i, _ in sift_pairs)
+        common_img1 = opt_img1_gaussians.intersection(sift_img1_gaussians)
+        
+        # Image 2側のガウスの重複
+        opt_img2_gaussians = set(j for _, j in opt_pairs)
+        sift_img2_gaussians = set(j for _, j in sift_pairs)
+        common_img2 = opt_img2_gaussians.intersection(sift_img2_gaussians)
+        
+        f.write("Partial overlap analysis:\n")
+        f.write(f"Image 1 Gaussians - Optimized F: {len(opt_img1_gaussians)}, SIFT F: {len(sift_img1_gaussians)}, Common: {len(common_img1)} ({len(common_img1)/len(opt_img1_gaussians)*100:.2f}%)\n")
+        f.write(f"Image 2 Gaussians - Optimized F: {len(opt_img2_gaussians)}, SIFT F: {len(sift_img2_gaussians)}, Common: {len(common_img2)} ({len(common_img2)/len(opt_img2_gaussians)*100:.2f}%)\n\n")
+        
+        # 対応関係の詳細分析
+        # 各Image 1ガウスがいくつのImage 2ガウスに対応しているか
+        opt_img1_count = {}
+        sift_img1_count = {}
+        
+        for i, _ in opt_pairs:
+            opt_img1_count[i] = opt_img1_count.get(i, 0) + 1
+        
+        for i, _ in sift_pairs:
+            sift_img1_count[i] = sift_img1_count.get(i, 0) + 1
+        
+        opt_img1_counts = list(opt_img1_count.values())
+        sift_img1_counts = list(sift_img1_count.values())
+        
+        f.write("Correspondence distribution (Image 1 Gaussians):\n")
+        f.write(f"Optimized F - Min: {min(opt_img1_counts)}, Max: {max(opt_img1_counts)}, Mean: {sum(opt_img1_counts)/len(opt_img1_counts):.2f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_img1_counts)}, Max: {max(sift_img1_counts)}, Mean: {sum(sift_img1_counts)/len(sift_img1_counts):.2f}\n\n")
+        
+        # 各Image 2ガウスがいくつのImage 1ガウスに対応しているか
+        opt_img2_count = {}
+        sift_img2_count = {}
+        
+        for _, j in opt_pairs:
+            opt_img2_count[j] = opt_img2_count.get(j, 0) + 1
+        
+        for _, j in sift_pairs:
+            sift_img2_count[j] = sift_img2_count.get(j, 0) + 1
+        
+        opt_img2_counts = list(opt_img2_count.values())
+        sift_img2_counts = list(sift_img2_count.values())
+        
+        f.write("Correspondence distribution (Image 2 Gaussians):\n")
+        f.write(f"Optimized F - Min: {min(opt_img2_counts)}, Max: {max(opt_img2_counts)}, Mean: {sum(opt_img2_counts)/len(opt_img2_counts):.2f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_img2_counts)}, Max: {max(sift_img2_counts)}, Mean: {sum(sift_img2_counts)/len(sift_img2_counts):.2f}\n")
+
+def analyze_correspondence_properties(T_opt, T_sift, gaussians1, gaussians2, output_dir, top_n=500):
+    """対応点の性質（色、スケール、回転）を分析
+    
+    Args:
+        T_opt: 最適化で得られた輸送行列
+        T_sift: SIFTで得られた輸送行列
+        gaussians1: 1枚目の画像の2Dガウス
+        gaussians2: 2枚目の画像の2Dガウス
+        output_dir: 出力ディレクトリ
+        top_n: 分析する上位ペアの数
+    """
+    # 高輸送量ペアの抽出
+    # Optimized F
+    opt_values = T_opt.flatten()
+    opt_indices = np.argsort(opt_values)[::-1][:top_n]
+    opt_pairs = [np.unravel_index(idx, T_opt.shape) for idx in opt_indices]
+    
+    # SIFT F
+    sift_values = T_sift.flatten()
+    sift_indices = np.argsort(sift_values)[::-1][:top_n]
+    sift_pairs = [np.unravel_index(idx, T_sift.shape) for idx in sift_indices]
+    
+    # RGB、スケール、回転の差異を計算
+    def compute_property_differences(pairs, gaussians1, gaussians2):
+        rgb_diffs = []
+        scale_diffs = []
+        rotation_diffs = []
+        spatial_dists = []
+        
+        # tensorからnumpyに変換
+        rgb1 = gaussians1.rgb.cpu().numpy() if isinstance(gaussians1.rgb, torch.Tensor) else gaussians1.rgb
+        rgb2 = gaussians2.rgb.cpu().numpy() if isinstance(gaussians2.rgb, torch.Tensor) else gaussians2.rgb
+        
+        scales1 = gaussians1.scales.cpu().numpy() if isinstance(gaussians1.scales, torch.Tensor) else gaussians1.scales
+        scales2 = gaussians2.scales.cpu().numpy() if isinstance(gaussians2.scales, torch.Tensor) else gaussians2.scales
+        
+        rot1 = gaussians1.rotations.cpu().numpy() if isinstance(gaussians1.rotations, torch.Tensor) else gaussians1.rotations
+        rot2 = gaussians2.rotations.cpu().numpy() if isinstance(gaussians2.rotations, torch.Tensor) else gaussians2.rotations
+        
+        means1 = gaussians1.means.cpu().numpy() if isinstance(gaussians1.means, torch.Tensor) else gaussians1.means
+        means2 = gaussians2.means.cpu().numpy() if isinstance(gaussians2.means, torch.Tensor) else gaussians2.means
+        
+        for i, j in pairs:
+            # RGB差異（L2ノルム）
+            rgb_diff = np.linalg.norm(rgb1[i] - rgb2[j])
+            rgb_diffs.append(rgb_diff)
+            
+            # スケール差異（相対比）
+            scale_ratio = np.maximum(scales1[i] / scales2[j], scales2[j] / scales1[i])
+            scale_diff = np.mean(scale_ratio)
+            scale_diffs.append(scale_diff)
+            
+            # 回転差異（角度の最小差）
+            rot_diff = min(abs(rot1[i] - rot2[j]) % (2*np.pi), (2*np.pi - abs(rot1[i] - rot2[j]) % (2*np.pi)))
+            rotation_diffs.append(rot_diff)
+            
+            # 空間的な距離（簡易的なチェック）
+            spatial_dist = np.linalg.norm(means1[i] - means2[j])
+            spatial_dists.append(spatial_dist)
+        
+        return {
+            'rgb_diffs': rgb_diffs,
+            'scale_diffs': scale_diffs,
+            'rotation_diffs': rotation_diffs,
+            'spatial_dists': spatial_dists
+        }
+    
+    # 各輸送行列の対応点性質の分析
+    opt_props = compute_property_differences(opt_pairs, gaussians1, gaussians2)
+    sift_props = compute_property_differences(sift_pairs, gaussians1, gaussians2)
+    
+    # 分析結果を保存
+    with open(os.path.join(output_dir, 'correspondence_properties.txt'), 'w') as f:
+        f.write("CORRESPONDENCE PROPERTIES ANALYSIS\n")
+        f.write("=================================\n\n")
+        
+        f.write(f"Number of top pairs analyzed: {top_n}\n\n")
+        
+        # RGB差異
+        f.write("RGB color differences (L2 norm):\n")
+        f.write(f"Optimized F - Min: {min(opt_props['rgb_diffs']):.4f}, Max: {max(opt_props['rgb_diffs']):.4f}, Mean: {sum(opt_props['rgb_diffs'])/len(opt_props['rgb_diffs']):.4f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_props['rgb_diffs']):.4f}, Max: {max(sift_props['rgb_diffs']):.4f}, Mean: {sum(sift_props['rgb_diffs'])/len(sift_props['rgb_diffs']):.4f}\n\n")
+        
+        # スケール差異
+        f.write("Scale differences (relative ratio):\n")
+        f.write(f"Optimized F - Min: {min(opt_props['scale_diffs']):.4f}, Max: {max(opt_props['scale_diffs']):.4f}, Mean: {sum(opt_props['scale_diffs'])/len(opt_props['scale_diffs']):.4f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_props['scale_diffs']):.4f}, Max: {max(sift_props['scale_diffs']):.4f}, Mean: {sum(sift_props['scale_diffs'])/len(sift_props['scale_diffs']):.4f}\n\n")
+        
+        # 回転差異
+        f.write("Rotation differences (radians):\n")
+        f.write(f"Optimized F - Min: {min(opt_props['rotation_diffs']):.4f}, Max: {max(opt_props['rotation_diffs']):.4f}, Mean: {sum(opt_props['rotation_diffs'])/len(opt_props['rotation_diffs']):.4f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_props['rotation_diffs']):.4f}, Max: {max(sift_props['rotation_diffs']):.4f}, Mean: {sum(sift_props['rotation_diffs'])/len(sift_props['rotation_diffs']):.4f}\n\n")
+        
+        # 空間的距離
+        f.write("Spatial distances (Euclidean distance):\n")
+        f.write(f"Optimized F - Min: {min(opt_props['spatial_dists']):.4f}, Max: {max(opt_props['spatial_dists']):.4f}, Mean: {sum(opt_props['spatial_dists'])/len(opt_props['spatial_dists']):.4f}\n")
+        f.write(f"SIFT F      - Min: {min(sift_props['spatial_dists']):.4f}, Max: {max(sift_props['spatial_dists']):.4f}, Mean: {sum(sift_props['spatial_dists'])/len(sift_props['spatial_dists']):.4f}\n\n")
+        
+        # 差異の総合分析
+        f.write("Overall property differences analysis:\n")
+        
+        # RGB差異の比較
+        rgb_diff_ratio = sum(opt_props['rgb_diffs'])/len(opt_props['rgb_diffs']) / (sum(sift_props['rgb_diffs'])/len(sift_props['rgb_diffs']))
+        f.write(f"RGB difference ratio (Optimized F / SIFT F): {rgb_diff_ratio:.4f}\n")
+        
+        # スケール差異の比較
+        scale_diff_ratio = sum(opt_props['scale_diffs'])/len(opt_props['scale_diffs']) / (sum(sift_props['scale_diffs'])/len(sift_props['scale_diffs']))
+        f.write(f"Scale difference ratio (Optimized F / SIFT F): {scale_diff_ratio:.4f}\n")
+        
+        # 回転差異の比較
+        rotation_diff_ratio = sum(opt_props['rotation_diffs'])/len(opt_props['rotation_diffs']) / (sum(sift_props['rotation_diffs'])/len(sift_props['rotation_diffs']))
+        f.write(f"Rotation difference ratio (Optimized F / SIFT F): {rotation_diff_ratio:.4f}\n")
+        
+        # 空間的距離の比較
+        spatial_dist_ratio = sum(opt_props['spatial_dists'])/len(opt_props['spatial_dists']) / (sum(sift_props['spatial_dists'])/len(sift_props['spatial_dists']))
+        f.write(f"Spatial distance ratio (Optimized F / SIFT F): {spatial_dist_ratio:.4f}\n\n")
+    
+    print(f"Correspondence properties analysis saved to {os.path.join(output_dir, 'correspondence_properties.txt')}")
+    
+    # 視覚化のためのヒストグラム
+    plt.figure(figsize=(20, 16))
+    
+    # RGB差異のヒストグラム
+    plt.subplot(2, 2, 1)
+    plt.hist(opt_props['rgb_diffs'], alpha=0.5, bins=20, label='Optimized F')
+    plt.hist(sift_props['rgb_diffs'], alpha=0.5, bins=20, label='SIFT F')
+    plt.xlabel('RGB Difference (L2 norm)')
+    plt.ylabel('Frequency')
+    plt.title('RGB Color Differences')
+    plt.legend()
+    
+    # スケール差異のヒストグラム
+    plt.subplot(2, 2, 2)
+    plt.hist(opt_props['scale_diffs'], alpha=0.5, bins=20, label='Optimized F')
+    plt.hist(sift_props['scale_diffs'], alpha=0.5, bins=20, label='SIFT F')
+    plt.xlabel('Scale Difference (relative ratio)')
+    plt.ylabel('Frequency')
+    plt.title('Scale Differences')
+    plt.legend()
+    
+    # 回転差異のヒストグラム
+    plt.subplot(2, 2, 3)
+    plt.hist(opt_props['rotation_diffs'], alpha=0.5, bins=20, label='Optimized F')
+    plt.hist(sift_props['rotation_diffs'], alpha=0.5, bins=20, label='SIFT F')
+    plt.xlabel('Rotation Difference (radians)')
+    plt.ylabel('Frequency')
+    plt.title('Rotation Differences')
+    plt.legend()
+    
+    # 空間的距離のヒストグラム
+    plt.subplot(2, 2, 4)
+    plt.hist(opt_props['spatial_dists'], alpha=0.5, bins=20, label='Optimized F')
+    plt.hist(sift_props['spatial_dists'], alpha=0.5, bins=20, label='SIFT F')
+    plt.xlabel('Spatial Distance (pixels)')
+    plt.ylabel('Frequency')
+    plt.title('Spatial Distances')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'correspondence_properties_histograms.png'), dpi=300)
+    plt.close()
+    
+    print(f"Correspondence properties histograms saved to {os.path.join(output_dir, 'correspondence_properties_histograms.png')}")
 
 def estimate_camera_pose_from_features(image1_path, image2_path, K1, K2, debug_dir=None):
     """特徴点ベースでカメラ姿勢推定を行う関数
@@ -972,7 +1543,7 @@ def main():
     ##############################
     # 11) (Optional) Project 3D Gaussians back to 2D for debug
     ##############################
-    if True:
+    if args.render_gaussians:
         print("\n--- Rendering 3D Gaussians back into both camera views (alpha-blend) ---")
 
         transport_values = None
@@ -1193,6 +1764,20 @@ def main():
 
     # print(f"\nSaved pipeline results to {out_pkl}")
     # print("\nDone.")
+    
+    # SIFT方式の処理が完了した後、かつ最終的な結果保存の前
+    if R_sift is not None and t_sift is not None and F_sift is not None:
+        print("\n--- Analyzing Transport Matrices Comparison ---")
+        analyze_transport_matrices(
+            solver=solver,
+            F_optimized=F_optimized,
+            F_sift=F_sift,
+            gaussians1=gaussians1,
+            gaussians2=gaussians2,
+            image1_path=image1_path,
+            image2_path=image2_path,
+            output_dir=os.path.join(output_dir, 'transport_analysis')
+        )
 
     # COLMAP形式でエクスポート
     print("\n--- Exporting to COLMAP format for visualization ---")
