@@ -21,55 +21,6 @@ class ObservationManager:
         """
         self.point_manager = point_manager if point_manager is not None else PointIDManager()
     
-    def track_observations_from_transport(
-        self,
-        transport_matrix: np.ndarray,
-        means_2d: Union[np.ndarray, torch.Tensor],
-        point_ids: List[int],
-        camera_id: int,
-    ) -> List[int]:
-        """Track correspondences from a transport matrix and add to the point manager.
-        
-        This method handles converting tensors to numpy arrays, validating inputs, and
-        applying different filtering strategies based on parameters.
-        
-        Args:
-            transport_matrix: Optimal transport matrix between 3D points and 2D Gaussians
-            means_2d: 2D means of the Gaussians in the target view
-            point_ids: List of point IDs corresponding to rows in transport_matrix
-            camera_id: ID of the camera observing the 2D points
-        Returns:
-            List of point IDs for which observations were added
-        """
-        updated_point_ids = []
-
-       # PyTorchテンソルの場合はnumpy配列に変換
-        if isinstance(means_2d, torch.Tensor):
-            means_2d = means_2d.detach().cpu().numpy()
-            
-        # カメラの存在確認
-        if camera_id not in self.point_manager.cameras:
-            sys.exit(f"Warning: Camera ID {camera_id} not found in point manager")
-        
-        # 輸送行列から観測を追跡
-        # 各ポイントIDに対して処理
-        for i, point_id in enumerate(point_ids):
-            # point_idが無効な場合はスキップ
-            if point_id not in self.point_manager.points:
-                sys.exit(f"Error: Point ID {point_id} not found in point manager")
-                
-            # 非ゼロの輸送値を持つ全てのインデックスを取得
-            nonzero_indices = np.where(transport_matrix[i] > 0)[0]
-            # 非ゼロの輸送を持つ全ての観測を追加
-            for idx in nonzero_indices:
-                    point_2d = means_2d[idx]
-                    self.point_manager.add_observation(point_id, camera_id, point_2d)
-                    if point_id not in updated_point_ids:
-                        updated_point_ids.append(point_id)
-        
-        print(f"Added {len(updated_point_ids)} observations to camera {camera_id}")
-        return updated_point_ids
-        
     def track_observations_from_match_pairs(
         self,
         match_pairs: List[Tuple[int, int]],
