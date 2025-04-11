@@ -620,10 +620,10 @@ class OptimalTransportSolver:
         # ------------
         # Debug prints
         # ------------
-        print("=== Sampson Error Stats ===")
-        print(f"  min={sampson_error.min():.6f}, max={sampson_error.max():.6f}, mean={sampson_error.mean():.6f}")
-        print("=== Color Diff Stats ===")
-        print(f"  min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
+        # print("=== Sampson Error Stats ===")
+        # print(f"  min={sampson_error.min():.6f}, max={sampson_error.max():.6f}, mean={sampson_error.mean():.6f}")
+        # print("=== Color Diff Stats ===")
+        # print(f"  min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
 
         # ------------------------------------------
         # Example: Simple normalization or scaling
@@ -859,7 +859,11 @@ class OptimalTransportSolver:
             # カメラ中心位置：少し離れた位置に初期化
             self.center = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
         
-        optimizer = torch.optim.Adam([self.rvec_cw, self.center], lr=1e-3)
+        # optimizer = torch.optim.Adam([self.rvec_cw, self.center], lr=1e-3)
+        optimizer = torch.optim.Adam([
+            {'params': self.rvec_cw, 'lr': 1e-3},
+            {'params': self.center, 'lr': 1e-3} 
+        ])
         prev_loss_val = float('inf')
         loss_history = []
 
