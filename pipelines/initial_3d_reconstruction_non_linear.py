@@ -38,8 +38,10 @@ def parse_args():
     parser.add_argument(
         "--data_dir_gmm",
         type=str,
-        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
         default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked",
+        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_200gs_5kiter_masked_sequential",
+        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/house_100gs_10kiter_masked",
+        
         help="Path to the directory that contains fitted Gaussian pkls."
     )
     parser.add_argument(
@@ -64,12 +66,14 @@ def parse_args():
         "--gaussians1_filename",
         type=str,
         default="0022_fitted_gaussians.pkl",
+        # default="fitted_gaussians_0022.pkl",
         help="Filename of the first fitted Gaussians pickle."
     )
     parser.add_argument(
         "--gaussians2_filename",
         type=str,
         default="0023_fitted_gaussians.pkl",
+        # default="fitted_gaussians_0023.pkl",
         help="Filename of the second fitted Gaussians pickle."
     )
     parser.add_argument(
@@ -598,7 +602,26 @@ def analyze_correspondence_properties(T_opt, T_sift, gaussians1, gaussians2, out
             rgb_diffs.append(rgb_diff)
             
             # スケール差異（相対比）
-            scale_ratio = np.maximum(scales1[i] / scales2[j], scales2[j] / scales1[i])
+            scale_ratio = np.zeros_like(scales1[i])
+            nonzero_mask = (scales1[i] > 1e-10) & (scales2[j] > 1e-10)
+            
+            if np.any(nonzero_mask):
+                ratio1 = np.zeros_like(scales1[i])
+                ratio2 = np.zeros_like(scales1[i])
+                
+                valid_indices = np.where(scales2[j] > 1e-10)[0]
+                if len(valid_indices) > 0:
+                    ratio1[valid_indices] = scales1[i][valid_indices] / scales2[j][valid_indices]
+                    
+                valid_indices = np.where(scales1[i] > 1e-10)[0]
+                if len(valid_indices) > 0:
+                    ratio2[valid_indices] = scales2[j][valid_indices] / scales1[i][valid_indices]
+                    
+                scale_ratio[nonzero_mask] = np.maximum(ratio1[nonzero_mask], ratio2[nonzero_mask])
+            
+            # 無限大の値を除外
+            scale_ratio = np.clip(scale_ratio, 0, 1e6)  # 適切な上限値に制限
+            
             scale_diff = np.mean(scale_ratio)
             scale_diffs.append(scale_diff)
             
@@ -1237,7 +1260,7 @@ def main():
         lambda_mean=0.0,
         lambda_cov=0.0,
         lambda_color=0.2,
-        lambda_epipolar=1.0,
+        lambda_epipolar=0.8,
         device=device
     )
 
