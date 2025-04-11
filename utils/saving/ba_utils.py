@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import torch
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
@@ -325,167 +325,14 @@ def render_gaussians_alpha_blend(
 
     return color_buffer, alpha_buffer
 
-
-def visualize_rendered_comparison(
-    reconstruction_data: Dict,
-    ba_results: Dict,
-    image_name: str,
-    original_image_path: str,
-    save_path: str
-) -> None:
-    """BAの前後での3Dガウスのレンダリング結果を比較
-
-    Args:
-        reconstruction_data: 再構成データ
-        ba_results: BAの結果
-        image_name: 画像名
-        original_image_path: 元画像のパス
-        save_path: 保存先パス
-    """
-    # 画像読み込み
-    orig_img = cv2.imread(original_image_path, cv2.IMREAD_UNCHANGED)
-    if orig_img.shape[2] == 4:  # アルファチャンネルがある場合
-        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGRA2RGBA)
-    else:
-        orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
-    
-    H, W = orig_img.shape[:2]
-    
-    # カメラパラメータ取得
-    # 画像名からカメラインデックスを特定
-    camera_idx = None
-    for i, img in enumerate(reconstruction_data.get('used_images', [])):
-        if img == image_name:
-            camera_idx = i
-            break
-    
-    if camera_idx is None:
-        print(f"Warning: Camera index for {image_name} not found")
-        return
-    
-    # BA前後のカメラパラメータ取得
-    if 'initial_cameras' in ba_results:
-        R_before, t_before = ba_results['initial_cameras'][camera_idx]
-    else:
-        # 初期カメラパラメータがない場合は既存のものを使用
-        R_before, t_before = reconstruction_data['camera_params_list'][camera_idx]
-    
-    if 'optimized_cameras' in ba_results:
-        R_after, t_after = ba_results['optimized_cameras'][camera_idx]
-    else:
-        print(f"Warning: Optimized camera for {image_name} not found")
-        return
-    
-    # 内部パラメータ
-    if 'K' in reconstruction_data:
-        K = reconstruction_data['K']
-    elif f'camera{camera_idx+1}_K' in reconstruction_data:
-        K = reconstruction_data[f'camera{camera_idx+1}_K']
-    else:
-        print(f"Warning: Intrinsic matrix for {image_name} not found")
-        return
-    
-    # BA前後の3D Gaussian
-    if 'initial_points' in ba_results and 'optimized_points' in ba_results:
-        points_before = ba_results['initial_points']
-        points_after = ba_results['optimized_points']
-    else:
-        # BA結果に含まれない場合は既存のものを使用
-        points_before = reconstruction_data['points_3d']
-        points_after = reconstruction_data['points_3d']
-    
-    # 共分散行列、色、アルファは変わらないと仮定
-    covariances = reconstruction_data['covariances_3d']
-    colors = reconstruction_data['color_3d']
-    alphas = reconstruction_data['alpha_3d']
-    
-    # BA前のレンダリング
-    color_before, alpha_before = render_gaussians_alpha_blend(
-        points_3d=points_before,
-        covariances_3d=covariances,
-        color_3d=colors,
-        alpha_3d=alphas,
-        R_cam=R_before,
-        t_cam=t_before,
-        K=K,
-        out_width=W,
-        out_height=H
-    )
-    
-    # BA後のレンダリング
-    color_after, alpha_after = render_gaussians_alpha_blend(
-        points_3d=points_after,
-        covariances_3d=covariances,
-        color_3d=colors,
-        alpha_3d=alphas,
-        R_cam=R_after,
-        t_cam=t_after,
-        K=K,
-        out_width=W,
-        out_height=H
-    )
-    
-    # 比較可視化
-    plt.figure(figsize=(15, 5))
-    
-    # 元画像
-    plt.subplot(131)
-    plt.imshow(orig_img)
-    plt.title("Original Image")
-    plt.axis('off')
-    
-    # BA前のレンダリング
-    plt.subplot(132)
-    plt.imshow(color_before)
-    plt.title("Before BA")
-    plt.axis('off')
-    
-    # BA後のレンダリング
-    plt.subplot(133)
-    plt.imshow(color_after)
-    plt.title("After BA")
-    plt.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    
-    # エラー可視化（オリジナルとのピクセル差分）
-    plt.figure(figsize=(15, 5))
-    
-    # BA前の誤差
-    error_before = np.abs(color_before - orig_img/255.0).mean(axis=2)
-    plt.subplot(131)
-    plt.imshow(error_before, cmap='hot')
-    plt.title(f"Error Before BA (Mean: {error_before.mean():.4f})")
-    plt.colorbar()
-    
-    # BA後の誤差
-    error_after = np.abs(color_after - orig_img/255.0).mean(axis=2)
-    plt.subplot(132)
-    plt.imshow(error_after, cmap='hot')
-    plt.title(f"Error After BA (Mean: {error_after.mean():.4f})")
-    plt.colorbar()
-    
-    # 誤差の改善
-    error_diff = error_before - error_after
-    plt.subplot(133)
-    plt.imshow(error_diff, cmap='coolwarm')
-    plt.title(f"Error Improvement (Mean: {error_diff.mean():.4f})")
-    plt.colorbar()
-    
-    error_save_path = save_path.replace('.png', '_error.png')
-    plt.tight_layout()
-    plt.savefig(error_save_path)
-    plt.close()
-
 def visualize_ba_results(
     reconstruction_data: Dict,
     ba_results: Dict,
     data_dir: str,
     fitted_gaussians_dir: str,
     save_dir: str,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    visualize_all_cameras: bool = False
 ) -> None:
     """Bundle Adjustmentの結果を包括的に可視化
 
@@ -496,6 +343,7 @@ def visualize_ba_results(
         fitted_gaussians_dir: フィッティングされたGaussianのディレクトリ
         save_dir: 保存先ディレクトリ
         device: 計算デバイス
+        visualize_all_cameras: すべてのカメラを可視化するかどうか。Falseの場合は初期ペアのみ。
     """
     os.makedirs(save_dir, exist_ok=True)
     print(f"Visualizing BA results to {save_dir}...")
@@ -506,100 +354,16 @@ def visualize_ba_results(
         plot_rmse_progress(ba_results, rmse_plot_path)
         print(f"Saved RMSE plot to {rmse_plot_path}")
     
-    # 2. 各画像での投影点比較とレンダリング比較
-    for img_name in tqdm(reconstruction_data.get('used_images', []), desc="Generating visualizations"):
-        img_path = os.path.join(data_dir, "images", img_name)
-        
-        # 2.1 投影点の比較
-        camera_idx = None
-        for i, img in enumerate(reconstruction_data.get('used_images', [])):
-            if img == img_name:
-                camera_idx = i
-                break
-        
-        if camera_idx is not None:
-            # カメラパラメータ取得
-            if 'initial_cameras' in ba_results and camera_idx < len(ba_results['initial_cameras']):
-                camera_before = ba_results['initial_cameras'][camera_idx]
-            else:
-                camera_before = reconstruction_data['camera_params_list'][camera_idx]
-                
-            if 'optimized_cameras' in ba_results and camera_idx < len(ba_results['optimized_cameras']):
-                camera_after = ba_results['optimized_cameras'][camera_idx]
-            else:
-                camera_after = camera_before
-            
-            # BA前後の点群
-            points_before = ba_results.get('initial_points', reconstruction_data['points_3d'])
-            points_after = ba_results.get('optimized_points', reconstruction_data['points_3d'])
-            
-            # カメラの内部パラメータ
-            if 'K' in reconstruction_data:
-                K = reconstruction_data['K']
-            elif f'camera{camera_idx+1}_K' in reconstruction_data:
-                K = reconstruction_data[f'camera{camera_idx+1}_K']
-            else:
-                print(f"Warning: Intrinsic matrix for {img_name} not found")
-                continue
-            
-            # BA前後の3D Gaussianを2Dに投影
-            initial_2d = project_3d_gaussians(points_before, camera_before, K)
-            final_2d = project_3d_gaussians(points_after, camera_after, K)
-            
-            # 元の2D Gaussianをロード
-            gaussians_file = os.path.join(fitted_gaussians_dir, f"{img_name.split('.')[0]}_fitted_gaussians.pkl")
-            if os.path.exists(gaussians_file):
-                _, original_2d, _, _ = load_gaussians_torch(gaussians_file, device=device)
-                
-                # 2.1.1 2D投影点の比較可視化
-                vis_path = os.path.join(save_dir, f"ba_comparison_{img_name.split('.')[0]}.png")
-                visualize_ba_comparison(img_path, initial_2d, final_2d, original_2d, vis_path)
-                
-                # 2.1.2 3Dレンダリング比較の可視化
-                render_path = os.path.join(save_dir, f"ba_render_{img_name.split('.')[0]}.png")
-                visualize_rendered_comparison(
-                    reconstruction_data=reconstruction_data,
-                    ba_results=ba_results,
-                    image_name=img_name,
-                    original_image_path=img_path,
-                    save_path=render_path
-                )
-            else:
-                print(f"Warning: Fitted gaussians for {img_name} not found at {gaussians_file}")
-    
-    print("Visualization completed.")
-    
-    
-def visualize_initial_pair_renders(
-    reconstruction_data: Dict,
-    ba_results: Dict,
-    data_dir: str,
-    save_dir: str
-) -> None:
-    """初期ペア（最初の2つのカメラ）についてBA前後のガウシアンレンダリング結果を比較視覚化する
-    
-    主な出力:
-    - rendered_splats_camX_before_ba.png: BA前のレンダリング結果(BGRAフォーマット)
-    - rendered_splats_camX_after_ba.png: BA後のレンダリング結果(BGRAフォーマット)
-    - comparison_camX.png: 元画像とBA前後の結果を並べた比較画像
-    - comparison_error_camX.png: 誤差解析画像
-    
-    Args:
-        reconstruction_data: 再構成データ
-        ba_results: BAの結果
-        data_dir: データディレクトリ（オリジナル画像があるディレクトリ）
-        save_dir: 保存先ディレクトリ
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    print("\n--- Visualizing BA Results for Initial Camera Pair ---")
-    
-    # 初期ペア（最初の2つのカメラ）のインデックスを取得
-    if len(reconstruction_data.get('used_images', [])) < 2:
-        print("Warning: Not enough cameras for initial pair comparison")
-        return
-    
-    # 初期ペアのカメラインデックス
-    camera_indices = [0, 1]  # 最初の2つのカメラ
+    # 2. カメラの投影点比較とレンダリング比較
+    # 可視化するカメラインデックスを決定
+    if visualize_all_cameras:
+        camera_indices = list(range(len(reconstruction_data.get('used_images', []))))
+    else:
+        # 初期ペア（最初の2つのカメラ）のみ
+        if len(reconstruction_data.get('used_images', [])) < 2:
+            print("Warning: Not enough cameras for initial pair comparison")
+            return
+        camera_indices = [0, 1]
     
     # 画像ディレクトリ
     image_dir = os.path.join(data_dir, "images")
@@ -613,7 +377,50 @@ def visualize_initial_pair_renders(
     else:
         print("Warning: No transport values found in reconstruction data. Using default alpha values only.")
     
-    # 各カメラに対して処理
+    # 2Dガウシアン投影の可視化（初期ペアのみ）
+    if not visualize_all_cameras:
+        for idx in [0, 1]:  # 初期ペアのみ
+            img_name = reconstruction_data['used_images'][idx]
+            img_path = os.path.join(image_dir, img_name)
+            
+            # カメラパラメータ取得
+            if 'initial_cameras' in ba_results and idx < len(ba_results['initial_cameras']):
+                camera_before = ba_results['initial_cameras'][idx]
+            else:
+                camera_before = reconstruction_data['camera_params_list'][idx]
+                
+            if 'optimized_cameras' in ba_results and idx < len(ba_results['optimized_cameras']):
+                camera_after = ba_results['optimized_cameras'][idx]
+            else:
+                camera_after = camera_before
+            
+            # BA前後の点群
+            points_before = ba_results.get('initial_points', reconstruction_data['points_3d'])
+            points_after = ba_results.get('optimized_points', reconstruction_data['points_3d'])
+            
+            # カメラの内部パラメータ
+            K = get_camera_intrinsics(reconstruction_data, idx)
+            if K is None:
+                print(f"Warning: Intrinsic matrix for {img_name} not found")
+                continue
+            
+            # 元の2D Gaussianをロード
+            gaussians_file = os.path.join(fitted_gaussians_dir, f"{img_name.split('.')[0]}_fitted_gaussians.pkl")
+            if os.path.exists(gaussians_file):
+                _, original_2d, _, _ = load_gaussians_torch(gaussians_file, device=device)
+                
+                # BA前後の3D Gaussianを2Dに投影
+                initial_2d = project_3d_gaussians(points_before, camera_before, K)
+                final_2d = project_3d_gaussians(points_after, camera_after, K)
+                
+                # 2D投影点の比較可視化
+                vis_path = os.path.join(save_dir, f"ba_comparison_{img_name.split('.')[0]}.png")
+                visualize_ba_comparison(img_path, initial_2d, final_2d, original_2d, vis_path)
+                print(f"Saved 2D projection comparison to {vis_path}")
+            else:
+                print(f"Warning: Fitted gaussians for {img_name} not found at {gaussians_file}")
+    
+    # 3. 3Dレンダリング比較
     for idx in camera_indices:
         image_name = reconstruction_data['used_images'][idx]
         image_path = os.path.join(image_dir, image_name)
@@ -636,11 +443,8 @@ def visualize_initial_pair_renders(
             R_after, t_after = R_before, t_before
         
         # 内部パラメータ
-        if 'K' in reconstruction_data:
-            K = reconstruction_data['K']
-        elif f'camera{idx+1}_K' in reconstruction_data:
-            K = reconstruction_data[f'camera{idx+1}_K']
-        else:
+        K = get_camera_intrinsics(reconstruction_data, idx)
+        if K is None:
             print(f"Warning: Intrinsic matrix for {image_name} not found")
             continue
         
@@ -797,4 +601,24 @@ def visualize_initial_pair_renders(
         
         print(f"Saved comparison visualizations to {comparison_path} and {error_comparison_path}")
     
-    print(f"Initial pair renderings saved to {save_dir}")
+    print(f"BA visualizations saved to {save_dir}")
+
+def get_camera_intrinsics(reconstruction_data: Dict, camera_idx: int) -> Optional[np.ndarray]:
+    """カメラの内部パラメータを取得する
+
+    Args:
+        reconstruction_data: 再構成データ
+        camera_idx: カメラインデックス
+
+    Returns:
+        np.ndarray: カメラの内部パラメータ行列 K (3x3) または None
+    """
+    # 共通の内部パラメータがある場合
+    if 'K' in reconstruction_data:
+        return reconstruction_data['K']
+    
+    # カメラごとの内部パラメータがある場合
+    elif f'camera{camera_idx+1}_K' in reconstruction_data:
+        return reconstruction_data[f'camera{camera_idx+1}_K']
+    
+    return None
