@@ -1,9 +1,10 @@
 # src/reconstructor/viewpoint_extender.py
 import sys
 import numpy as np
+import cv2
 import torch
 import os
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
@@ -60,6 +61,10 @@ class ViewpointExtender:
         self.rvec = None
         self.tvec = None
         
+        # transport matrix and values for alpha blending (currently no use for transport matrix)
+        self.transport_matrix = None
+        self.transport_values = None    
+        
         # 湧出ガウス情報を保存
         self.source_gaussians_data = source_gaussians_data if source_gaussians_data else {}
         
@@ -70,6 +75,8 @@ class ViewpointExtender:
         # Convert K_new to torch tensor if it's not already
         if not isinstance(self.K_new, torch.Tensor):
             self.K_new = torch.tensor(self.K_new, dtype=torch.float32, device=self.device)
+            
+        
 
     def project_3d_gaussians(self) -> TwoDGaussians:
         """
@@ -112,7 +119,7 @@ class ViewpointExtender:
             
             # Check if point is in front of camera
             if x_cam[2] <= 1e-6:
-                continue  # Skip points behind the camera
+                sys.exit("3d gaussian is behind the camera")
                 
             # Project to image coordinates
             K_new = self.K_new.to(dtype=torch.float32) if isinstance(self.K_new, torch.Tensor) else torch.tensor(self.K_new, dtype=torch.float32, device=self.device)
@@ -256,24 +263,35 @@ class ViewpointExtender:
         
         # Extract optimized R, t - これは参照カメラに対する相対変換
         with torch.no_grad():
-            R_est = self.transport_solver.rodrigues(self.rvec).detach().cpu().numpy()
-            t_est = self.tvec.detach().cpu().numpy()
+            r_optimized = self.transport_solver.rvec.detach().cpu().numpy()
+            t_optimized = self.transport_solver.tvec.detach().cpu().numpy()
+            r_est, _ = cv2.Rodrigues(r_optimized)
             
-        R_ref, t_ref = self.camera_params_list[self.reference_camera_idx]
-
-        # 相対変換→ワールド座標変換
-        # R_ref, t_ref は世界座標系→参照カメラ座標系の変換
-        # R_est, t_est は参照カメラ座標系→新カメラ座標系の変換
-        # 求めるのは世界座標系→新カメラ座標系の変換
-
-        # 世界座標系→参照カメラ→新カメラの合成変換を計算
-        R_world = R_est @ R_ref  
-        t_world = R_est @ t_ref + t_est  
-
-        self.camera_params_list.append((R_world, t_world))
+            # 平行移動ベクトルの正規化を追加
+            t_norm = np.linalg.norm(t_optimized)
+            if t_norm > 1e-10:
+                t_optimized = t_optimized / t_norm
         
-        # Return the new camera parameters
-        return R_world, t_world
+        # カメラ座標変換の処理
+        R_ref, t_ref = self.camera_params_list[self.reference_camera_idx]
+        
+        # 世界座標系への変換
+        R_world = r_est @ R_ref  
+        t_world = r_est @ t_ref + t_optimized  
+        
+        # 輸送行列の計算と保存
+        # with torch.no_grad():
+        #     F = self.transport_solver.f
+        #     cost_matrix = self.transport_solver.compute_cost_matrix_fundamental(F)
+        #     transport_matrix = self.transport_solver.unbalanced_sinkhorn_algorithm(
+        #         cost_matrix, rho=0.1, max_iter=10000, tol=1e-6
+        #     )
+        #     transport_np = transport_matrix.detach().cpu().numpy()
+        
+        # # クラス変数として保存
+        # self.transport_matrix = transport_np
+        
+        self.camera_params_list.append((R_world, t_world))
 
     def detect_new_source_gaussians(
         self,
@@ -345,8 +363,7 @@ class ViewpointExtender:
         source_camera_idx: int,
         new_image_2d_gaussians: TwoDGaussians,
         target_volume: float = None,
-        auto_target_volume: bool = True,
-        correspondence_threshold: float = 1e-6  # 対応付け閾値
+        correspondence_threshold: float = 0.0,
     ) -> int:
         """既存の湧出ガウスと新視点の2Dガウスを対応付けて三角測量し、新しい3Dガウスを追加する
         
@@ -355,9 +372,11 @@ class ViewpointExtender:
             new_image_2d_gaussians: 新視点の2Dガウス分布
             target_volume: 新規ガウスの目標体積
             correspondence_threshold: 対応付け閾値（これより大きい輸送量を持つガウスペアを対応とみなす）
+            return_match_pairs: match_pairsを返すかどうか
                 
         Returns:
-            int: 追加された3Dガウスの数
+            Union[int, Tuple[int, List[Tuple[int, int]]]]: 
+                - 追加された3Dガウスの数, match_pairs
         """
         
         if self.source_gaussians_data is None:
@@ -468,7 +487,7 @@ class ViewpointExtender:
         # F行列に基づくコスト行列と輸送行列を計算
         cost_matrix = solver.compute_cost_matrix_fundamental(F)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(
-            cost_matrix, rho=0.5, max_iter=1000, tol=1e-5
+            cost_matrix, rho=0.1, max_iter=1000, tol=1e-6
         )
         transport_np = transport_matrix.detach().cpu().numpy()
         
@@ -524,7 +543,7 @@ class ViewpointExtender:
         
         if len(reconstructor.points_3d) == 0:
             print("Triangulation failed: no 3D points could be generated")
-            return 0
+            return 0, []
         
         # 3D共分散行列を計算
         print(f"Computing covariances for {len(reconstructor.points_3d)} triangulated points")
@@ -626,7 +645,10 @@ class ViewpointExtender:
         print(f"Added {len(reconstructor.points_3d)} new 3D Gaussians from source camera {source_camera_idx}")
         print(f"Marked {len(successfully_triangulated_source_indices)} source gaussians as processed")
         
-        return len(reconstructor.points_3d)
+        match_pairs = reconstructor.match_pairs
+        self.transport_values = reconstructor.transport_values
+
+        return len(reconstructor.points_3d), match_pairs
     
     def _mark_processed_source_gaussians(
         self,
@@ -678,7 +700,10 @@ class ViewpointExtender:
             auto_threshold: 閾値を自動的に決定するかどうか
         
         Returns:
-            Tuple[np.ndarray, np.ndarray]: 新しいカメラパラメータ(R, t)
+        Tuple[np.ndarray, np.ndarray, List[Tuple[int, int]]]: 
+            - R_new: 新カメラの回転行列
+            - t_new: 新カメラの並進ベクトル
+            - match_pairs: 三角測量で使用された対応点のペア
         """
         # 新規視点のカメラパラメータ推定
         print("Estimating camera parameters for new viewpoint...")
@@ -693,25 +718,29 @@ class ViewpointExtender:
         )
         
         transport = self.transport_solver.unbalanced_sinkhorn_algorithm(
-            cost_matrix, rho=0.5, max_iter=10000, tol=1e-6
+            cost_matrix, rho=0.1, max_iter=10000, tol=1e-6
         )
         
         transport_matrix = transport.detach().cpu().numpy()
         
         # 過去の湧出ガウスから3Dガウスを追加
         total_added = 0
+        match_pairs = []  # 三角測量で使われた対応点ペアを保存
+
         if self.source_gaussians_data:
             print("\nProcessing source gaussians from previous views...")
             
             # 各カメラの湧出ガウスから追加
-            for source_idx in range(len(self.camera_params_list) - 1):  # 新しく追加したカメラは除く
-                added = self.triangulate_source_gaussians(
-                    source_camera_idx=source_idx,
-                    new_image_2d_gaussians=new_image_2d_gaussians,
-                    target_volume=target_volume
-                )
-                total_added += added
-                
+            for source_idx in range(len(self.camera_params_list) - 1):
+                added, current_match_pairs = self.triangulate_source_gaussians(
+                source_camera_idx=source_idx,
+                new_image_2d_gaussians=new_image_2d_gaussians,
+                target_volume=target_volume,
+                return_match_pairs=True  # match_pairsを返すよう指定
+            )
+            match_pairs.extend(current_match_pairs)
+            total_added += added
+            
             print(f"Total added 3D Gaussians from previous sources: {total_added}")
         
         # 新視点の湧出ガウスを検出して保存
@@ -735,5 +764,5 @@ class ViewpointExtender:
             print(f"Added {len(new_source_data['indices'])} new source Gaussians as '{new_source_key}'")
         
         
-        return R_new, t_new
+        return R_new, t_new, match_pairs
     
