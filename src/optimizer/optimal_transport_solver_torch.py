@@ -788,10 +788,20 @@ class OptimalTransportSolver:
 
     
     
-    def optimize_with_RT(self, max_iter=1000, tol=1e-6):
+    def optimize_with_RT(self, max_iter=1000, tol=1e-6, save_diagnostics=True, diagnostics_dir=None):
         """R,tを直接最適化してFを構築して self.f に反映させる。
         最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
+        
+        Args:
+            max_iter: Maximum number of iterations
+            tol: Convergence tolerance
+            save_diagnostics: Whether to save detailed diagnostic information
+            diagnostics_dir: Directory to save diagnostics (default: results/diagnostics_rt)
         """
+        # History tracking for diagnostics
+        loss_history = []
+        param_history = {'rvec': [], 'tvec': []}
+        grad_history = {'rvec': [], 'tvec': []}
 
         # R,tを最適化パラメータ設定  (これは相対変換)
         if not hasattr(self, 'rvec'):
@@ -799,12 +809,19 @@ class OptimalTransportSolver:
         if not hasattr(self, 'tvec'):
             self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
         
-        optimizer = torch.optim.Adam([self.rvec, self.tvec], lr=1e-3)
+        optimizer = torch.optim.Adam([
+            {'params': self.rvec, 'lr': 5e-2},
+            {'params': self.tvec, 'lr': 5e-2} 
+        ])
         prev_loss_val = float('inf')
-        loss_history = []
 
         transport_dir = os.path.join("results", "transport_RT")
         os.makedirs(transport_dir, exist_ok=True)
+
+        if diagnostics_dir is None:
+            diagnostics_dir = os.path.join("results", "diagnostics_rt")
+        
+        os.makedirs(diagnostics_dir, exist_ok=True)
 
         pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
         
@@ -821,11 +838,18 @@ class OptimalTransportSolver:
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
 
-            # パラメータ更新
-            optimizer.step()
-
+            # Record history before updating parameters
             current_loss = loss.item()
             loss_history.append(current_loss)
+            
+            # Save parameter and gradient history
+            param_history['rvec'].append(self.rvec.clone())
+            param_history['tvec'].append(self.tvec.clone())
+            grad_history['rvec'].append(self.rvec.grad.clone())
+            grad_history['tvec'].append(self.tvec.grad.clone())
+
+            # パラメータ更新
+            optimizer.step()
 
             # 収束判定
             loss_diff = abs(prev_loss_val - current_loss)
@@ -839,25 +863,23 @@ class OptimalTransportSolver:
                 grad_t = self.tvec.grad.norm().item()
                 pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
 
-                # Transport matrix 可視化
+                # Transport matrix visualization code (unchanged from original)
                 if iteration % 10 == 0 or iteration == max_iter - 1:
                     with torch.no_grad():
                         t_np = transport.detach().cpu().numpy()
                         
-                        # 行列の次元に応じてサイズとアスペクト比を調整
                         rows, cols = t_np.shape
                         aspect_ratio = cols / rows
                         
                         if rows > cols:
-                            fig_width = 8  # 基本幅
-                            fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
+                            fig_width = 8
+                            fig_height = min(20, fig_width / aspect_ratio)
                         else:
-                            fig_height = 6  # 基本高さ
-                            fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
+                            fig_height = 6
+                            fig_width = min(20, fig_height * aspect_ratio)
                         
                         plt.figure(figsize=(fig_width, fig_height))
                         
-                        # 大きな行列の場合はダウンサンプリング
                         if rows > 1000 or cols > 1000:
                             downsample_factor = max(1, int(max(rows, cols) / 1000))
                             t_np_display = t_np[::downsample_factor, ::downsample_factor]
@@ -871,23 +893,19 @@ class OptimalTransportSolver:
                         plt.xlabel("Image 2 Gaussians")
                         plt.ylabel("Image 1 Gaussians")
                         
-                        # 軸ラベルの位置調整
                         plt.tight_layout()
                         plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
                         plt.savefig(plt_path, dpi=150)
                         plt.close()
 
-        # print("Optimized rvec:", self.rvec)
-        # print("Optimized tvec:", self.tvec)
-
-        # build_f_from_rt から最終Fを取り出す
+        # Build final F from the optimized R,t
         final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
-        # print("Final F:\n", final_F.cpu().numpy())
 
-        # solver.f にコピー
+        # Save to solver.f
         with torch.no_grad():
             self.f = final_F
 
+        # Plot basic loss history
         plt.figure()
         plt.plot(loss_history, '-o')
         plt.title("Loss (optimize_with_RT)")
@@ -896,11 +914,31 @@ class OptimalTransportSolver:
         plt.grid(True)
         plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
         plt.close()
+        
+        # Save detailed diagnostics if requested
+        if save_diagnostics:
+            self.save_optimization_diagnostics(
+                output_dir=diagnostics_dir,
+                loss_history=loss_history,
+                param_history=param_history,
+                grad_history=grad_history
+            )
 
-    def optimize_with_RT_C2W(self, max_iter=1000, tol=1e-6):
+    def optimize_with_RT_C2W(self, max_iter=1000, tol=1e-6, save_diagnostics=True, diagnostics_dir=None):
         """Camera-to-Worldパラメータ(カメラの回転と中心位置)を最適化してFを構築。
         カメラ中心位置とカメラ座標系→ワールド座標系の回転を最適化するため勾配のスケールが揃いやすい。
+        
+        Args:
+            max_iter: Maximum number of iterations
+            tol: Convergence tolerance
+            save_diagnostics: Whether to save detailed diagnostic information
+            diagnostics_dir: Directory to save diagnostics (default: results/diagnostics_c2w)
         """
+        # History tracking for diagnostics
+        loss_history = []
+        param_history = {'rvec_cw': [], 'center': []}
+        grad_history = {'rvec_cw': [], 'center': []}
+        
         # C2Wパラメータの初期化
         if not hasattr(self, 'rvec_cw'):
             self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
@@ -908,16 +946,19 @@ class OptimalTransportSolver:
             # カメラ中心位置：少し離れた位置に初期化
             self.center = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
         
-        # optimizer = torch.optim.Adam([self.rvec_cw, self.center], lr=1e-3)
         optimizer = torch.optim.Adam([
-            {'params': self.rvec_cw, 'lr': 1e-3},
-            {'params': self.center, 'lr': 1e-3} 
+            {'params': self.rvec_cw, 'lr': 5e-2},
+            {'params': self.center, 'lr': 5e-2} 
         ])
         prev_loss_val = float('inf')
-        loss_history = []
 
-        transport_dir = os.path.join("results", "transport_RT")
+        transport_dir = os.path.join("results", "transport_RT_C2W")
         os.makedirs(transport_dir, exist_ok=True)
+
+        if diagnostics_dir is None:
+            diagnostics_dir = os.path.join("results", "diagnostics_c2w")
+        
+        os.makedirs(diagnostics_dir, exist_ok=True)
 
         pbar = tqdm(range(max_iter), desc="Optimizing C2W", leave=True)
         
@@ -939,11 +980,18 @@ class OptimalTransportSolver:
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
 
-            # パラメータ更新
-            optimizer.step()
-
+            # Record history before updating parameters
             current_loss = loss.item()
             loss_history.append(current_loss)
+            
+            # Save parameter and gradient history
+            param_history['rvec_cw'].append(self.rvec_cw.clone())
+            param_history['center'].append(self.center.clone())
+            grad_history['rvec_cw'].append(self.rvec_cw.grad.clone() if self.rvec_cw.grad is not None else None)
+            grad_history['center'].append(self.center.grad.clone() if self.center.grad is not None else None)
+
+            # パラメータ更新
+            optimizer.step()
 
             # 収束判定
             loss_diff = abs(prev_loss_val - current_loss)
@@ -957,25 +1005,25 @@ class OptimalTransportSolver:
                 grad_c = self.center.grad.norm().item() if self.center.grad is not None else 0
                 pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_c=f"{grad_c:.6f}")
 
-                # Transport matrix 可視化 (元のコードと同じ)
+                # Transport matrix visualization (as in the original code)
                 if iteration % 10 == 0 or iteration == max_iter - 1:
                     with torch.no_grad():
                         t_np = transport.detach().cpu().numpy()
                         
-                        # 行列の次元に応じてサイズとアスペクト比を調整
+                        # Row/column dimensions and aspect ratio adjustment
                         rows, cols = t_np.shape
                         aspect_ratio = cols / rows
                         
                         if rows > cols:
-                            fig_width = 8  # 基本幅
-                            fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
+                            fig_width = 8
+                            fig_height = min(20, fig_width / aspect_ratio)
                         else:
-                            fig_height = 6  # 基本高さ
-                            fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
+                            fig_height = 6
+                            fig_width = min(20, fig_height * aspect_ratio)
                         
                         plt.figure(figsize=(fig_width, fig_height))
                         
-                        # 大きな行列の場合はダウンサンプリング
+                        # Downsampling for large matrices
                         if rows > 1000 or cols > 1000:
                             downsample_factor = max(1, int(max(rows, cols) / 1000))
                             t_np_display = t_np[::downsample_factor, ::downsample_factor]
@@ -989,7 +1037,6 @@ class OptimalTransportSolver:
                         plt.xlabel("Image 2 Gaussians")
                         plt.ylabel("Image 1 Gaussians")
                         
-                        # 軸ラベルの位置調整
                         plt.tight_layout()
                         plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
                         plt.savefig(plt_path, dpi=150)
@@ -1014,12 +1061,522 @@ class OptimalTransportSolver:
             self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
             self.tvec = nn.Parameter(t_wc)
 
+        # Basic loss plot
         plt.figure()
         plt.plot(loss_history, '-o')
-        plt.title("Loss (optimize_with_RT)")
+        plt.title("Loss (optimize_with_RT_C2W)")
         plt.xlabel("Iteration")
         plt.ylabel("Loss")
         plt.grid(True)
-        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
+        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT_C2W.png"))
         plt.close()
+        
+        # Save detailed diagnostics if requested
+        if save_diagnostics:
+            self.save_optimization_diagnostics_C2W(
+                output_dir=diagnostics_dir,
+                loss_history=loss_history,
+                param_history=param_history,
+                grad_history=grad_history
+            )
 
+    def save_optimization_diagnostics(self, 
+                                    output_dir: str,
+                                    loss_history: list,
+                                    param_history: dict,
+                                    grad_history: dict) -> None:
+        """Save detailed diagnostics about the optimization process.
+        
+        Analyzes and visualizes the optimization process, including:
+        - Loss trajectory
+        - Parameter evolution (R, t)
+        - Gradient behavior
+        - Convergence analysis
+        
+        Args:
+            output_dir: Directory to save diagnostic files
+            loss_history: List of loss values at each iteration
+            param_history: Dictionary of parameter histories (e.g. {'rvec': [...], 'tvec': [...]})
+            grad_history: Dictionary of gradient histories corresponding to parameters
+        """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert histories to numpy arrays
+        param_history_np = {}
+        grad_history_np = {}
+        
+        for param_name, history in param_history.items():
+            param_history_np[param_name] = np.array([p.detach().cpu().numpy() for p in history])
+            
+        for param_name, history in grad_history.items():
+            grad_history_np[param_name] = np.array([g.detach().cpu().numpy() if g is not None 
+                                                else np.zeros_like(param_history_np[param_name][0]) 
+                                                for g in history])
+        
+        # Number of iterations
+        iterations = range(len(loss_history))
+        
+        # 1. Loss Trajectory Analysis
+        plt.figure(figsize=(12, 8))
+        plt.subplot(211)
+        plt.plot(iterations, loss_history, 'b-', linewidth=2)
+        plt.title('Loss Value During Optimization')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        
+        # Plot loss changes (derivative) to see stability
+        if len(loss_history) > 1:
+            plt.subplot(212)
+            loss_changes = np.array([loss_history[i+1] - loss_history[i] 
+                                    for i in range(len(loss_history)-1)])
+            plt.plot(iterations[:-1], loss_changes, 'r-')
+            plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            plt.title('Loss Change Between Iterations')
+            plt.xlabel('Iteration')
+            plt.ylabel('Loss Difference')
+            plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'loss_analysis.png'), dpi=150)
+        plt.close()
+        
+        # 2. Parameter Trajectory Analysis for each parameter
+        for param_name, param_data in param_history_np.items():
+            if param_data.shape[1] == 3:  # For 3D vectors like rvec or tvec
+                fig = plt.figure(figsize=(15, 5))
+                plt.plot(iterations, param_data[:, 0], 'r-', label=f'{param_name}[0]')
+                plt.plot(iterations, param_data[:, 1], 'g-', label=f'{param_name}[1]')
+                plt.plot(iterations, param_data[:, 2], 'b-', label=f'{param_name}[2]')
+                plt.title(f'{param_name} Components Over Time')
+                plt.xlabel('Iteration')
+                plt.ylabel('Value')
+                plt.grid(True)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{param_name}_trajectory.png'), dpi=150)
+                plt.close()
+                
+                # 3D Visualization of Parameter Trajectory
+                fig = plt.figure(figsize=(10, 8))
+                ax = fig.add_subplot(111, projection='3d')
+                ax.plot(param_data[:, 0], param_data[:, 1], param_data[:, 2], 'r-', linewidth=2)
+                ax.scatter(param_data[0, 0], param_data[0, 1], param_data[0, 2], c='g', s=100, label='Initial')
+                ax.scatter(param_data[-1, 0], param_data[-1, 1], param_data[-1, 2], c='b', s=100, label='Final')
+                ax.set_title(f'{param_name} Trajectory in 3D')
+                ax.set_xlabel(f'{param_name}[0]')
+                ax.set_ylabel(f'{param_name}[1]')
+                ax.set_zlabel(f'{param_name}[2]')
+                ax.legend()
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{param_name}_3d_trajectory.png'), dpi=150)
+                plt.close()
+        
+        # 3. Gradient Analysis for each parameter
+        for param_name, grad_data in grad_history_np.items():
+            if grad_data.shape[1] == 3:  # For 3D vectors
+                # Gradient magnitude
+                grad_magnitude = np.linalg.norm(grad_data, axis=1)
+                
+                fig = plt.figure(figsize=(15, 10))
+                gs = GridSpec(2, 2, figure=fig)
+                
+                # Plot gradient magnitude
+                ax1 = fig.add_subplot(gs[0, :])
+                ax1.plot(iterations, grad_magnitude, 'r-', linewidth=2)
+                ax1.set_title(f'{param_name} Gradient Magnitude')
+                ax1.set_xlabel('Iteration')
+                ax1.set_ylabel('Gradient Norm')
+                ax1.set_yscale('log')  # Log scale to better see changes
+                ax1.grid(True)
+                
+                # Plot gradient components
+                ax2 = fig.add_subplot(gs[1, :])
+                ax2.plot(iterations, grad_data[:, 0], 'r-', label=f'grad_{param_name}[0]')
+                ax2.plot(iterations, grad_data[:, 1], 'g-', label=f'grad_{param_name}[1]')
+                ax2.plot(iterations, grad_data[:, 2], 'b-', label=f'grad_{param_name}[2]')
+                ax2.set_title(f'{param_name} Gradient Components')
+                ax2.set_xlabel('Iteration')
+                ax2.set_ylabel('Gradient Value')
+                ax2.grid(True)
+                ax2.legend()
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{param_name}_gradient_analysis.png'), dpi=150)
+                plt.close()
+        
+        # 4. Generate a text report with analysis
+        with open(os.path.join(output_dir, 'optimization_analysis.txt'), 'w') as f:
+            f.write("OPTIMIZATION PROCESS ANALYSIS\n")
+            f.write("===========================\n\n")
+            
+            # Loss analysis
+            f.write("1. LOSS BEHAVIOR\n")
+            f.write("----------------\n")
+            initial_loss = loss_history[0]
+            final_loss = loss_history[-1]
+            loss_reduction = (initial_loss - final_loss) / initial_loss * 100 if initial_loss != 0 else 0
+            
+            f.write(f"Initial loss: {initial_loss:.6f}\n")
+            f.write(f"Final loss: {final_loss:.6f}\n")
+            f.write(f"Total loss reduction: {loss_reduction:.2f}%\n\n")
+            
+            # Monotonicity check
+            is_monotonic = all(loss_history[i] >= loss_history[i+1] for i in range(len(loss_history)-1))
+            f.write(f"Loss decreases monotonically: {is_monotonic}\n")
+            
+            # Find oscillations or plateaus
+            oscillation_count = sum(1 for i in range(len(loss_history)-2) 
+                                if (loss_history[i] > loss_history[i+1] and 
+                                    loss_history[i+1] < loss_history[i+2]))
+            
+            plateau_threshold = 1e-6  # Define what constitutes a plateau
+            plateau_count = sum(1 for i in range(len(loss_history)-1) 
+                            if abs(loss_history[i] - loss_history[i+1]) < plateau_threshold)
+            
+            f.write(f"Number of oscillations: {oscillation_count}\n")
+            f.write(f"Number of plateaus: {plateau_count}\n\n")
+            
+            # Parameter analysis for each parameter
+            f.write("2. PARAMETER BEHAVIOR\n")
+            f.write("---------------------\n")
+            for param_name, param_data in param_history_np.items():
+                f.write(f"{param_name} (initial): " + np.array2string(param_data[0], precision=6) + "\n")
+                f.write(f"{param_name} (final): " + np.array2string(param_data[-1], precision=6) + "\n")
+                param_change = np.linalg.norm(param_data[-1] - param_data[0])
+                f.write(f"Total {param_name} change magnitude: {param_change:.6f}\n\n")
+            
+            # Gradient analysis for each parameter
+            f.write("3. GRADIENT BEHAVIOR\n")
+            f.write("-------------------\n")
+            for param_name, grad_data in grad_history_np.items():
+                grad_magnitude = np.linalg.norm(grad_data, axis=1)
+                max_grad = np.max(grad_magnitude)
+                min_grad = np.min(grad_magnitude)
+                avg_grad = np.mean(grad_magnitude)
+                
+                f.write(f"{param_name} gradient - Max: {max_grad:.6f}, Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n")
+                
+                # Check for vanishing/exploding gradients
+                vanishing_threshold = 1e-6
+                exploding_threshold = 1e2
+                
+                vanishing_grad = any(grad < vanishing_threshold for grad in grad_magnitude)
+                exploding_grad = any(grad > exploding_threshold for grad in grad_magnitude)
+                
+                f.write(f"{param_name} gradient vanishing: {vanishing_grad}\n")
+                f.write(f"{param_name} gradient exploding: {exploding_grad}\n\n")
+            
+            # Correlation analysis between parameters and gradients
+            f.write("4. PARAMETER-GRADIENT RELATIONSHIPS\n")
+            f.write("----------------------------------\n")
+            
+            for param_name, param_data in param_history_np.items():
+                grad_data = grad_history_np[param_name]
+                
+                # Calculate parameter change and gradient magnitude for each step
+                if len(param_data) > 1:
+                    param_changes = np.linalg.norm(param_data[1:] - param_data[:-1], axis=1)
+                    grad_magnitudes = np.linalg.norm(grad_data[:-1], axis=1)
+                    
+                    # Compute correlation if there are enough data points
+                    if len(param_changes) > 2:
+                        try:
+                            correlation = np.corrcoef(grad_magnitudes, param_changes)[0, 1]
+                            f.write(f"{param_name} gradient-change correlation: {correlation:.6f}\n")
+                            f.write(f"  (positive value suggests effective gradient descent; negative or zero suggests issues)\n\n")
+                        except:
+                            f.write(f"{param_name} gradient-change correlation: Could not compute\n\n")
+            
+            # Conclusion
+            f.write("5. CONCLUSION\n")
+            f.write("-------------\n")
+            
+            # Determine if the optimization was successful
+            successful = loss_reduction > 50 and final_loss < initial_loss * 0.5
+            
+            if successful:
+                f.write("Optimization appears to be SUCCESSFUL based on significant loss reduction.\n\n")
+            else:
+                f.write("Optimization may have ISSUES based on limited loss reduction.\n\n")
+                
+            # Report potential issues
+            issues = []
+            if not is_monotonic and oscillation_count > len(loss_history) * 0.1:
+                issues.append("- Loss exhibits significant oscillations, suggesting unstable optimization.")
+                
+            if plateau_count > len(loss_history) * 0.3:
+                issues.append("- Loss exhibits plateaus, suggesting the optimizer may be struggling to make progress.")
+                
+            # Check for vanishing or exploding gradients across all parameters
+            any_vanishing = any(
+                np.any(np.linalg.norm(grad_history_np[param_name], axis=1) < vanishing_threshold)
+                for param_name in grad_history_np
+            )
+            
+            any_exploding = any(
+                np.any(np.linalg.norm(grad_history_np[param_name], axis=1) > exploding_threshold)
+                for param_name in grad_history_np
+            )
+            
+            if any_vanishing:
+                issues.append("- Gradients approach zero, suggesting vanishing gradient issues.")
+                
+            if any_exploding:
+                issues.append("- Gradients are very large, suggesting exploding gradient issues.")
+            
+            if issues:
+                f.write("Potential issues detected:\n")
+                for issue in issues:
+                    f.write(issue + "\n")
+            else:
+                f.write("No significant optimization issues detected.\n")
+            
+        print(f"Saved optimization diagnostics to {output_dir}")
+
+
+    def save_optimization_diagnostics_C2W(self, 
+                                    output_dir: str,
+                                    loss_history: list,
+                                    param_history: dict,
+                                    grad_history: dict) -> None:
+        """Save detailed diagnostics about the optimization process.
+        
+        Analyzes and visualizes the optimization process, including:
+        - Loss trajectory
+        - Parameter evolution
+        - Gradient behavior
+        - Convergence analysis
+        
+        Args:
+            output_dir: Directory to save diagnostic files
+            loss_history: List of loss values at each iteration
+            param_history: Dictionary of parameter histories (e.g. {'rvec': [...], 'tvec': [...]})
+            grad_history: Dictionary of gradient histories corresponding to parameters
+        """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert histories to numpy arrays
+        param_history_np = {}
+        grad_history_np = {}
+        
+        for param_name, history in param_history.items():
+            param_history_np[param_name] = np.array([p.detach().cpu().numpy() for p in history])
+            
+        for param_name, history in grad_history.items():
+            grad_history_np[param_name] = np.array([g.detach().cpu().numpy() if g is not None 
+                                                else np.zeros_like(param_history_np[param_name][0]) 
+                                                for g in history])
+        
+        # Number of iterations
+        iterations = range(len(loss_history))
+        
+        # 1. Loss Trajectory Analysis
+        plt.figure(figsize=(12, 8))
+        plt.subplot(211)
+        plt.plot(iterations, loss_history, 'b-', linewidth=2)
+        plt.title('Loss Value During Optimization')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        
+        # Plot loss changes (derivative) to see stability
+        plt.subplot(212)
+        loss_changes = np.array([loss_history[i+1] - loss_history[i] 
+                                for i in range(len(loss_history)-1)])
+        plt.plot(iterations[:-1], loss_changes, 'r-')
+        plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        plt.title('Loss Change Between Iterations')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss Difference')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'loss_analysis.png'), dpi=150)
+        plt.close()
+        
+        # 2. Parameter Trajectory Analysis for each parameter
+        for param_name, param_data in param_history_np.items():
+            if param_data.shape[1] == 3:  # For 3D vectors like rvec or center
+                fig = plt.figure(figsize=(15, 5))
+                plt.plot(iterations, param_data[:, 0], 'r-', label=f'{param_name}[0]')
+                plt.plot(iterations, param_data[:, 1], 'g-', label=f'{param_name}[1]')
+                plt.plot(iterations, param_data[:, 2], 'b-', label=f'{param_name}[2]')
+                plt.title(f'{param_name} Components Over Time')
+                plt.xlabel('Iteration')
+                plt.ylabel('Value')
+                plt.grid(True)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{param_name}_trajectory.png'), dpi=150)
+                plt.close()
+                
+                # 3D Visualization of Parameter Trajectory
+                fig = plt.figure(figsize=(10, 8))
+                ax = fig.add_subplot(111, projection='3d')
+                ax.plot(param_data[:, 0], param_data[:, 1], param_data[:, 2], 'r-', linewidth=2)
+                ax.scatter(param_data[0, 0], param_data[0, 1], param_data[0, 2], c='g', s=100, label='Initial')
+                ax.scatter(param_data[-1, 0], param_data[-1, 1], param_data[-1, 2], c='b', s=100, label='Final')
+                ax.set_title(f'{param_name} Trajectory in 3D')
+                ax.set_xlabel(f'{param_name}[0]')
+                ax.set_ylabel(f'{param_name}[1]')
+                ax.set_zlabel(f'{param_name}[2]')
+                ax.legend()
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{param_name}_3d_trajectory.png'), dpi=150)
+                plt.close()
+        
+        # 3. Gradient Analysis for each parameter
+        for param_name, grad_data in grad_history_np.items():
+            if grad_data.shape[1] == 3:  # For 3D vectors
+                # Gradient magnitude
+                grad_magnitude = np.linalg.norm(grad_data, axis=1)
+                
+                fig = plt.figure(figsize=(15, 10))
+                gs = GridSpec(2, 2, figure=fig)
+                
+                # Plot gradient magnitude
+                ax1 = fig.add_subplot(gs[0, :])
+                ax1.plot(iterations, grad_magnitude, 'r-', linewidth=2)
+                ax1.set_title(f'{param_name} Gradient Magnitude')
+                ax1.set_xlabel('Iteration')
+                ax1.set_ylabel('Gradient Norm')
+                ax1.set_yscale('log')  # Log scale to better see changes
+                ax1.grid(True)
+                
+                # Plot gradient components
+                ax2 = fig.add_subplot(gs[1, :])
+                ax2.plot(iterations, grad_data[:, 0], 'r-', label=f'grad_{param_name}[0]')
+                ax2.plot(iterations, grad_data[:, 1], 'g-', label=f'grad_{param_name}[1]')
+                ax2.plot(iterations, grad_data[:, 2], 'b-', label=f'grad_{param_name}[2]')
+                ax2.set_title(f'{param_name} Gradient Components')
+                ax2.set_xlabel('Iteration')
+                ax2.set_ylabel('Gradient Value')
+                ax2.grid(True)
+                ax2.legend()
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{param_name}_gradient_analysis.png'), dpi=150)
+                plt.close()
+        
+        # 4. Generate a text report with analysis
+        with open(os.path.join(output_dir, 'optimization_analysis.txt'), 'w') as f:
+            f.write("OPTIMIZATION PROCESS ANALYSIS\n")
+            f.write("===========================\n\n")
+            
+            # Loss analysis
+            f.write("1. LOSS BEHAVIOR\n")
+            f.write("----------------\n")
+            initial_loss = loss_history[0]
+            final_loss = loss_history[-1]
+            loss_reduction = (initial_loss - final_loss) / initial_loss * 100 if initial_loss != 0 else 0
+            
+            f.write(f"Initial loss: {initial_loss:.6f}\n")
+            f.write(f"Final loss: {final_loss:.6f}\n")
+            f.write(f"Total loss reduction: {loss_reduction:.2f}%\n\n")
+            
+            # Monotonicity check
+            is_monotonic = all(loss_history[i] >= loss_history[i+1] for i in range(len(loss_history)-1))
+            f.write(f"Loss decreases monotonically: {is_monotonic}\n")
+            
+            # Find oscillations or plateaus
+            oscillation_count = sum(1 for i in range(len(loss_history)-2) 
+                                if (loss_history[i] > loss_history[i+1] and 
+                                    loss_history[i+1] < loss_history[i+2]))
+            
+            plateau_threshold = 1e-6  # Define what constitutes a plateau
+            plateau_count = sum(1 for i in range(len(loss_history)-1) 
+                            if abs(loss_history[i] - loss_history[i+1]) < plateau_threshold)
+            
+            f.write(f"Number of oscillations: {oscillation_count}\n")
+            f.write(f"Number of plateaus: {plateau_count}\n\n")
+            
+            # Parameter analysis for each parameter
+            f.write("2. PARAMETER BEHAVIOR\n")
+            f.write("---------------------\n")
+            for param_name, param_data in param_history_np.items():
+                f.write(f"{param_name} (initial): " + np.array2string(param_data[0], precision=6) + "\n")
+                f.write(f"{param_name} (final): " + np.array2string(param_data[-1], precision=6) + "\n")
+                param_change = np.linalg.norm(param_data[-1] - param_data[0])
+                f.write(f"Total {param_name} change magnitude: {param_change:.6f}\n\n")
+            
+            # Gradient analysis for each parameter
+            f.write("3. GRADIENT BEHAVIOR\n")
+            f.write("-------------------\n")
+            for param_name, grad_data in grad_history_np.items():
+                grad_magnitude = np.linalg.norm(grad_data, axis=1)
+                max_grad = np.max(grad_magnitude)
+                min_grad = np.min(grad_magnitude)
+                avg_grad = np.mean(grad_magnitude)
+                
+                f.write(f"{param_name} gradient - Max: {max_grad:.6f}, Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n")
+                
+                # Check for vanishing/exploding gradients
+                vanishing_threshold = 1e-6
+                exploding_threshold = 1e2
+                
+                vanishing_grad = any(grad < vanishing_threshold for grad in grad_magnitude)
+                exploding_grad = any(grad > exploding_threshold for grad in grad_magnitude)
+                
+                f.write(f"{param_name} gradient vanishing: {vanishing_grad}\n")
+                f.write(f"{param_name} gradient exploding: {exploding_grad}\n\n")
+            
+            # Conclusion
+            f.write("4. CONCLUSION\n")
+            f.write("-------------\n")
+            
+            # Determine if the optimization was successful
+            successful = loss_reduction > 50 and final_loss < initial_loss * 0.5
+            
+            if successful:
+                f.write("Optimization appears to be SUCCESSFUL based on significant loss reduction.\n\n")
+            else:
+                f.write("Optimization may have ISSUES based on limited loss reduction.\n\n")
+                
+            # Report potential issues
+            issues = []
+            if not is_monotonic and oscillation_count > len(loss_history) * 0.1:
+                issues.append("- Loss exhibits significant oscillations, suggesting unstable optimization.")
+                
+            if plateau_count > len(loss_history) * 0.3:
+                issues.append("- Loss exhibits plateaus, suggesting the optimizer may be struggling to make progress.")
+                
+            # Check for vanishing or exploding gradients across all parameters
+            any_vanishing = any(
+                np.any(np.linalg.norm(grad_history_np[param_name], axis=1) < vanishing_threshold)
+                for param_name in grad_history_np
+            )
+            
+            any_exploding = any(
+                np.any(np.linalg.norm(grad_history_np[param_name], axis=1) > exploding_threshold)
+                for param_name in grad_history_np
+            )
+            
+            if any_vanishing:
+                issues.append("- Gradients approach zero, suggesting vanishing gradient issues.")
+                
+            if any_exploding:
+                issues.append("- Gradients are very large, suggesting exploding gradient issues.")
+            
+            if issues:
+                f.write("Potential issues detected:\n")
+                for issue in issues:
+                    f.write(issue + "\n")
+            else:
+                f.write("No significant optimization issues detected.\n")
+            
+        print(f"Saved optimization diagnostics to {output_dir}")
