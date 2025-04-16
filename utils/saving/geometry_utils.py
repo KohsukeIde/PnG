@@ -23,10 +23,62 @@ def sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta=12, n_phi=12):
     if isinstance(center, torch.Tensor):
         center = center.detach().cpu().numpy()
     
-    eigvals, eigvecs = np.linalg.eigh(Sigma_3)
-    eigvals = np.clip(eigvals, 1e-12, None)
-    scales = np.sqrt(eigvals)
-    sqrtSigma = eigvecs @ np.diag(scales) @ eigvecs.T
+    # エラー診断のための前処理
+    def diagnose_matrix(matrix):
+        error_info = []
+        
+        # 行列の形状確認
+        if matrix.shape != (3, 3):
+            error_info.append(f"Invalid matrix shape: {matrix.shape}, expected (3, 3)")
+        
+        # NaNや無限大のチェック
+        if np.isnan(matrix).any():
+            error_info.append(f"Matrix contains NaN values: {matrix}")
+        if np.isinf(matrix).any():
+            error_info.append(f"Matrix contains infinite values: {matrix}")
+        
+        # 対称性チェック
+        sym_diff = np.max(np.abs(matrix - matrix.T))
+        if sym_diff > 1e-6:
+            error_info.append(f"Matrix is not symmetric. Max difference: {sym_diff}")
+            error_info.append(f"Matrix: {matrix}")
+        
+        # 行列の条件数
+        try:
+            eigvals = np.linalg.eigvalsh(matrix)
+            if np.min(eigvals) <= 0:
+                error_info.append(f"Matrix is not positive definite. Eigenvalues: {eigvals}")
+            
+            if np.max(eigvals) / np.max(np.abs(np.min(eigvals)), 1e-10) > 1e8:
+                error_info.append(f"Matrix is ill-conditioned. Eigenvalues: {eigvals}")
+        except Exception as e:
+            error_info.append(f"Could not compute eigenvalues: {e}")
+        
+        return error_info
+    
+    # 共分散行列の診断
+    error_messages = diagnose_matrix(Sigma_3)
+    
+    try:
+        eigvals, eigvecs = np.linalg.eigh(Sigma_3)
+        eigvals = np.clip(eigvals, 1e-12, None)
+        scales = np.sqrt(eigvals)
+        sqrtSigma = eigvecs @ np.diag(scales) @ eigvecs.T
+    except np.linalg.LinAlgError as e:
+        # 詳細なエラー情報を出力
+        error_report = "\n".join([
+            "固有値分解に失敗しました。共分散行列の診断結果:",
+            f"共分散行列: {Sigma_3}",
+            f"行列の次元: {Sigma_3.shape}",
+            f"行列の要素の範囲: {np.min(Sigma_3)} to {np.max(Sigma_3)}",
+            f"行列の対角要素: {np.diag(Sigma_3)}",
+            f"行列のトレース: {np.trace(Sigma_3)}"
+        ])
+        
+        if error_messages:
+            error_report += "\n検出された問題:\n" + "\n".join(error_messages)
+        
+        raise ValueError(f"共分散行列の固有値分解エラー: {e}\n{error_report}")
 
     vertices = []
     faces = []
@@ -148,6 +200,14 @@ def create_camera_frustum_mesh(
         i1 = 5 + i
         i2 = 5 + ((i+1) % 4)
         frustum_faces.append([i0, i1, i2])
+
+    # near-plane ring => 2 triangles
+    frustum_faces.append([1,2,3])
+    frustum_faces.append([1,3,4])
+
+    # far-plane ring => 2 triangles
+    frustum_faces.append([5,6,7])
+    frustum_faces.append([5,7,8])
 
     # near-plane ring => 2 triangles
     frustum_faces.append([1,2,3])
