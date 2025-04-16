@@ -65,9 +65,8 @@ def sample_ellipsoid_vertices_and_faces(Sigma_3, center, n_theta=12, n_phi=12):
         scales = np.sqrt(eigvals)
         sqrtSigma = eigvecs @ np.diag(scales) @ eigvecs.T
     except np.linalg.LinAlgError as e:
-        # 詳細なエラー情報を出力
         error_report = "\n".join([
-            "固有値分解に失敗しました。共分散行列の診断結果:",
+            "failed to decompose covariance matrix.",
             f"共分散行列: {Sigma_3}",
             f"行列の次元: {Sigma_3.shape}",
             f"行列の要素の範囲: {np.min(Sigma_3)} to {np.max(Sigma_3)}",
@@ -200,14 +199,6 @@ def create_camera_frustum_mesh(
         i1 = 5 + i
         i2 = 5 + ((i+1) % 4)
         frustum_faces.append([i0, i1, i2])
-
-    # near-plane ring => 2 triangles
-    frustum_faces.append([1,2,3])
-    frustum_faces.append([1,3,4])
-
-    # far-plane ring => 2 triangles
-    frustum_faces.append([5,6,7])
-    frustum_faces.append([5,7,8])
 
     # near-plane ring => 2 triangles
     frustum_faces.append([1,2,3])
