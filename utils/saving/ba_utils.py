@@ -65,15 +65,18 @@ def visualize_ba_comparison(
     # BA前後の対応を線で結ぶ
     for i in range(len(initial_2d_gaussians.means)):
         plt.plot([initial_2d_gaussians.means[i, 0], final_2d_gaussians.means[i, 0]],
-                 [initial_2d_gaussians.means[i, 1], final_2d_gaussians.means[i, 1]],
-                 'r-', alpha=0.3)
-    
-    plt.scatter(initial_2d_gaussians.means[:, 0], 
-                initial_2d_gaussians.means[:, 1], 
-                c='red', alpha=0.5, label='Before BA')
+                [initial_2d_gaussians.means[i, 1], final_2d_gaussians.means[i, 1]],
+                'r-', alpha=0.3)
+
+    # 順序を変更: まず「After BA」を描画し、その後「Before BA」を描画
     plt.scatter(final_2d_gaussians.means[:, 0], 
                 final_2d_gaussians.means[:, 1], 
                 c='green', alpha=0.5, label='After BA')
+                
+    # 「Before BA」をより目立つようにする
+    plt.scatter(initial_2d_gaussians.means[:, 0], 
+                initial_2d_gaussians.means[:, 1], 
+                c='red', alpha=0.8, s=25, marker='x', label='Before BA')
     plt.title('BA Movement')
     plt.legend()
     
