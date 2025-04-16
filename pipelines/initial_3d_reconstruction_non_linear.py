@@ -53,26 +53,26 @@ def parse_args():
     parser.add_argument(
         "--image1_name",
         type=str,
-        default="0022.png",
+        default="0009.png",
         help="Filename of the first image."
     )
     parser.add_argument(
         "--image2_name",
         type=str,
-        default="0023.png",
+        default="0012.png",
         help="Filename of the second image."
     )
     parser.add_argument(
         "--gaussians1_filename",
         type=str,
-        default="0022_fitted_gaussians.pkl",
+        default="0009_fitted_gaussians.pkl",
         # default="fitted_gaussians_0022.pkl",
         help="Filename of the first fitted Gaussians pickle."
     )
     parser.add_argument(
         "--gaussians2_filename",
         type=str,
-        default="0023_fitted_gaussians.pkl",
+        default="0012_fitted_gaussians.pkl",
         # default="fitted_gaussians_0023.pkl",
         help="Filename of the second fitted Gaussians pickle."
     )
@@ -97,7 +97,7 @@ def parse_args():
     parser.add_argument(
         "--render_gaussians",
         action="store_true",
-        default=False,
+        default=True,
         help="Render Gaussians for OT optimized/SIFT base camera pose."
     )
 
@@ -1259,8 +1259,8 @@ def main():
         epsilon=0.01,
         lambda_mean=0.0,
         lambda_cov=0.0,
-        lambda_color=0.2,
-        lambda_epipolar=0.8,
+        lambda_color=0.5,
+        lambda_epipolar=0.5,
         device=device
     )
 
