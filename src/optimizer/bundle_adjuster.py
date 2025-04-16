@@ -6,6 +6,7 @@ import os
 from typing import List, Dict, Tuple, Optional
 import scipy.sparse as sp
 from scipy.optimize import least_squares
+from .point_id_manager import PointIDManager
 
 class BundleAdjuster:
     """
@@ -14,48 +15,47 @@ class BundleAdjuster:
     Uses a COLMAP-like approach with staged optimization and point-centered observations.
     Camera poses are parameterized as camera-to-world (inverse) transformations,
     aligning with modern SfM methods like COLMAP.
+    
+    This implementation uses persistent point IDs via PointIDManager to maintain
+    consistent observation tracking throughout the reconstruction process.
     """
     
     def __init__(
         self,
-        points_3d: np.ndarray,
-        camera_params_list: List[Tuple[np.ndarray, np.ndarray]],
-        match_points_2d: List[List[Tuple[int, np.ndarray]]],
-        intrinsics_list: List[np.ndarray],
-        image_names: Optional[List[str]] = None,
+        point_id_manager: PointIDManager,
         use_robust_loss: bool = True,
         loss_scale: float = 2.0  # Default scale similar to COLMAP
     ):
-        """Initialize the Bundle Adjuster with COLMAP-like structure.
+        """Initialize the Bundle Adjuster with COLMAP-like structure using persistent point IDs.
         
         Args:
-            points_3d: 3D point coordinates with shape [N, 3] in world space
-            camera_params_list: List of (R, t) camera parameters where R is world-to-camera rotation
-                                and t is world-to-camera translation. We will convert to camera-to-world.
-            match_points_2d: For each camera, list of (point_idx, [x, y]) observations
-            intrinsics_list: List of camera intrinsic matrices K
-            image_names: Optional list of image names for COLMAP export
+            point_id_manager: Point ID manager containing points, cameras and observations
             use_robust_loss: Whether to use robust loss function
             loss_scale: Scale parameter for robust loss (default 2.0 like COLMAP)
         """
-        self.points_3d = points_3d.copy()
-        self.intrinsics_list = intrinsics_list
-        self.match_points_2d = match_points_2d
-        self.image_names = image_names
+        self.point_id_manager = point_id_manager
         self.use_robust_loss = use_robust_loss
         self.loss_scale = loss_scale
         
-        # Convert world-to-camera (R, t) to camera-to-world (R_inv, c) representation
-        # This is the inverse parameterization used by COLMAP, iNeRF, etc.
+        # Use all points from the point manager without filtering
+        self.point_ids = list(self.point_id_manager.points.keys())
+        
+        # Create optimization index mappings
+        self.point_id_to_index = {point_id: i for i, point_id in enumerate(self.point_ids)}
+        self.camera_id_to_index = {camera_id: i for i, camera_id 
+                                  in enumerate(sorted(self.point_id_manager.cameras.keys()))}
+        self.camera_index_to_id = {i: camera_id for camera_id, i 
+                                  in self.camera_id_to_index.items()}
+        
+        # Create optimization parameter arrays
+        self.points_3d = np.array([self.point_id_manager.points[point_id].position 
+                                  for point_id in self.point_ids])
+        
+        # Extract camera-to-world parameters
         self.camera_to_world_list = []
-        for R_wtc, t_wtc in camera_params_list:
-            # R_inverse: camera-to-world rotation 
-            R_ctw = R_wtc.T.copy()
-            
-            # c: camera center in world coordinates (c = -R_wtc^T * t_wtc)
-            c = -R_ctw @ t_wtc
-            
-            self.camera_to_world_list.append((R_ctw, c))
+        for camera_id in sorted(self.point_id_manager.cameras.keys()):
+            camera = self.point_id_manager.cameras[camera_id]
+            self.camera_to_world_list.append((camera.R, camera.c))
         
         # Convert camera rotations to rodrigues vectors for optimization
         self.rvecs = []
@@ -66,22 +66,28 @@ class BundleAdjuster:
         # Extract camera centers (c) in world coordinates
         self.centers = [c.flatten() for _, c in self.camera_to_world_list]
         
+        # Cache intrinsic matrices
+        self.intrinsics_list = []
+        for camera_id in sorted(self.point_id_manager.cameras.keys()):
+            camera = self.point_id_manager.cameras[camera_id]
+            self.intrinsics_list.append(camera.K)
+        
+        # Cache image names
+        self.image_names = []
+        for camera_id in sorted(self.point_id_manager.cameras.keys()):
+            camera = self.point_id_manager.cameras[camera_id]
+            self.image_names.append(camera.image_name)
+        
         # Number of cameras and points
         self.n_cameras = len(self.camera_to_world_list)
         self.n_points = len(self.points_3d)
         
-        # Build 3D point-centered observation structure (COLMAP style)
-        self.point3D_observations = {}  # point_id -> [(camera_id, point2D), ...]
-        
-        # Construct from existing correspondences
-        for cam_idx, observations in enumerate(self.match_points_2d):
-            for point_idx, point_2d in observations:
-                if point_idx not in self.point3D_observations:
-                    self.point3D_observations[point_idx] = []
-                self.point3D_observations[point_idx].append((cam_idx, point_2d))
-        
         # Count total observations for statistics
-        self.n_observations = sum(len(obs) for obs in self.match_points_2d)
+        self.n_observations = 0
+        for point_id in self.point_ids:
+            point = self.point_id_manager.points[point_id]
+            self.n_observations += len(point.observations)
+        
         print(f"Bundle Adjustment: {self.n_observations} observations across {self.n_cameras} cameras for {self.n_points} points")
         
     def _pack_parameters(self) -> np.ndarray:
@@ -126,12 +132,14 @@ class BundleAdjuster:
         """Compute reprojection error residuals using COLMAP-style point-centered approach.
         
         This implementation:
-        1. Iterates over 3D points and their observations
+        1. Iterates over 3D points and their observations using persistent point IDs
         2. Fills in placeholder values for invalid observations to maintain consistent array shape
         3. Properly handles points that might be behind cameras
         4. Uses camera-to-world parameterization (COLMAP style)
         """
-        self._unpack_parameters(params)
+        # Handle None params for staged optimization
+        if params is not None:
+            self._unpack_parameters(params)
         
         # Build a mapping of all possible residuals to ensure consistent output shape
         # Each residual is a 2D point (x,y), so we'll need 2 values per observation
@@ -139,18 +147,22 @@ class BundleAdjuster:
         residual_count = 0
         
         # First pass: Count expected residuals and their positions
-        for point_idx, observations in self.point3D_observations.items():
-            if point_idx >= len(self.points_3d):
+        for point_opt_index, point_id in enumerate(self.point_ids):
+            if point_id not in self.point_id_manager.points:
                 continue
-            
-            for cam_idx, point_2d in observations:
-                if cam_idx >= len(self.camera_to_world_list):
-                    continue
                 
-                # This observation should produce a 2D residual 
-                # この観測（ポイントとカメラの組み合わせ）の残差の開始位置を記録
-                # 残差配列は，全ての観測の残差を1次元配列として格納　-> [r_0x, r_0y, r_1x, r_1y, ..., r_nx, r_ny] (r_ix：i番目の観測のx座標の残差, r_iy：i番目の観測のy座標の残差)
-                expected_residuals[(point_idx, cam_idx)] = residual_count
+            point = self.point_id_manager.points[point_id]
+            
+            for camera_id, point_2d in point.observations.items():
+                if camera_id not in self.camera_id_to_index:
+                    continue
+                    
+                # This observation should produce a 2D residual
+                # Store the position in the residuals array for this observation
+                # Residuals array format: [r_0x, r_0y, r_1x, r_1y, ..., r_nx, r_ny]
+                # where r_ix is the x-coordinate residual for observation i
+                cam_idx = self.camera_id_to_index[camera_id]
+                expected_residuals[(point_opt_index, cam_idx)] = residual_count
                 residual_count += 2  # x and y components
         
         # Create array with placeholders for all expected residuals
@@ -159,19 +171,24 @@ class BundleAdjuster:
         all_residuals = np.ones(residual_count) * placeholder_value
         
         # Second pass: Fill in actual residuals for valid observations
-        for point_idx, observations in self.point3D_observations.items():
-            if point_idx >= len(self.points_3d):
+        for point_opt_index, point_id in enumerate(self.point_ids):
+            if point_id not in self.point_id_manager.points:
                 continue
                 
-            point_3d = self.points_3d[point_idx]
+            point = self.point_id_manager.points[point_id]
+            
+            # Get the 3D position from our optimized array
+            point_3d = self.points_3d[point_opt_index]
             
             # For each camera observing this point
-            for cam_idx, point_2d in observations:
-                if cam_idx >= len(self.camera_to_world_list):
+            for camera_id, point_2d in point.observations.items():
+                if camera_id not in self.camera_id_to_index:
                     continue
+                    
+                cam_idx = self.camera_id_to_index[camera_id]
                 
                 # Get residual position in output array
-                residual_pos = expected_residuals.get((point_idx, cam_idx))
+                residual_pos = expected_residuals.get((point_opt_index, cam_idx))
                 if residual_pos is None:
                     continue
                 
@@ -191,16 +208,15 @@ class BundleAdjuster:
                     continue
                 
                 # Project to image coordinates
-                point_img = K @ point_cam # 内部パラメータで投影
-                point_img = point_img[:2] / point_img[2] # 同次座標から2D座標に変換
+                point_img = K @ point_cam  # Project using intrinsic parameters
+                point_img = point_img[:2] / point_img[2]  # Convert from homogeneous to 2D
                 
                 # Skip if NaN, leaving placeholder values
                 if np.isnan(point_2d).any() or np.isnan(point_img).any():
                     continue
                 
-                # Compute and store residual (points_2d == new_2d_gaussians.mean() || gaussians.mean() in case of initial BA)
+                # Compute and store residual
                 residual = point_img - point_2d
-                # residual_pos - x座標の残差の位置，residual_pos+1 - y座標の残差の位置
                 all_residuals[residual_pos:residual_pos+2] = residual
         
         return all_residuals
@@ -212,26 +228,54 @@ class BundleAdjuster:
         Returns:
             List[int]: Number of observations per 3D point
         """
-        point_observation_counts = [0] * len(self.points_3d)
+        observation_counts = []
         
-        for observations in self.match_points_2d:
-            for point_idx, _ in observations:
-                if point_idx < len(self.points_3d):
-                    point_observation_counts[point_idx] += 1
-                    
-        return point_observation_counts
+        for point_id in self.point_ids:
+            if point_id in self.point_id_manager.points:
+                point = self.point_id_manager.points[point_id]
+                observation_counts.append(len(point.observations))
+            else:
+                observation_counts.append(0)
+                
+        return observation_counts
         
-    def get_valid_point_indices(self, min_observations: int = 2) -> List[int]:
-        """Get indices of points with sufficient observations.
+    def get_point_indices_with_observations(self, min_observations: int = 2) -> List[int]:
+        """Get optimization indices of points with observations.
         
         Args:
-            min_observations: Minimum number of observations required
+            min_observations: Minimum number of observations to consider
             
         Returns:
-            List[int]: Indices of valid points
+            List[int]: Optimization indices of points with observations
         """
-        observation_counts = self.get_point_observation_counts()
-        return [i for i, count in enumerate(observation_counts) if count >= min_observations]
+        indices_with_observations = []
+        
+        for i, point_id in enumerate(self.point_ids):
+            if point_id in self.point_id_manager.points:
+                point = self.point_id_manager.points[point_id]
+                if len(point.observations) >= min_observations:
+                    indices_with_observations.append(i)
+                    
+        return indices_with_observations
+    
+    def get_point_ids_with_observations(self, min_observations: int = 2) -> List[int]:
+        """Get point IDs that have observations.
+        
+        Args:
+            min_observations: Minimum number of observations to consider
+            
+        Returns:
+            List[int]: IDs of points with observations
+        """
+        ids_with_observations = []
+        
+        for point_id in self.point_ids:
+            if point_id in self.point_id_manager.points:
+                point = self.point_id_manager.points[point_id]
+                if len(point.observations) >= min_observations:
+                    ids_with_observations.append(point_id)
+                    
+        return ids_with_observations
         
     def _optimize_standard(self, n_iterations: int, verbose: bool, loss_fn: str, 
                        method: str, initial_rmse: float = float('nan')) -> Dict:
@@ -260,18 +304,28 @@ class BundleAdjuster:
         else:
             print("Warning: No valid residuals computed for final parameters")
             final_rmse = float('nan')
+            
+        # Consider optimization "successful" if RMSE improved significantly, even if max iterations was reached
+        optimization_success = result.success
+        improvement = 0
+        
+        if not np.isnan(initial_rmse) and not np.isnan(final_rmse):
+            improvement = (initial_rmse - final_rmse) / initial_rmse * 100
+            # If error reduced by at least 20%, consider the optimization successful regardless of convergence
+            if improvement >= 20 and not optimization_success:
+                optimization_success = True
+                print("Bundle Adjustment reached max iterations but had significant error reduction, marking as successful")
         
         if verbose:
             print(f"Bundle Adjustment completed:")
             print(f"  Initial RMSE: {initial_rmse:.4f} pixels")
             print(f"  Final RMSE: {final_rmse:.4f} pixels")
-            print(f"  Optimization success: {result.success}")
-            if not np.isnan(initial_rmse) and not np.isnan(final_rmse):
-                improvement = (initial_rmse - final_rmse) / initial_rmse * 100
+            print(f"  Optimization success: {optimization_success}")
+            if improvement > 0:
                 print(f"  Improvement: {improvement:.2f}%")
             
         return {
-            'success': result.success,
+            'success': optimization_success,  # Use our modified success criteria
             'initial_rmse': initial_rmse,
             'final_rmse': final_rmse,
             'n_iterations': result.nfev,
@@ -290,22 +344,44 @@ class BundleAdjuster:
         if verbose:
             print("Stage 1: Optimizing 3D points with fixed cameras...")
         
-        # For Stage 1, we'll only optimize points that have observations in the point3D_observations dict
-        visible_point_indices = list(self.point3D_observations.keys())
+        # For Stage 1, we'll only optimize points that have observations
+        # Get point IDs with at least 2 observations
+        valid_point_ids = self.get_point_ids_with_observations(min_observations=2)
         
-        # Ensure indices are valid by filtering out any that exceed the array size
-        valid_indices = [idx for idx in visible_point_indices if idx < len(self.points_3d)]
+        # Create mapping from position in optimization array to point ID
+        opt_idx_to_point_id = {}
+        point_id_to_opt_idx = {}
+        
+        # Extract only the points that have observations, maintaining a clear mapping
+        selected_points = []
+        for opt_idx, point_id in enumerate(valid_point_ids):
+            if point_id not in self.point_id_to_index:
+                continue
+                
+            point_idx = self.point_id_to_index[point_id]
+            if point_idx >= len(self.points_3d):
+                continue
+                
+            selected_points.append(self.points_3d[point_idx])
+            opt_idx_to_point_id[opt_idx] = point_id
+            point_id_to_opt_idx[point_id] = opt_idx
         
         if verbose:
-            print(f"Optimizing {len(valid_indices)} points that have observations (out of {len(self.points_3d)} total)")
+            print(f"Optimizing {len(selected_points)} points with observations (out of {len(self.points_3d)} total)")
         
-        # Create a mapping from original indices to parameter array indices
-        # index_mapping = {idx: i for i, idx in enumerate(valid_indices)}
+        if not selected_points:
+            print("No valid points to optimize in Stage 1. Skipping...")
+            return {
+                'success': False,
+                'message': 'No valid points for optimization',
+                'final_rmse': float('nan'),
+                'n_iterations': 0,
+                'optimized_cameras': self.camera_to_world_list,
+                'optimized_points': self.points_3d
+            }
         
-        # Extract only the points that have observations
-        selected_points = np.array([self.points_3d[idx] for idx in valid_indices])
-        
-        # Flatten for optimization
+        # Convert to numpy array and flatten for optimization
+        selected_points = np.array(selected_points)
         params_points = selected_points.flatten()
         
         # Create a function that only updates visible points
@@ -314,19 +390,21 @@ class BundleAdjuster:
                 # Reshape flat array back to points
                 reshaped_points = points_params.reshape(-1, 3)
                 
-                # Update only the points in our mapping
-                for i, point_idx in enumerate(valid_indices):
-                    if i < len(reshaped_points):
-                        self.points_3d[point_idx] = reshaped_points[i]
+                # Update the points in our array
+                for opt_idx, point_3d in enumerate(reshaped_points):
+                    if opt_idx in opt_idx_to_point_id:
+                        point_id = opt_idx_to_point_id[opt_idx]
+                        if point_id in self.point_id_to_index:
+                            point_idx = self.point_id_to_index[point_id]
+                            if point_idx < len(self.points_3d):
+                                self.points_3d[point_idx] = point_3d
                 
                 # Compute residuals without changing camera parameters
                 return self._compute_residuals(None)
             except Exception as e:
                 print(f"Error in compute_residuals_fixed_cameras: {e}")
-                # Calculate how many residuals are expected and return placeholder values
-                residual_count = 0
-                for observation_list in self.match_points_2d:
-                    residual_count += len(observation_list) * 2  # x and y components
+                # Get a reasonable number of residuals
+                residual_count = max(len(self.point_ids) * 2, self.n_observations * 2)
                 placeholder_value = 1e-3
                 return np.ones(residual_count) * placeholder_value
         
@@ -356,17 +434,32 @@ class BundleAdjuster:
             
         # Find cameras that have observations
         cameras_with_obs = set()
-        for observations in self.point3D_observations.values():
-            for cam_idx, _ in observations:
-                if cam_idx < self.n_cameras:  # Ensure valid index
-                    cameras_with_obs.add(cam_idx)
-                    
+        for point_id in valid_point_ids:
+            if point_id in self.point_id_manager.points:
+                point = self.point_id_manager.points[point_id]
+                for camera_id in point.observations:
+                    if camera_id in self.camera_id_to_index:
+                        cameras_with_obs.add(self.camera_id_to_index[camera_id])
+        
         # Convert to sorted list
         valid_cameras = sorted(list(cameras_with_obs))
+        
+        # Create mappings between indices
+        cam_idx_to_opt_idx = {cam_idx: i for i, cam_idx in enumerate(valid_cameras)}
         
         if verbose:
             print(f"Optimizing {len(valid_cameras)} cameras that have observations (out of {self.n_cameras} total)")
             
+        if not valid_cameras:
+            print("No valid cameras to optimize in Stage 2. Skipping...")
+            return {
+                'success': result_points.success,  # Consider stage 1 result
+                'final_rmse': points_rmse if 'points_rmse' in locals() else float('nan'),
+                'n_iterations': result_points.nfev,
+                'optimized_cameras': self.camera_to_world_list,
+                'optimized_points': self.points_3d
+            }
+        
         # Extract only the camera parameters that have observations
         rvecs_to_optimize = [self.rvecs[idx] for idx in valid_cameras]
         centers_to_optimize = [self.centers[idx] for idx in valid_cameras]
@@ -379,28 +472,34 @@ class BundleAdjuster:
         
         # Create a function that only updates cameras
         def compute_residuals_fixed_points(camera_params):
-            
-            # Get number of cameras to update
-            num_cameras = len(valid_cameras)
-            
-            # First update all rotation vectors
-            for i, cam_idx in enumerate(valid_cameras):
-                # Extract rvec (first part of parameters)
-                start_idx = i * 3
-                self.rvecs[cam_idx] = camera_params[start_idx:start_idx+3]
-            
-            # Then update all translation vectors
-            for i, cam_idx in enumerate(valid_cameras):
-                # Extract tvec (second part of parameters, after all rvecs)
-                start_idx = num_cameras * 3 + i * 3
-                self.centers[cam_idx] = camera_params[start_idx:start_idx+3]
+            try:
+                # Get number of cameras to update
+                num_cameras = len(valid_cameras)
                 
-                # Update camera_to_world_list
-                R, _ = cv2.Rodrigues(self.rvecs[cam_idx])
-                self.camera_to_world_list[cam_idx] = (R, self.centers[cam_idx])
-            
-            # Compute residuals without changing 3D points
-            return self._compute_residuals(None)
+                # First update all rotation vectors
+                for i, cam_idx in enumerate(valid_cameras):
+                    # Extract rvec (first part of parameters)
+                    start_idx = i * 3
+                    self.rvecs[cam_idx] = camera_params[start_idx:start_idx+3]
+                
+                # Then update all translation vectors
+                for i, cam_idx in enumerate(valid_cameras):
+                    # Extract tvec (second part of parameters, after all rvecs)
+                    start_idx = num_cameras * 3 + i * 3
+                    self.centers[cam_idx] = camera_params[start_idx:start_idx+3]
+                    
+                    # Update camera_to_world_list
+                    R, _ = cv2.Rodrigues(self.rvecs[cam_idx])
+                    self.camera_to_world_list[cam_idx] = (R, self.centers[cam_idx])
+                
+                # Compute residuals without changing 3D points
+                return self._compute_residuals(None)
+            except Exception as e:
+                print(f"Error in compute_residuals_fixed_points: {e}")
+                # Get a reasonable number of residuals
+                residual_count = max(len(self.point_ids) * 2, self.n_observations * 2)
+                placeholder_value = 1e-3
+                return np.ones(residual_count) * placeholder_value
         
         # Optimize cameras only - ensure sufficient iterations
         min_iterations = max(20, n_iterations // 3)
@@ -428,74 +527,73 @@ class BundleAdjuster:
         
         try:    
             # Pack camera parameters - all rvecs first, then all camera centers
-            rvec_params = []
-            center_params = []
-            for i in valid_cameras:
-                rvec_params.extend(self.rvecs[i])
-                center_params.extend(self.centers[i])
+            camera_params = []
+            
+            # Add rotation vectors (rvecs) in order of valid_cameras
+            for cam_idx in valid_cameras:
+                camera_params.extend(self.rvecs[cam_idx])
                 
-            # Combine camera params - all rvecs followed by all camera centers
-            camera_params = np.concatenate([np.array(rvec_params), np.array(center_params)])
+            # Add camera centers in order of valid_cameras
+            for cam_idx in valid_cameras:
+                camera_params.extend(self.centers[cam_idx])
                 
             # Pack 3D points for points with observations
             point_params = []
-            for i in valid_indices:
-                point_params.extend(self.points_3d[i])
+            for point_id in valid_point_ids:
+                if point_id in self.point_id_to_index:
+                    point_idx = self.point_id_to_index[point_id]
+                    if point_idx < len(self.points_3d):
+                        point_params.extend(self.points_3d[point_idx])
                 
             # Combine all parameters
-            params_all = np.concatenate([camera_params, np.array(point_params)])
+            params_all = np.concatenate([np.array(camera_params), np.array(point_params)])
+            
+            # Store optimization structure
+            camera_count = len(valid_cameras)
+            point_count = len(valid_point_ids)
             
             if verbose:
-                print(f"Stage 3: Optimizing {len(valid_cameras)} cameras and {len(valid_indices)} points")
+                print(f"Stage 3: Optimizing {camera_count} cameras and {point_count} points")
                 print(f"Total parameters: {len(params_all)}")
                 print(f"Camera params: {len(camera_params)}, Point params: {len(point_params)}")
+            
+            # Create a clear mapping from parameter position to entity
+            point_param_start = len(camera_params)
             
             # Create a custom residual function to handle our reduced parameter set
             def compute_residuals_all(all_params):
                 try:
                     # Split parameters into camera and point parts
-                    camera_count = len(valid_cameras)
-                    camera_param_count = camera_count * 6  # 6 params per camera
+                    camera_params = all_params[:point_param_start]
+                    point_params = all_params[point_param_start:]
                     
-                    camera_params = all_params[:camera_param_count]
-                    point_params = all_params[camera_param_count:]
-                    
-                    # First get all the rvecs
-                    rvec_start = 0
+                    # Update camera parameters
                     for i, cam_idx in enumerate(valid_cameras):
-                        self.rvecs[cam_idx] = camera_params[rvec_start + i*3:rvec_start + (i+1)*3]
+                        # Update rotation vector (rvec)
+                        self.rvecs[cam_idx] = camera_params[i*3:i*3+3]
                     
-                    # Then get all the camera centers
+                    # Update camera centers
                     center_start = camera_count * 3  # Skip all rvecs
                     for i, cam_idx in enumerate(valid_cameras):
-                        self.centers[cam_idx] = camera_params[center_start + i*3:center_start + (i+1)*3]
+                        self.centers[cam_idx] = camera_params[center_start + i*3:center_start + i*3+3]
                         
                         # Update camera_to_world_list
                         R, _ = cv2.Rodrigues(self.rvecs[cam_idx])
                         self.camera_to_world_list[cam_idx] = (R, self.centers[cam_idx])
                     
-                    # Check the number of points to update matches the expected size
-                    point_count = len(point_params) // 3
-                    if point_count != len(valid_indices):
-                        # If there's a mismatch, ensure we only update as many as are valid
-                        point_count = min(point_count, len(valid_indices))
-                        
-                    # Reshape points and update them
-                    points_reshaped = point_params.reshape(-1, 3)
-                    
-                    for i in range(point_count):
-                        if i < len(valid_indices):
-                            point_idx = valid_indices[i]
-                            self.points_3d[point_idx] = points_reshaped[i]
+                    # Update 3D points
+                    for i, point_id in enumerate(valid_point_ids):
+                        if point_id in self.point_id_to_index:
+                            point_idx = self.point_id_to_index[point_id]
+                            if point_idx < len(self.points_3d) and i*3+3 <= len(point_params):
+                                self.points_3d[point_idx] = point_params[i*3:i*3+3]
                     
                     # Compute residuals
                     return self._compute_residuals(None)
                 except Exception as e:
                     print(f"Error in compute_residuals_all: {e}")
-                    # Calculate how many residuals are expected and return placeholder values
-                    residual_count = 0
-                    for observation_list in self.match_points_2d:
-                        residual_count += len(observation_list) * 2  # x and y components
+                    # Get a reasonable number of residuals
+                    residual_count = max(len(self.point_ids) * 2, self.n_observations * 2)
                     placeholder_value = 1e-3
                     return np.ones(residual_count) * placeholder_value
             
@@ -537,15 +635,24 @@ class BundleAdjuster:
             if len(initial_residuals) > 0:
                 initial_rmse = np.sqrt(np.mean(initial_residuals**2))
                 
-                # Only revert if final error is worse than initial error
-                if (np.isnan(final_rmse) or final_rmse > initial_rmse * 1.1):  # Allow up to 10% increase
+                # Check for significant improvement
+                improvement = 0
+                if not np.isnan(final_rmse) and not np.isnan(initial_rmse):
+                    improvement = (initial_rmse - final_rmse) / initial_rmse * 100
+                
+                # If there was at least 20% improvement, mark as successful regardless of convergence
+                if improvement >= 20:
+                    print(f"Stage 3 optimization achieved {improvement:.2f}% error reduction. Marking as successful despite non-convergence.")
+                    optimization_success = True
+                # Only revert if error increased significantly (more than 10%)
+                elif (np.isnan(final_rmse) or final_rmse > initial_rmse * 1.1):
                     print(f"Optimization increased error from {initial_rmse:.4f} to {final_rmse:.4f}. Reverting to original parameters.")
                     # Restore original values
                     self.points_3d = original_points.copy()
                     self.rvecs = [rvec.copy() for rvec in original_rvecs]
                     self.centers = [center.copy() for center in original_centers]
                 else:
-                    print(f"Despite non-convergence, error improved from {initial_rmse:.4f} to {final_rmse:.4f}. Keeping results.")
+                    print(f"Error improved from {initial_rmse:.4f} to {final_rmse:.4f}. Keeping results despite non-convergence.")
                     optimization_success = True  # Consider this a success since error improved
             else:
                 # If we can't compute initial RMSE, revert to be safe
@@ -581,7 +688,7 @@ class BundleAdjuster:
             'optimized_points': self.points_3d
         }
     
-    def optimize(self, n_iterations: int = 100, verbose: bool = True, use_staged: bool = True) -> Dict:
+    def optimize(self, n_iterations: int = 100, verbose: bool = True, use_staged: bool = True, epipolar_threshold: float = None) -> Dict:
         """ Run bundle adjustment optimization with COLMAP-like approach.
         
         Args:
@@ -592,46 +699,59 @@ class BundleAdjuster:
         Returns:
             Dict with optimization results
         """
-        
-        # Analyze the observation model to count actual valid observations
+        # エピポーラフィルタリングが有効な場合、観測をフィルタリング
+        if epipolar_threshold is not None and epipolar_threshold > 0:
+            self.filter_observations_with_epipolar(epipolar_threshold, verbose=verbose)
+            
+        # Analyze the observation model to count valid observations using point IDs
         total_valid_observations = 0
         points_with_observations = set()
         cameras_with_observations = set()
         
-        # Use point-centered observation structure for analysis
-        for point_idx, observations in self.point3D_observations.items():
-            if point_idx >= len(self.points_3d):
+        # Count valid observations for each point - now without filtering by is_valid flag
+        for point_opt_idx, point_id in enumerate(self.point_ids):
+            if point_id not in self.point_id_manager.points:
                 continue
                 
+            point = self.point_id_manager.points[point_id]
             valid_point_observations = 0
-            for cam_idx, point_2d in observations:
-                if cam_idx >= len(self.camera_to_world_list):
+            
+            # Check each camera observing this point
+            for camera_id, point_2d in point.observations.items():
+                if camera_id not in self.camera_id_to_index:
                     continue
-                    
+                
+                cam_idx = self.camera_id_to_index[camera_id]
+                
                 # Check if point is in front of camera and not NaN
-                # Get camera-to-world parameters
                 R_ctw, c = self.camera_to_world_list[cam_idx]
                 
                 # Convert to world-to-camera for projection
                 R_wtc = R_ctw.T
                 t_wtc = -R_wtc @ c
                 
-                point_3d = self.points_3d[point_idx]
+                point_3d = self.points_3d[point_opt_idx]
                 point_cam = R_wtc @ point_3d + t_wtc
                 
                 if point_cam[2] > 0 and not np.isnan(point_2d).any():
                     total_valid_observations += 1
                     valid_point_observations += 1
-                    cameras_with_observations.add(cam_idx)
+                    cameras_with_observations.add(camera_id)
             
             # Only count points with at least 2 observations (COLMAP requirement)
             if valid_point_observations >= 2:
-                points_with_observations.add(point_idx)
+                points_with_observations.add(point_id)
         
         if verbose:
-            print(f"Valid observations: {total_valid_observations}")
-            print(f"Points with 2+ observations: {len(points_with_observations)}")
+            print(f"------------------------------------------------")
+            print(f"BUNDLE ADJUSTMENT DATA SUMMARY:")
+            print(f"Total 3D points in manager: {len(self.point_ids)}")
+            print(f"Points with ANY observations: {sum(1 for p_id in self.point_ids if p_id in self.point_id_manager.points and len(self.point_id_manager.points[p_id].observations) > 0)}")
+            print(f"Points with 2+ observations: {len(points_with_observations)} (these points can be triangulated)")
+            print(f"Total valid observations: {total_valid_observations}")
             print(f"Cameras with observations: {len(cameras_with_observations)}")
+            print(f"Observations per point with 2+ obs: {total_valid_observations/max(1, len(points_with_observations)):.2f}")
+            print(f"------------------------------------------------")
         
         # Check if we have enough data for a meaningful BA
         # Each point must be observed by at least 2 cameras to be constrained
@@ -641,7 +761,7 @@ class BundleAdjuster:
             total_valid_observations < 10):
             
             print(f"Warning: Insufficient data for meaningful Bundle Adjustment:")
-            print(f"  Points with observations: {len(points_with_observations)} (need at least 3)")
+            print(f"  Points with 2+ observations: {len(points_with_observations)} (need at least 3)")
             print(f"  Cameras with observations: {len(cameras_with_observations)} (need at least 2)")
             print(f"  Valid observations: {total_valid_observations} (need at least 10)")
             
@@ -687,9 +807,14 @@ class BundleAdjuster:
         # Run optimization - choose between standard and staged approaches
         try:
             if use_staged and self.n_points > 20 and self.n_cameras > 2:
-                return self._optimize_staged(n_iterations, verbose, loss_fn, method)
+                results = self._optimize_staged(n_iterations, verbose, loss_fn, method)
             else:
-                return self._optimize_standard(n_iterations, verbose, loss_fn, method, initial_rmse)
+                results = self._optimize_standard(n_iterations, verbose, loss_fn, method, initial_rmse)
+                
+            # Update the point_id_manager with optimized parameters
+            self._update_point_id_manager(results['success'])
+            
+            return results
         except Exception as e:
             print(f"Bundle Adjustment failed with error: {str(e)}")
             return {
@@ -698,3 +823,185 @@ class BundleAdjuster:
                 'optimized_cameras': self.camera_to_world_list,
                 'optimized_points': self.points_3d
             }
+            
+    def _update_point_id_manager(self, optimization_successful: bool) -> None:
+        """Update the point ID manager with optimized parameters.
+        
+        Args:
+            optimization_successful: Whether the optimization was successful
+        """
+        if not optimization_successful:
+            # In our case, even if scipy says it's unsuccessful, we still want to update
+            # the point manager if there was significant error reduction
+            print("Optimization didn't fully converge, but still updating point ID manager if error improved")
+            
+        # Get points with observations - only update these
+        points_with_obs = set(self.get_point_ids_with_observations(min_observations=1))
+        points_updated = 0
+            
+        # Update point positions - but only for points that have observations
+        for i, point_id in enumerate(self.point_ids):
+            if point_id in self.point_id_manager.points:
+                # Only update points that have at least one observation
+                if point_id in points_with_obs:
+                    # Update position (the only property modified by bundle adjustment)
+                    self.point_id_manager.points[point_id].position = self.points_3d[i]
+                    points_updated += 1
+                
+        print(f"Updated {points_updated} points that had observations (out of {len(self.point_ids)} total points)")
+                
+        # Update camera parameters
+        for cam_idx, (R_ctw, c) in enumerate(self.camera_to_world_list):
+            if cam_idx in self.camera_index_to_id:
+                camera_id = self.camera_index_to_id[cam_idx]
+                if camera_id in self.point_id_manager.cameras:
+                    # Update rotation and camera center
+                    self.point_id_manager.cameras[camera_id].R = R_ctw
+                    self.point_id_manager.cameras[camera_id].c = c
+                    
+                    
+    def _calculate_fundamental_matrix(
+        self, R1_ctw, c1, K1, R2_ctw, c2, K2
+    ) -> np.ndarray:
+        """2台のカメラ間の基礎行列を計算
+        
+        Args:
+            R1_ctw: カメラ1の回転行列（カメラ→ワールド）
+            c1: カメラ1の中心座標（ワールド座標系）
+            K1: カメラ1の内部パラメータ行列
+            R2_ctw: カメラ2の回転行列（カメラ→ワールド）
+            c2: カメラ2の中心座標（ワールド座標系）
+            K2: カメラ2の内部パラメータ行列
+            
+        Returns:
+            F: カメラ1の点からカメラ2のエピポーラ線への写像を表す基礎行列
+        """
+        # カメラ→ワールドからワールド→カメラへの変換
+        R1_wtc = R1_ctw.T
+        t1_wtc = -R1_wtc @ c1
+        
+        R2_wtc = R2_ctw.T
+        t2_wtc = -R2_wtc @ c2
+        
+        # カメラ1からカメラ2への相対的な回転と並進
+        R_rel = R2_wtc @ R1_ctw  # カメラ1からカメラ2への変換
+        t_rel = t2_wtc - R_rel @ t1_wtc
+        
+        # t_relの外積行列を作成
+        t_cross = np.array([
+            [0, -t_rel[2], t_rel[1]],
+            [t_rel[2], 0, -t_rel[0]],
+            [-t_rel[1], t_rel[0], 0]
+        ])
+        
+        # 基本行列の計算: E = [t]_x * R
+        E = t_cross @ R_rel
+        
+        # 基礎行列の計算: F = K2^-T * E * K1^-1
+        F = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+        
+        return F
+
+    def filter_observations_with_epipolar(self, threshold: float = 2.0, min_inlier_ratio: float = 0.5, verbose: bool = True):
+        """エピポーラ制約に違反する観測をフィルタリング
+        
+        Args:
+            threshold: エピポーラ線からの最大許容距離（ピクセル単位）
+            min_inlier_ratio: 観測を維持するためのインライアの最小比率
+            verbose: 進捗を表示するかどうか
+            
+        Returns:
+            int: フィルタリングされた観測の数
+        """
+        # フィルタリング統計の初期化
+        filtered_count = 0
+        total_observations = 0
+        points_affected = 0
+        
+        # 全ての点を反復処理
+        for point_id in self.point_ids:
+            if point_id not in self.point_id_manager.points:
+                continue
+                
+            point = self.point_id_manager.points[point_id]
+            cameras_observing_point = list(point.observations.keys())
+            total_observations += len(cameras_observing_point)
+            
+            # 観測が3未満の点はスキップ（フィルタリング後に少なくとも2つ必要）
+            if len(cameras_observing_point) < 3:
+                continue
+            
+            # この点の観測をフィルタリング
+            filtered_cameras = set()
+            
+            # 各カメラを他のすべてのカメラと比較
+            for camera_id1 in cameras_observing_point:
+                if camera_id1 not in self.camera_id_to_index:
+                    continue
+                    
+                # 外れ値としてのこの観測を持つ他のカメラの数をカウント
+                outlier_count = 0
+                total_checked = 0
+                
+                for camera_id2 in cameras_observing_point:
+                    if camera_id2 == camera_id1 or camera_id2 not in self.camera_id_to_index:
+                        continue
+                        
+                    # カメラパラメータを取得
+                    point_2d1 = point.observations[camera_id1]
+                    cam_idx1 = self.camera_id_to_index[camera_id1]
+                    R1_ctw, c1 = self.camera_to_world_list[cam_idx1]
+                    K1 = self.intrinsics_list[cam_idx1]
+                    
+                    point_2d2 = point.observations[camera_id2]
+                    cam_idx2 = self.camera_id_to_index[camera_id2]
+                    R2_ctw, c2 = self.camera_to_world_list[cam_idx2]
+                    K2 = self.intrinsics_list[cam_idx2]
+                    
+                    # いずれかの点がNaNの場合はスキップ
+                    if np.isnan(point_2d1).any() or np.isnan(point_2d2).any():
+                        continue
+                    
+                    # 基礎行列を計算
+                    F = self._calculate_fundamental_matrix(
+                        R1_ctw, c1, K1, 
+                        R2_ctw, c2, K2
+                    )
+                    
+                    # 2番目の画像でのエピポーラ線を計算
+                    point_2d1_h = np.append(point_2d1, 1)
+                    epipolar_line2 = F @ point_2d1_h
+                    
+                    # エピポーラ線の法線のノルムを計算
+                    line_normal = np.sqrt(epipolar_line2[0]**2 + epipolar_line2[1]**2)
+                    if line_normal < 1e-10:  # 非常に小さい場合はスキップ（0除算回避）
+                        continue
+                    
+                    # 2番目の点からエピポーラ線までの距離を計算
+                    point_2d2_h = np.append(point_2d2, 1)
+                    distance = abs(np.dot(epipolar_line2, point_2d2_h)) / line_normal
+                    
+                    total_checked += 1
+                    if distance > threshold:
+                        outlier_count += 1
+                
+                # チェックの半分以上が失敗した場合、この観測をフィルタリング
+                if total_checked > 0 and outlier_count / total_checked > (1 - min_inlier_ratio):
+                    filtered_cameras.add(camera_id1)
+                    filtered_count += 1
+            
+            # フィルタリングされたカメラを観測から削除
+            original_count = len(point.observations)
+            for camera_id in filtered_cameras:
+                if camera_id in point.observations:
+                    del point.observations[camera_id]
+            
+            # 点が影響を受けたかどうかを確認
+            if len(point.observations) < original_count:
+                points_affected += 1
+        
+        if verbose:
+            print(f"エピポーラフィルタリング: 合計{total_observations}観測から{filtered_count}を除外")
+            print(f"{points_affected}点に影響, 閾値={threshold:.2f}px")
+        
+        return filtered_count
