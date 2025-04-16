@@ -707,8 +707,14 @@ def visualize_cameras_and_points(
         
         all_vertices = np.array(all_vertices)
         
-        # カメラ中心とフラスタム頂点を合わせた点群
+        # カメラ中心とフラスタム頂点を合わせた点群: original!
         all_points_for_bound = np.vstack([camera_positions, all_vertices])
+        
+        # # カメラ中心とフラスタム頂点を合わせた点群 + 3D点群
+        # if points is not None and len(points) > 0:
+        #     all_points_for_bound = np.vstack([camera_positions, all_vertices, points])
+        # else:
+        #     all_points_for_bound = np.vstack([camera_positions, all_vertices])
         
         # 中心と最大半径を計算
         center = all_points_for_bound.mean(axis=0)
@@ -1053,3 +1059,6 @@ if __name__ == "__main__":
 
 #nerf materials gt
 #python extrinsics_visualizer.py --nerf_json /Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/materials/transforms_train.json --use_true_intrinsics
+
+#ba after initialization
+#python extrinsics_visualizer.py --images /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/ba_initial/colmap_ba/images.txt --points /Users/kohsukeide/dev/perspective-n-gaussian/pipelines/results/ba_initial/colmap_ba/points3d.txt --use_true_intrinsics
