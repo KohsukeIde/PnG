@@ -547,7 +547,7 @@ class OptimalTransportSolver:
     #     print(f"Optimization loss plot saved to '{plt_path}'")
 
 
-    def compute_cost_matrix_fundamental_sampson(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using the Sampson error
         with a Fundamental Matrix F. Also includes color difference term as an example.
 
@@ -639,11 +639,11 @@ class OptimalTransportSolver:
 
         return cost_matrix
 
-    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
 
         This replaces the Homography-based distance with an epipolar distance.
-        Also includes color difference term as an example.
+        Also includes color difference and covariance difference terms.
 
         Args:
             f (torch.Tensor): The Fundamental matrix (3x3).
@@ -651,7 +651,7 @@ class OptimalTransportSolver:
         Returns:
             torch.Tensor: Cost matrix of shape (K1, K2).
         """
-         # 1) 画像1,2 それぞれのGaussians数
+        # 1) 画像1,2 それぞれのGaussians数
         k1 = self.means1.shape[0]
         k2 = self.means2.shape[0]
 
@@ -702,36 +702,85 @@ class OptimalTransportSolver:
         #    color_diff(i,j) = sum_k ( rgb1[i][k] - rgb2[j][k] )^2
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
-
-        # - デバッグ出力（正規化前）
-        # print("=== Before Normalization ===")
-        # print(f"epipolar_dist: min={epipolar_dist.min():.6f}, "
-        #     f"max={epipolar_dist.max():.6f}, mean={epipolar_dist.mean():.6f}")
-        # print(f"d_color:       min={d_color.min():.6f}, "
-        #     f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
-
-        # 8) （任意のスケーリング・調整）
-        # epipolar_max = epipolar_dist.max() + 1e-12
-        # epipolar_dist = epipolar_dist / epipolar_max
-        # d_color = d_color / 3.0             # 例: 色差も軽く正規化
+        
+        # 8) 共分散制約の計算
+        #    R,tから予測される共分散の変換を計算し、実際の共分散との差を求める
+        
+        # 8.2) 共分散差分を初期化（すべてのペアに対して）
+        cov_diff = torch.zeros((k1, k2), device=self.device)
+        
+        # 8.3) 各ガウシアンペアの共分散差分を計算
+        for i in range(k1):
+            # 画像1のガウシアンの共分散行列を取得
+            scale1 = self.scales1[i]
+            rotation1 = self.rotations1[i]
+            
+            # 回転行列の計算
+            cos_r = torch.cos(rotation1)
+            sin_r = torch.sin(rotation1)
+            R_2d = torch.tensor([
+                [cos_r, -sin_r],
+                [sin_r, cos_r]
+            ], device=self.device)
+            
+            # スケール行列
+            S_diag = torch.diag(scale1.pow(2))
+            
+            # 共分散行列: R * S * R^T
+            cov1 = R_2d @ S_diag @ R_2d.t()
+            
+            # エピポーラ線ベクトルを計算（F * x1）
+            p1 = p1_homo[i]  # (3,)
+            epipolar_lines = f @ p1  # (3,)：画像2上のエピポーラ線
+            
+            # エピポーラ線の方向ベクトル [normalized(-b, a)]
+            line_dir = torch.tensor([-epipolar_lines[1], epipolar_lines[0]], 
+                                device=self.device)
+            line_dir = line_dir / (torch.norm(line_dir) + 1e-10)  # 正規化
+            
+            # R,tに基づく共分散の変換（エピポーラ線方向に伸長）
+            # 奥行きの不確かさがエピポーラ線方向の不確かさとして現れる
+            scale_factor = 2.0  # エピポーラ線方向の伸長係数（調整可能）
+            line_outer = torch.outer(line_dir, line_dir)
+            transform = torch.eye(2, device=self.device) + (scale_factor - 1.0) * line_outer
+            
+            # 変換された共分散行列
+            transformed_cov1 = transform @ cov1 @ transform.t()
+            
+            for j in range(k2):
+                # 画像2のガウシアンの共分散行列を取得
+                scale2 = self.scales2[j]
+                rotation2 = self.rotations2[j]
+                
+                cos_r2 = torch.cos(rotation2)
+                sin_r2 = torch.sin(rotation2)
+                R_2d2 = torch.tensor([
+                    [cos_r2, -sin_r2],
+                    [sin_r2, cos_r2]
+                ], device=self.device)
+                
+                S_diag2 = torch.diag(scale2.pow(2))
+                cov2 = R_2d2 @ S_diag2 @ R_2d2.t()
+                
+                # 共分散の差をフロベニウスノルムで計算
+                diff = torch.norm(transformed_cov1 - cov2, 'fro')
+                cov_diff[i, j] = diff
+        
+        # 9) 各コスト要素の正規化
         with torch.no_grad():
             p95_epipolar = torch.quantile(epipolar_dist, 0.95)
             p95_color = torch.quantile(d_color, 0.95)
+            p95_cov = torch.quantile(cov_diff, 0.95)
 
         epipolar_dist = torch.clamp(epipolar_dist, max=p95_epipolar) / p95_epipolar
         d_color = torch.clamp(d_color, max=p95_color) / p95_color
+        cov_diff = torch.clamp(cov_diff, max=p95_cov) / p95_cov
 
-        # print("=== After Normalization ===")
-        # print(f"epipolar_dist: min={self.lambda_epipolar * epipolar_dist.min():.6f}, "
-        #     f"max={self.lambda_epipolar * epipolar_dist.max():.6f}, "
-        #     f"mean={self.lambda_epipolar * epipolar_dist.mean():.6f}")
-        # print(f"d_color:       min={d_color.min():.6f}, "
-        #     f"max={d_color.max():.6f}, mean={d_color.mean():.6f}")
-
-        # 9) 上記2種のコストを重み付けして合成
-        #    cost_matrix(i,j) = lambda_epipolar * epipolar_dist(i,j)
-        #                     + lambda_color   * d_color(i,j)
-        cost_matrix = self.lambda_epipolar * epipolar_dist + self.lambda_color * d_color
+        cost_matrix = (
+            self.lambda_epipolar * epipolar_dist + 
+            self.lambda_color * d_color + 
+            self.lambda_cov * cov_diff
+        )
 
         return cost_matrix
         
@@ -739,116 +788,116 @@ class OptimalTransportSolver:
 
     
     
-    # def optimize_with_RT(self, max_iter=1000, tol=1e-6):
-    #     """R,tを直接最適化してFを構築して self.f に反映させる。
-    #     最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
-    #     """
-
-    #     # R,tを最適化パラメータ設定  (これは相対変換)
-    #     if not hasattr(self, 'rvec'):
-    #         self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
-    #     if not hasattr(self, 'tvec'):
-    #         self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
-        
-    #     optimizer = torch.optim.Adam([self.rvec, self.tvec], lr=1e-3)
-    #     prev_loss_val = float('inf')
-    #     loss_history = []
-
-    #     transport_dir = os.path.join("results", "transport_RT")
-    #     os.makedirs(transport_dir, exist_ok=True)
-
-    #     pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
-        
-    #     for iteration in pbar:
-    #         optimizer.zero_grad()
-
-    #         F = self.build_f_from_rt(self.rvec, self.tvec)
-
-    #         cost_matrix = self.compute_cost_matrix_fundamental(F)
-
-    #         transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
-
-    #         # ロス計算 + 逆伝播
-    #         loss = torch.sum(transport * cost_matrix)
-    #         loss.backward()
-
-    #         # パラメータ更新
-    #         optimizer.step()
-
-    #         current_loss = loss.item()
-    #         loss_history.append(current_loss)
-
-    #         # 収束判定
-    #         loss_diff = abs(prev_loss_val - current_loss)
-    #         if iteration > 5 and loss_diff < tol:
-    #             pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
-    #             break
-    #         prev_loss_val = current_loss
-
-    #         if iteration % 10 == 0:
-    #             grad_r = self.rvec.grad.norm().item()
-    #             grad_t = self.tvec.grad.norm().item()
-    #             pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
-
-    #             # Transport matrix 可視化
-    #             if iteration % 10 == 0 or iteration == max_iter - 1:
-    #                 with torch.no_grad():
-    #                     t_np = transport.detach().cpu().numpy()
-                        
-    #                     # 行列の次元に応じてサイズとアスペクト比を調整
-    #                     rows, cols = t_np.shape
-    #                     aspect_ratio = cols / rows
-                        
-    #                     if rows > cols:
-    #                         fig_width = 8  # 基本幅
-    #                         fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
-    #                     else:
-    #                         fig_height = 6  # 基本高さ
-    #                         fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
-                        
-    #                     plt.figure(figsize=(fig_width, fig_height))
-                        
-    #                     # 大きな行列の場合はダウンサンプリング
-    #                     if rows > 1000 or cols > 1000:
-    #                         downsample_factor = max(1, int(max(rows, cols) / 1000))
-    #                         t_np_display = t_np[::downsample_factor, ::downsample_factor]
-    #                         plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
-    #                         plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
-    #                     else:
-    #                         plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
-    #                         plt.title(f"Transport Plan at Iteration {iteration}")
-                        
-    #                     plt.colorbar(label="Transport Plan Value")
-    #                     plt.xlabel("Image 2 Gaussians")
-    #                     plt.ylabel("Image 1 Gaussians")
-                        
-    #                     # 軸ラベルの位置調整
-    #                     plt.tight_layout()
-    #                     plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-    #                     plt.savefig(plt_path, dpi=150)
-    #                     plt.close()
-
-    #     # print("Optimized rvec:", self.rvec)
-    #     # print("Optimized tvec:", self.tvec)
-
-    #     # build_f_from_rt から最終Fを取り出す
-    #     final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
-    #     # print("Final F:\n", final_F.cpu().numpy())
-
-    #     # solver.f にコピー
-    #     with torch.no_grad():
-    #         self.f = final_F
-
-    #     plt.figure()
-    #     plt.plot(loss_history, '-o')
-    #     plt.title("Loss (optimize_with_RT)")
-    #     plt.xlabel("Iteration")
-    #     plt.ylabel("Loss")
-    #     plt.grid(True)
-    #     plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
-    #     plt.close()
-
     def optimize_with_RT(self, max_iter=1000, tol=1e-6):
+        """R,tを直接最適化してFを構築して self.f に反映させる。
+        最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
+        """
+
+        # R,tを最適化パラメータ設定  (これは相対変換)
+        if not hasattr(self, 'rvec'):
+            self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+        if not hasattr(self, 'tvec'):
+            self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
+        
+        optimizer = torch.optim.Adam([self.rvec, self.tvec], lr=1e-3)
+        prev_loss_val = float('inf')
+        loss_history = []
+
+        transport_dir = os.path.join("results", "transport_RT")
+        os.makedirs(transport_dir, exist_ok=True)
+
+        pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
+        
+        for iteration in pbar:
+            optimizer.zero_grad()
+
+            F = self.build_f_from_rt(self.rvec, self.tvec)
+
+            cost_matrix = self.compute_cost_matrix_fundamental(F)
+
+            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
+
+            # ロス計算 + 逆伝播
+            loss = torch.sum(transport * cost_matrix)
+            loss.backward()
+
+            # パラメータ更新
+            optimizer.step()
+
+            current_loss = loss.item()
+            loss_history.append(current_loss)
+
+            # 収束判定
+            loss_diff = abs(prev_loss_val - current_loss)
+            if iteration > 5 and loss_diff < tol:
+                pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
+                break
+            prev_loss_val = current_loss
+
+            if iteration % 10 == 0:
+                grad_r = self.rvec.grad.norm().item()
+                grad_t = self.tvec.grad.norm().item()
+                pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
+
+                # Transport matrix 可視化
+                if iteration % 10 == 0 or iteration == max_iter - 1:
+                    with torch.no_grad():
+                        t_np = transport.detach().cpu().numpy()
+                        
+                        # 行列の次元に応じてサイズとアスペクト比を調整
+                        rows, cols = t_np.shape
+                        aspect_ratio = cols / rows
+                        
+                        if rows > cols:
+                            fig_width = 8  # 基本幅
+                            fig_height = min(20, fig_width / aspect_ratio)  # 高さは幅/アスペクト比（最大20に制限）
+                        else:
+                            fig_height = 6  # 基本高さ
+                            fig_width = min(20, fig_height * aspect_ratio)  # 幅は高さ*アスペクト比（最大20に制限）
+                        
+                        plt.figure(figsize=(fig_width, fig_height))
+                        
+                        # 大きな行列の場合はダウンサンプリング
+                        if rows > 1000 or cols > 1000:
+                            downsample_factor = max(1, int(max(rows, cols) / 1000))
+                            t_np_display = t_np[::downsample_factor, ::downsample_factor]
+                            plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+                            plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
+                        else:
+                            plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
+                            plt.title(f"Transport Plan at Iteration {iteration}")
+                        
+                        plt.colorbar(label="Transport Plan Value")
+                        plt.xlabel("Image 2 Gaussians")
+                        plt.ylabel("Image 1 Gaussians")
+                        
+                        # 軸ラベルの位置調整
+                        plt.tight_layout()
+                        plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+                        plt.savefig(plt_path, dpi=150)
+                        plt.close()
+
+        # print("Optimized rvec:", self.rvec)
+        # print("Optimized tvec:", self.tvec)
+
+        # build_f_from_rt から最終Fを取り出す
+        final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
+        # print("Final F:\n", final_F.cpu().numpy())
+
+        # solver.f にコピー
+        with torch.no_grad():
+            self.f = final_F
+
+        plt.figure()
+        plt.plot(loss_history, '-o')
+        plt.title("Loss (optimize_with_RT)")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.grid(True)
+        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
+        plt.close()
+
+    def optimize_with_RT_C2W(self, max_iter=1000, tol=1e-6):
         """Camera-to-Worldパラメータ(カメラの回転と中心位置)を最適化してFを構築。
         カメラ中心位置とカメラ座標系→ワールド座標系の回転を最適化するため勾配のスケールが揃いやすい。
         """
