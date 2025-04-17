@@ -674,6 +674,9 @@ class Initial3DReconstructor:
                 qq_final, ss_final = result.x[:4], result.x[4:]
                 sigma_3_final = build_covariance_3d(qq_final, ss_final)
                 # 四元数とスケールも返す
+                if np.any(np.isnan(sigma_3_final)):
+                    print(f"found nan value in covariance matrix. ignore this gaussian {idx}")
+                    return (None, None, None, False)
                 return (sigma_3_final, qq_final, ss_final, True)
             else:
                 print(f"Failed to optimize covariance for Gaussian {idx}, ignoring Gaussian {idx}")
