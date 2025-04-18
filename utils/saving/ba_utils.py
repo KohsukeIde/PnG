@@ -351,19 +351,13 @@ def visualize_ba_results(
     os.makedirs(save_dir, exist_ok=True)
     print(f"Visualizing BA results to {save_dir}...")
     
-    # 1. RMSEの推移をプロット
-    if 'rmse_history' in ba_results:
-        rmse_plot_path = os.path.join(save_dir, "ba_rmse_progress.png")
-        plot_rmse_progress(ba_results, rmse_plot_path)
-        print(f"Saved RMSE plot to {rmse_plot_path}")
-    
     # 2. カメラの投影点比較とレンダリング比較
     # 可視化するカメラインデックスを決定
     if visualize_all_cameras:
-        camera_indices = list(range(len(reconstruction_data.get('used_images', []))))
+        camera_indices = list(range(len(reconstruction_data['used_images'])))
     else:
         # 初期ペア（最初の2つのカメラ）のみ
-        if len(reconstruction_data.get('used_images', [])) < 2:
+        if len(reconstruction_data['used_images']) < 2:
             print("Warning: Not enough cameras for initial pair comparison")
             return
         camera_indices = [0, 1]
