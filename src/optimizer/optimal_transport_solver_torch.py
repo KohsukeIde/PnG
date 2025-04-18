@@ -141,30 +141,6 @@ class OptimalTransportSolver:
             + (1.0 - torch.cos(theta)) * (K @ K)                   # (1-cos(θ))K² term
         )
 
-    def build_f_from_rt(self, rvec: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
-        """rvec, tvec から F を構築。
-        F = K2^-T [t]_x R K1^-1
-        """
-        R = self.rodrigues(rvec)
-
-        # [t]_x も同様に zeros + 代入
-        tx = torch.zeros((3,3), device=self.device)
-        tx[0,1] = -tvec[2]
-        tx[0,2] =  tvec[1]
-        tx[1,0] =  tvec[2]
-        tx[1,2] = -tvec[0]
-        tx[2,0] = -tvec[1]
-        tx[2,1] =  tvec[0]
-
-        E = tx @ R  # (3,3)
-
-        K1_inv = torch.inverse(self.k1)
-        K2_inv = torch.inverse(self.k2)
-        K2_inv_T = K2_inv.transpose(0,1)
-
-        F = K2_inv_T @ E @ K1_inv
-        return F
-
     def _build_F_from_wc(self, R_wc: torch.Tensor, t_wc: torch.Tensor) -> torch.Tensor:
         """R_wc, t_wc から F を構築。(build_f_from_rtの代替関数)
         F = K2^-T [t]_x R K1^-1
