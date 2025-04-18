@@ -213,29 +213,51 @@ class OptimalTransportSolver:
     #     covariance = r @ s @ r.transpose(1, 2)  # shape (K, 2, 2)
     #     return covariance
     
+    def _hat(self, v: torch.Tensor) -> torch.Tensor:
+        """Skew‑symmetric matrix (hat operator) for a 3‑vector."""
+        h = torch.zeros((3, 3), dtype=v.dtype, device=v.device)
+        h[0, 1], h[0, 2] = -v[2],  v[1]
+        h[1, 0], h[1, 2] =  v[2], -v[0]
+        h[2, 0], h[2, 1] = -v[1],  v[0]
+        return h
+
+
     def rodrigues(self, rvec: torch.Tensor) -> torch.Tensor:
-        """Rodrigues変換 (OpenCVのcv2.Rodrigues相当)。
-        rvec: (3,) -> 回転ベクトル
-        Returns : (3,3) 回転行列
-        """
-        # ノルム(回転角)
-        theta = torch.clamp(torch.norm(rvec), min=1e-12)
-        # 単位方向
+        """SO(3) exponential map with small‑angle safeguard and autograd support."""
+        theta = torch.linalg.norm(rvec)
+        if theta < 1.0e-6:                               # 1st‑order Taylor
+            return torch.eye(3, device=rvec.device) + self._hat(rvec)
         r_axis = rvec / theta
+        K = self._hat(r_axis)
+        return (
+            torch.eye(3, device=rvec.device)
+            + torch.sin(theta) * K
+            + (1.0 - torch.cos(theta)) * (K @ K)
+        )
+  
+    # def rodrigues(self, rvec: torch.Tensor) -> torch.Tensor:
+    #     """Rodrigues変換 (OpenCVのcv2.Rodrigues相当)。
+    #     rvec: (3,) -> 回転ベクトル
+    #     Returns : (3,3) 回転行列
+    #     """
+    #     # ノルム(回転角)
+    #     theta = torch.clamp(torch.norm(rvec), min=1e-12)
+    #     # 単位方向
+    #     r_axis = rvec / theta
 
-        # 外積行列Kを「定数tensor([...])」ではなく，zeros + 代入で組み立て(じゃないと勾配流れない...)
-        K = torch.zeros((3,3), dtype=torch.float32, device=rvec.device)
-        K[0,1] = -r_axis[2]
-        K[0,2] =  r_axis[1]
-        K[1,0] =  r_axis[2]
-        K[1,2] = -r_axis[0]
-        K[2,0] = -r_axis[1]
-        K[2,1] =  r_axis[0]
+    #     # 外積行列Kを「定数tensor([...])」ではなく，zeros + 代入で組み立て(じゃないと勾配流れない...)
+    #     K = torch.zeros((3,3), dtype=torch.float32, device=rvec.device)
+    #     K[0,1] = -r_axis[2]
+    #     K[0,2] =  r_axis[1]
+    #     K[1,0] =  r_axis[2]
+    #     K[1,2] = -r_axis[0]
+    #     K[2,0] = -r_axis[1]
+    #     K[2,1] =  r_axis[0]
 
-        # Rodrigues formula
-        I = torch.eye(3, dtype=torch.float32, device=rvec.device)
-        R = I + torch.sin(theta)*K + (1.0 - torch.cos(theta))*(K @ K)
-        return R
+    #     # Rodrigues formula
+    #     I = torch.eye(3, dtype=torch.float32, device=rvec.device)
+    #     R = I + torch.sin(theta)*K + (1.0 - torch.cos(theta))*(K @ K)
+    #     return R
 
     def build_f_from_rt(self, rvec: torch.Tensor, tvec: torch.Tensor) -> torch.Tensor:
         """rvec, tvec から F を構築。
@@ -416,7 +438,7 @@ class OptimalTransportSolver:
         # alpha and beta represent the total mass (or approximated mass) of each Gaussian
         alpha = self.alpha1  # shape (K1,)
         beta = self.alpha2  # shape (K2,)
-
+        print("cost min/max", cost_matrix.min(), cost_matrix.max())
         kernel = torch.exp(-cost_matrix / self.epsilon)  # shape (K1, K2)
 
         # Initialize u, v to 1
@@ -547,7 +569,7 @@ class OptimalTransportSolver:
     #     print(f"Optimization loss plot saved to '{plt_path}'")
 
 
-    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental_sampson(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using the Sampson error
         with a Fundamental Matrix F. Also includes color difference term as an example.
 
@@ -639,7 +661,7 @@ class OptimalTransportSolver:
 
         return cost_matrix
 
-    def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
 
         This replaces the Homography-based distance with an epipolar distance.
@@ -788,212 +810,243 @@ class OptimalTransportSolver:
 
     
     
-    def optimize_with_RT(self, max_iter=1000, tol=1e-6, save_diagnostics=True, diagnostics_dir=None):
-        """R,tを直接最適化してFを構築して self.f に反映させる。
-        最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
+    # def optimize_with_RT(self, max_iter=1000, tol=1e-6, save_diagnostics=True, diagnostics_dir=None):
+    #     """R,tを直接最適化してFを構築して self.f に反映させる。
+    #     最終的に得られた rvec,tvec を「カメラ姿勢(R,t)」として利用する想定。
         
-        Args:
-            max_iter: Maximum number of iterations
-            tol: Convergence tolerance
-            save_diagnostics: Whether to save detailed diagnostic information
-            diagnostics_dir: Directory to save diagnostics (default: results/diagnostics_rt)
-        """
-        # History tracking for diagnostics
-        loss_history = []
-        param_history = {'rvec': [], 'tvec': []}
-        grad_history = {'rvec': [], 'tvec': []}
+    #     Args:
+    #         max_iter: Maximum number of iterations
+    #         tol: Convergence tolerance
+    #         save_diagnostics: Whether to save detailed diagnostic information
+    #         diagnostics_dir: Directory to save diagnostics (default: results/diagnostics_rt)
+    #     """
+    #     # History tracking for diagnostics
+    #     loss_history = []
+    #     param_history = {'rvec': [], 'tvec': []}
+    #     grad_history = {'rvec': [], 'tvec': []}
 
-        # R,tを最適化パラメータ設定  (これは相対変換)
-        if not hasattr(self, 'rvec'):
-            self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
-        if not hasattr(self, 'tvec'):
-            self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
+    #     # R,tを最適化パラメータ設定  (これは相対変換)
+    #     if not hasattr(self, 'rvec'):
+    #         self.rvec = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+    #     if not hasattr(self, 'tvec'):
+    #         self.tvec = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
         
-        optimizer = torch.optim.Adam([
-            {'params': self.rvec, 'lr': 5e-2},
-            {'params': self.tvec, 'lr': 5e-2} 
-        ])
-        prev_loss_val = float('inf')
+    #     optimizer = torch.optim.Adam([
+    #         {'params': self.rvec, 'lr': 5e-2},
+    #         {'params': self.tvec, 'lr': 5e-2} 
+    #     ])
+    #     prev_loss_val = float('inf')
 
-        transport_dir = os.path.join("results", "transport_RT")
-        os.makedirs(transport_dir, exist_ok=True)
+    #     transport_dir = os.path.join("results", "transport_RT")
+    #     os.makedirs(transport_dir, exist_ok=True)
 
-        if diagnostics_dir is None:
-            diagnostics_dir = os.path.join("results", "diagnostics_rt")
+    #     if diagnostics_dir is None:
+    #         diagnostics_dir = os.path.join("results", "diagnostics_rt")
         
-        os.makedirs(diagnostics_dir, exist_ok=True)
+    #     os.makedirs(diagnostics_dir, exist_ok=True)
 
-        pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
+    #     pbar = tqdm(range(max_iter), desc="Optimizing R,t", leave=True)
         
-        for iteration in pbar:
-            optimizer.zero_grad()
+    #     for iteration in pbar:
+    #         optimizer.zero_grad()
 
-            F = self.build_f_from_rt(self.rvec, self.tvec)
+    #         F = self.build_f_from_rt(self.rvec, self.tvec)
 
-            cost_matrix = self.compute_cost_matrix_fundamental(F)
+    #         cost_matrix = self.compute_cost_matrix_fundamental(F)
 
-            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
+    #         transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
 
-            # ロス計算 + 逆伝播
-            loss = torch.sum(transport * cost_matrix)
-            loss.backward()
+    #         # ロス計算 + 逆伝播
+    #         loss = torch.sum(transport * cost_matrix)
+    #         loss.backward()
 
-            # Record history before updating parameters
-            current_loss = loss.item()
-            loss_history.append(current_loss)
+    #         # Record history before updating parameters
+    #         current_loss = loss.item()
+    #         loss_history.append(current_loss)
             
-            # Save parameter and gradient history
-            param_history['rvec'].append(self.rvec.clone())
-            param_history['tvec'].append(self.tvec.clone())
-            grad_history['rvec'].append(self.rvec.grad.clone())
-            grad_history['tvec'].append(self.tvec.grad.clone())
+    #         # Save parameter and gradient history
+    #         param_history['rvec'].append(self.rvec.clone())
+    #         param_history['tvec'].append(self.tvec.clone())
+    #         grad_history['rvec'].append(self.rvec.grad.clone())
+    #         grad_history['tvec'].append(self.tvec.grad.clone())
 
-            # パラメータ更新
-            optimizer.step()
+    #         # パラメータ更新
+    #         optimizer.step()
 
-            # 収束判定
-            loss_diff = abs(prev_loss_val - current_loss)
-            if iteration > 5 and loss_diff < tol:
-                pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
-                break
-            prev_loss_val = current_loss
+    #         # 収束判定
+    #         loss_diff = abs(prev_loss_val - current_loss)
+    #         if iteration > 5 and loss_diff < tol:
+    #             pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
+    #             break
+    #         prev_loss_val = current_loss
 
-            if iteration % 10 == 0:
-                grad_r = self.rvec.grad.norm().item()
-                grad_t = self.tvec.grad.norm().item()
-                pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
+    #         if iteration % 10 == 0:
+    #             grad_r = self.rvec.grad.norm().item()
+    #             grad_t = self.tvec.grad.norm().item()
+    #             pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_t=f"{grad_t:.6f}")
 
-                # Transport matrix visualization code (unchanged from original)
-                if iteration % 10 == 0 or iteration == max_iter - 1:
-                    with torch.no_grad():
-                        t_np = transport.detach().cpu().numpy()
+    #             # Transport matrix visualization code (unchanged from original)
+    #             if iteration % 10 == 0 or iteration == max_iter - 1:
+    #                 with torch.no_grad():
+    #                     t_np = transport.detach().cpu().numpy()
                         
-                        rows, cols = t_np.shape
-                        aspect_ratio = cols / rows
+    #                     rows, cols = t_np.shape
+    #                     aspect_ratio = cols / rows
                         
-                        if rows > cols:
-                            fig_width = 8
-                            fig_height = min(20, fig_width / aspect_ratio)
-                        else:
-                            fig_height = 6
-                            fig_width = min(20, fig_height * aspect_ratio)
+    #                     if rows > cols:
+    #                         fig_width = 8
+    #                         fig_height = min(20, fig_width / aspect_ratio)
+    #                     else:
+    #                         fig_height = 6
+    #                         fig_width = min(20, fig_height * aspect_ratio)
                         
-                        plt.figure(figsize=(fig_width, fig_height))
+    #                     plt.figure(figsize=(fig_width, fig_height))
                         
-                        if rows > 1000 or cols > 1000:
-                            downsample_factor = max(1, int(max(rows, cols) / 1000))
-                            t_np_display = t_np[::downsample_factor, ::downsample_factor]
-                            plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
-                            plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
-                        else:
-                            plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
-                            plt.title(f"Transport Plan at Iteration {iteration}")
+    #                     if rows > 1000 or cols > 1000:
+    #                         downsample_factor = max(1, int(max(rows, cols) / 1000))
+    #                         t_np_display = t_np[::downsample_factor, ::downsample_factor]
+    #                         plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+    #                         plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
+    #                     else:
+    #                         plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
+    #                         plt.title(f"Transport Plan at Iteration {iteration}")
                         
-                        plt.colorbar(label="Transport Plan Value")
-                        plt.xlabel("Image 2 Gaussians")
-                        plt.ylabel("Image 1 Gaussians")
+    #                     plt.colorbar(label="Transport Plan Value")
+    #                     plt.xlabel("Image 2 Gaussians")
+    #                     plt.ylabel("Image 1 Gaussians")
                         
-                        plt.tight_layout()
-                        plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-                        plt.savefig(plt_path, dpi=150)
-                        plt.close()
+    #                     plt.tight_layout()
+    #                     plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+    #                     plt.savefig(plt_path, dpi=150)
+    #                     plt.close()
 
-        # Build final F from the optimized R,t
-        final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
+    #     # Build final F from the optimized R,t
+    #     final_F = self.build_f_from_rt(self.rvec, self.tvec).detach()
 
-        # Save to solver.f
-        with torch.no_grad():
-            self.f = final_F
+    #     # Save to solver.f
+    #     with torch.no_grad():
+    #         self.f = final_F
 
-        # Plot basic loss history
-        plt.figure()
-        plt.plot(loss_history, '-o')
-        plt.title("Loss (optimize_with_RT)")
-        plt.xlabel("Iteration")
-        plt.ylabel("Loss")
-        plt.grid(True)
-        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
-        plt.close()
+    #     # Plot basic loss history
+    #     plt.figure()
+    #     plt.plot(loss_history, '-o')
+    #     plt.title("Loss (optimize_with_RT)")
+    #     plt.xlabel("Iteration")
+    #     plt.ylabel("Loss")
+    #     plt.grid(True)
+    #     plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT.png"))
+    #     plt.close()
         
-        # Save detailed diagnostics if requested
-        if save_diagnostics:
-            self.save_optimization_diagnostics(
-                output_dir=diagnostics_dir,
-                loss_history=loss_history,
-                param_history=param_history,
-                grad_history=grad_history
-            )
+    #     # Save detailed diagnostics if requested
+    #     if save_diagnostics:
+    #         self.save_optimization_diagnostics(
+    #             output_dir=diagnostics_dir,
+    #             loss_history=loss_history,
+    #             param_history=param_history,
+    #             grad_history=grad_history
+    #         )
 
-    def optimize_with_RT_C2W(self, max_iter=1000, tol=1e-6, save_diagnostics=True, diagnostics_dir=None):
-        """Camera-to-Worldパラメータ(カメラの回転と中心位置)を最適化してFを構築。
-        カメラ中心位置とカメラ座標系→ワールド座標系の回転を最適化するため勾配のスケールが揃いやすい。
+    def optimize_with_RT_C2W(self, max_iter=1000, tol=1e-6,
+                            save_diagnostics=True, diagnostics_dir=None,
+                            rot_scale: float = 5.0):
+        """Optimize camera-to-world parameters (R_cw, c_w) using optimal transport loss.
+        
+        This method optimizes the camera-to-world transformation parameters (rotation and camera center)
+        to find the best matching between two sets of 2D Gaussians. It uses SGD optimization
+        with momentum to minimize the optimal transport cost based on the fundamental matrix constraint.
+        
+        The optimized parameters represent the camera-to-world transformation:
+        - rvec_cw: Rotation vector (axis-angle) for camera-to-world rotation
+        - center: Camera center position in world coordinates
+        
+        These parameters are then converted to world-to-camera (R_wc, t_wc) for computing the 
+        fundamental matrix. The method also tracks optimization history and provides
+        visualization of the transport plan and optimization progress.
         
         Args:
-            max_iter: Maximum number of iterations
-            tol: Convergence tolerance
-            save_diagnostics: Whether to save detailed diagnostic information
-            diagnostics_dir: Directory to save diagnostics (default: results/diagnostics_c2w)
-        """
-        # History tracking for diagnostics
-        loss_history = []
-        param_history = {'rvec_cw': [], 'center': []}
-        grad_history = {'rvec_cw': [], 'center': []}
+            max_iter (int): Maximum number of optimization iterations. Default: 1000.
+            tol (float): Convergence tolerance for loss change. Default: 1e-6.
+            save_diagnostics (bool): Whether to save detailed diagnostic information about 
+                                    the optimization process. Default: True.
+            diagnostics_dir (str, optional): Directory path to save diagnostic information.
+                                            If None, uses "results/diagnostics_c2w". Default: None.
+            rot_scale (float): Scaling factor for rotation gradients, which helps balance
+                            the optimization between rotation and translation parameters. Default: 5.0.
         
-        # C2Wパラメータの初期化
+        Returns:
+            None: The optimized transformation parameters are stored as instance attributes:
+                  - self.rvec_cw: Camera-to-world rotation vector
+                  - self.center: Camera center in world coordinates
+                  - self.f: The resulting fundamental matrix
+                  - self.rvec, self.tvec: World-to-camera parameters (for compatibility)
+        """
+
+        # ------------------------- 履歴用 ------------------------- #
+        loss_history, param_history, grad_history = [], {'rvec_cw': [], 'center': []}, {'rvec_cw': [], 'center': []}
+
+        # ------------------------- パラメータ初期化 ----------------------- #
         if not hasattr(self, 'rvec_cw'):
             self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
         if not hasattr(self, 'center'):
-            # カメラ中心位置：少し離れた位置に初期化
             self.center = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
-        
-        optimizer = torch.optim.Adam([
-            {'params': self.rvec_cw, 'lr': 5e-2},
-            {'params': self.center, 'lr': 5e-2} 
-        ])
+
+        # ----------- Adam → SGD (momentum0.9, weight_decay0) -------------- #
+        optimizer = torch.optim.SGD(
+            [{'params': self.rvec_cw, 'lr': 5e-4},      # 回転を速め
+            {'params': self.center,  'lr': 5e-4}],    # 並進を遅め
+            momentum=0.9, weight_decay=0.0, dampening=0
+        )
+
         prev_loss_val = float('inf')
 
+        # -------------------------  出力ディレクトリ  ---------------------- #
         transport_dir = os.path.join("results", "transport_RT_C2W")
         os.makedirs(transport_dir, exist_ok=True)
-
-        if diagnostics_dir is None:
-            diagnostics_dir = os.path.join("results", "diagnostics_c2w")
-        
+        diagnostics_dir = diagnostics_dir or os.path.join("results", "diagnostics_c2w")
         os.makedirs(diagnostics_dir, exist_ok=True)
 
         pbar = tqdm(range(max_iter), desc="Optimizing C2W", leave=True)
-        
+
+        # -------------------------  ループ  ------------------------------- #
         for iteration in pbar:
             optimizer.zero_grad()
 
-            # C2W -> W2C への変換
-            R_cw = self.rodrigues(self.rvec_cw)  # カメラ→ワールドの回転行列
-            R_wc = R_cw.transpose(0, 1)          # ワールド→カメラの回転行列
-            t_wc = -R_wc @ self.center           # ワールド→カメラの並進ベクトル
-            
-            # rvecとtvecから直接Fを構築する代わりに、変換したR_wcとt_wcを使用
+            # C2W→W2C 変換
+            R_cw = self.rodrigues(self.rvec_cw)
+            R_wc = R_cw.t()
+            t_wc = -R_wc @ self.center
+
             F = self._build_F_from_wc(R_wc, t_wc)
 
+            # OT 損失
             cost_matrix = self.compute_cost_matrix_fundamental(F)
-            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5, max_iter=10000, tol=1e-6)
-
-            # ロス計算 + 逆伝播
+            transport   = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5,
+                                                            max_iter=10000, tol=1e-6)
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
 
-            # Record history before updating parameters
+            # ---- 回転勾配を rot_scale 倍 ----
+            if self.rvec_cw.grad is not None:
+                self.rvec_cw.grad.mul_(rot_scale)
+
+            # ---- ログ ----
             current_loss = loss.item()
             loss_history.append(current_loss)
-            
-            # Save parameter and gradient history
             param_history['rvec_cw'].append(self.rvec_cw.clone())
             param_history['center'].append(self.center.clone())
             grad_history['rvec_cw'].append(self.rvec_cw.grad.clone() if self.rvec_cw.grad is not None else None)
             grad_history['center'].append(self.center.grad.clone() if self.center.grad is not None else None)
 
-            # パラメータ更新
+            # ---- 更新 ----
             optimizer.step()
 
-            # 収束判定
+            # π クランプ
+            with torch.no_grad():
+                theta = torch.linalg.norm(self.rvec_cw)
+                if theta > np.pi:
+                    self.rvec_cw.mul_(np.pi / theta)
+
+            # ---- 収束判定 ----
             loss_diff = abs(prev_loss_val - current_loss)
             if iteration > 5 and loss_diff < tol:
                 pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
@@ -1005,63 +1058,54 @@ class OptimalTransportSolver:
                 grad_c = self.center.grad.norm().item() if self.center.grad is not None else 0
                 pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_c=f"{grad_c:.6f}")
 
-                # Transport matrix visualization (as in the original code)
+                # ---- Transport matrix visualization (元コードと同一) ----
                 if iteration % 10 == 0 or iteration == max_iter - 1:
                     with torch.no_grad():
                         t_np = transport.detach().cpu().numpy()
-                        
-                        # Row/column dimensions and aspect ratio adjustment
-                        rows, cols = t_np.shape
-                        aspect_ratio = cols / rows
-                        
-                        if rows > cols:
-                            fig_width = 8
-                            fig_height = min(20, fig_width / aspect_ratio)
-                        else:
-                            fig_height = 6
-                            fig_width = min(20, fig_height * aspect_ratio)
-                        
-                        plt.figure(figsize=(fig_width, fig_height))
-                        
-                        # Downsampling for large matrices
-                        if rows > 1000 or cols > 1000:
-                            downsample_factor = max(1, int(max(rows, cols) / 1000))
-                            t_np_display = t_np[::downsample_factor, ::downsample_factor]
-                            plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
-                            plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
-                        else:
-                            plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
-                            plt.title(f"Transport Plan at Iteration {iteration}")
-                        
-                        plt.colorbar(label="Transport Plan Value")
-                        plt.xlabel("Image 2 Gaussians")
-                        plt.ylabel("Image 1 Gaussians")
-                        
-                        plt.tight_layout()
-                        plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-                        plt.savefig(plt_path, dpi=150)
-                        plt.close()
 
-        # 最終的なF行列を計算して保存
+                    rows, cols = t_np.shape
+                    aspect_ratio = cols / rows
+
+                    if rows > cols:
+                        fig_width = 8
+                        fig_height = min(20, fig_width / aspect_ratio)
+                    else:
+                        fig_height = 6
+                        fig_width = min(20, fig_height * aspect_ratio)
+
+                    plt.figure(figsize=(fig_width, fig_height))
+
+                    if rows > 1000 or cols > 1000:
+                        downsample_factor = max(1, int(max(rows, cols) / 1000))
+                        t_np_display = t_np[::downsample_factor, ::downsample_factor]
+                        plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+                        plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
+                    else:
+                        plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
+                        plt.title(f"Transport Plan at Iteration {iteration}")
+
+                    plt.colorbar(label="Transport Plan Value")
+                    plt.xlabel("Image 2 Gaussians")
+                    plt.ylabel("Image 1 Gaussians")
+
+                    plt.tight_layout()
+                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
+                    plt.savefig(plt_path, dpi=150)
+                    plt.close()
+
+        # ------------------------- 最終 F を保存 --------------------------- #
         with torch.no_grad():
-            # C2W回転ベクトルから回転行列を計算
-            R_cw = self.rodrigues(self.rvec_cw)          
-            # W2C回転行列を計算（単純に転置）
-            R_wc = R_cw.transpose(0, 1)                  
-            # W2C並進ベクトルを計算
-            t_wc = -R_wc @ self.center                   
-            
-            # 回転行列を使用してF行列を構築
+            R_cw = self.rodrigues(self.rvec_cw)
+            R_wc = R_cw.t()
+            t_wc = -R_wc @ self.center
             final_F = self._build_F_from_wc(R_wc, t_wc)
             self.f = final_F
-            
-            # 互換性のために、最適化したC2Wから元のW2Cパラメータを計算して保存
-            # 回転行列からRodrigues回転ベクトルへの逆変換
+
             rvec_numpy, _ = cv2.Rodrigues(R_wc.cpu().numpy())
             self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
             self.tvec = nn.Parameter(t_wc)
 
-        # Basic loss plot
+        # ------------------------- 損失プロット (元コードと同一) ------------ #
         plt.figure()
         plt.plot(loss_history, '-o')
         plt.title("Loss (optimize_with_RT_C2W)")
@@ -1070,8 +1114,8 @@ class OptimalTransportSolver:
         plt.grid(True)
         plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT_C2W.png"))
         plt.close()
-        
-        # Save detailed diagnostics if requested
+
+        # ------------------------- 最適化過程描画 ------------- #
         if save_diagnostics:
             self.save_optimization_diagnostics_C2W(
                 output_dir=diagnostics_dir,
@@ -1079,6 +1123,7 @@ class OptimalTransportSolver:
                 param_history=param_history,
                 grad_history=grad_history
             )
+
 
     def save_optimization_diagnostics(self, 
                                     output_dir: str,
