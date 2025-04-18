@@ -287,6 +287,8 @@ class BundleAdjuster:
         result = least_squares(
             self._compute_residuals,
             params_initial,
+            jac='2-point',
+            x_scale='jac',
             method=method,
             loss=loss_fn,
             f_scale=self.loss_scale,
@@ -697,7 +699,7 @@ class BundleAdjuster:
             use_staged: Whether to use staged optimization (COLMAP style)
             
         Returns:
-            Dict with optimization results
+            Dict with optimization results including W2C rotations and translations
         """
         # エピポーラフィルタリングが有効な場合、観測をフィルタリング
         if epipolar_threshold is not None and epipolar_threshold > 0:
@@ -814,13 +816,33 @@ class BundleAdjuster:
             # Update the point_id_manager with optimized parameters
             self._update_point_id_manager(results['success'])
             
+            # カメラパラメータをW2C形式に変換する
+            optimized_cameras_w2c = []
+            for R_ctw, c in results['optimized_cameras']:
+                # カメラ→ワールドからワールド→カメラへの変換
+                R_wtc = R_ctw.T  # 回転行列の転置
+                t_wtc = -R_wtc @ c  # 平行移動ベクトル
+                optimized_cameras_w2c.append((R_wtc, t_wtc))
+            
+            # 結果を返す際にW2C形式のカメラパラメータを使用
+            results['optimized_cameras_w2c'] = optimized_cameras_w2c
+            
             return results
         except Exception as e:
             print(f"Bundle Adjustment failed with error: {str(e)}")
+            
+            # エラー時にも同様の形式を維持
+            optimized_cameras_w2c = []
+            for R_ctw, c in self.camera_to_world_list:
+                R_wtc = R_ctw.T
+                t_wtc = -R_wtc @ c
+                optimized_cameras_w2c.append((R_wtc, t_wtc))
+            
             return {
                 'success': False,
                 'message': str(e),
                 'optimized_cameras': self.camera_to_world_list,
+                'optimized_cameras_w2c': optimized_cameras_w2c,
                 'optimized_points': self.points_3d
             }
             
@@ -917,19 +939,30 @@ class BundleAdjuster:
         filtered_count = 0
         total_observations = 0
         points_affected = 0
+        points_skipped_too_few_obs = 0  # 観測数が少なすぎてスキップされた点の数
+        total_points_processed = 0  # 処理された点の総数
+        
+        print(f"======= エピポーラフィルタリングを開始 (閾値: {threshold}px, 最小インライア比率: {min_inlier_ratio}) =======")
+        print(f"ポイント総数: {len(self.point_ids)}")
         
         # 全ての点を反復処理
         for point_id in self.point_ids:
             if point_id not in self.point_id_manager.points:
                 continue
                 
+            total_points_processed += 1
             point = self.point_id_manager.points[point_id]
             cameras_observing_point = list(point.observations.keys())
             total_observations += len(cameras_observing_point)
             
-            # 観測が3未満の点はスキップ（フィルタリング後に少なくとも2つ必要）
-            if len(cameras_observing_point) < 3:
+            if len(cameras_observing_point) < 2:
+                points_skipped_too_few_obs += 1
+                if verbose and total_points_processed % 100 == 0:
+                    print(f"ポイント {point_id}: 観測数 {len(cameras_observing_point)} < 3 のためスキップ")
                 continue
+            
+            if verbose and total_points_processed % 100 == 0:
+                print(f"\nポイント {point_id} を処理中: {len(cameras_observing_point)} 観測")
             
             # この点の観測をフィルタリング
             filtered_cameras = set()
@@ -937,11 +970,14 @@ class BundleAdjuster:
             # 各カメラを他のすべてのカメラと比較
             for camera_id1 in cameras_observing_point:
                 if camera_id1 not in self.camera_id_to_index:
+                    if verbose and total_points_processed % 100 == 0:
+                        print(f"  カメラID {camera_id1} は最適化インデックスに存在しないためスキップ")
                     continue
                     
                 # 外れ値としてのこの観測を持つ他のカメラの数をカウント
                 outlier_count = 0
                 total_checked = 0
+                distances = []  # デバッグ用に距離を保存
                 
                 for camera_id2 in cameras_observing_point:
                     if camera_id2 == camera_id1 or camera_id2 not in self.camera_id_to_index:
@@ -960,48 +996,83 @@ class BundleAdjuster:
                     
                     # いずれかの点がNaNの場合はスキップ
                     if np.isnan(point_2d1).any() or np.isnan(point_2d2).any():
+                        if verbose and total_points_processed % 100 == 0:
+                            print(f"    カメラ {camera_id1}-{camera_id2}: NaN値のためスキップ")
                         continue
                     
                     # 基礎行列を計算
-                    F = self._calculate_fundamental_matrix(
-                        R1_ctw, c1, K1, 
-                        R2_ctw, c2, K2
-                    )
-                    
-                    # 2番目の画像でのエピポーラ線を計算
-                    point_2d1_h = np.append(point_2d1, 1)
-                    epipolar_line2 = F @ point_2d1_h
-                    
-                    # エピポーラ線の法線のノルムを計算
-                    line_normal = np.sqrt(epipolar_line2[0]**2 + epipolar_line2[1]**2)
-                    if line_normal < 1e-10:  # 非常に小さい場合はスキップ（0除算回避）
+                    try:
+                        F = self._calculate_fundamental_matrix(
+                            R1_ctw, c1, K1, 
+                            R2_ctw, c2, K2
+                        )
+                        
+                        # 2番目の画像でのエピポーラ線を計算
+                        point_2d1_h = np.append(point_2d1, 1)
+                        epipolar_line2 = F @ point_2d1_h
+                        
+                        # エピポーラ線の法線のノルムを計算
+                        line_normal = np.sqrt(epipolar_line2[0]**2 + epipolar_line2[1]**2)
+                        if line_normal < 1e-10:  # 非常に小さい場合はスキップ（0除算回避）
+                            if verbose and total_points_processed % 100 == 0:
+                                print(f"    カメラ {camera_id1}-{camera_id2}: エピポーラ線の法線が小さすぎるためスキップ")
+                            continue
+                        
+                        # 2番目の点からエピポーラ線までの距離を計算
+                        point_2d2_h = np.append(point_2d2, 1)
+                        distance = abs(np.dot(epipolar_line2, point_2d2_h)) / line_normal
+                        
+                        total_checked += 1
+                        distances.append(distance)
+                        if distance > threshold:
+                            outlier_count += 1
+                            if verbose and total_points_processed % 100 == 0:
+                                print(f"    カメラ {camera_id1}-{camera_id2}: 距離 {distance:.2f}px > 閾値 {threshold}px (外れ値)")
+                    except Exception as e:
+                        if verbose and total_points_processed % 100 == 0:
+                            print(f"    カメラ {camera_id1}-{camera_id2}: エラー発生 - {str(e)}")
                         continue
-                    
-                    # 2番目の点からエピポーラ線までの距離を計算
-                    point_2d2_h = np.append(point_2d2, 1)
-                    distance = abs(np.dot(epipolar_line2, point_2d2_h)) / line_normal
-                    
-                    total_checked += 1
-                    if distance > threshold:
-                        outlier_count += 1
                 
-                # チェックの半分以上が失敗した場合、この観測をフィルタリング
-                if total_checked > 0 and outlier_count / total_checked > (1 - min_inlier_ratio):
-                    filtered_cameras.add(camera_id1)
-                    filtered_count += 1
+                # チェック結果の出力
+                if total_checked > 0:
+                    outlier_ratio = outlier_count / total_checked
+                    if verbose and total_points_processed % 100 == 0:
+                        print(f"  カメラ {camera_id1}: {total_checked}回チェック, {outlier_count}外れ値 (比率: {outlier_ratio:.2f})")
+                        if distances:
+                            print(f"    距離: min={min(distances):.2f}px, max={max(distances):.2f}px, avg={sum(distances)/len(distances):.2f}px")
+                    
+                    # チェックの半分以上が失敗した場合、この観測をフィルタリング
+                    if outlier_ratio > (1 - min_inlier_ratio):
+                        filtered_cameras.add(camera_id1)
+                        if verbose and total_points_processed % 100 == 0:
+                            print(f"  カメラ {camera_id1}: 外れ値比率 {outlier_ratio:.2f} > {1-min_inlier_ratio:.2f} のためフィルタリング")
+                else:
+                    if verbose and total_points_processed % 100 == 0:
+                        print(f"  カメラ {camera_id1}: 有効なチェックが0のためスキップ")
             
             # フィルタリングされたカメラを観測から削除
             original_count = len(point.observations)
             for camera_id in filtered_cameras:
                 if camera_id in point.observations:
+                    filtered_count += 1
                     del point.observations[camera_id]
+                    if verbose and total_points_processed % 100 == 0:
+                        print(f"ポイント {point_id}: カメラ {camera_id} の観測を削除")
             
             # 点が影響を受けたかどうかを確認
             if len(point.observations) < original_count:
                 points_affected += 1
+                if verbose and total_points_processed % 100 == 0:
+                    print(f"ポイント {point_id}: {original_count - len(point.observations)}観測削除 → 残り{len(point.observations)}観測")
         
-        if verbose:
-            print(f"エピポーラフィルタリング: 合計{total_observations}観測から{filtered_count}を除外")
-            print(f"{points_affected}点に影響, 閾値={threshold:.2f}px")
+        # 全体の統計情報を表示
+        print(f"\n========= エピポーラフィルタリング結果 =========")
+        print(f"処理対象ポイント数: {total_points_processed}")
+        print(f"観測が3未満でスキップされたポイント数: {points_skipped_too_few_obs} ({points_skipped_too_few_obs/max(1, total_points_processed)*100:.1f}%)")
+        print(f"影響を受けたポイント数: {points_affected} ({points_affected/max(1, total_points_processed)*100:.1f}%)")
+        print(f"元の観測総数: {total_observations}")
+        print(f"フィルタリングされた観測数: {filtered_count} ({filtered_count/max(1, total_observations)*100:.1f}%)")
+        print(f"閾値: {threshold}px, 最小インライア比率: {min_inlier_ratio}")
+        print(f"============================================")
         
         return filtered_count
