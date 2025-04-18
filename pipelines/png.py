@@ -9,6 +9,7 @@ import time
 
 import numpy as np
 import torch
+import cv2
 from tqdm import tqdm
 from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
@@ -25,7 +26,8 @@ from utils.export.export_utils import (
     export_gaussians_to_colmap_dir
 )
 from src.optimizer.bundle_adjuster import BundleAdjuster
-from src.optimizer.observation_builder import ObservationBuilder
+from src.optimizer.observation_manager import ObservationManager
+from utils.saving.ba_utils import visualize_ba_results
 
 # Fix module import issues
 sys.modules['twodgs'] = sys.modules['src.primitive.twod_gaussians_rs']
@@ -37,7 +39,8 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless",
+        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/nerf_synthetic/textureless",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/DTU/scan63",
         help="Path to the data directory containing images and COLMAP data"
     )
     parser.add_argument(
@@ -49,7 +52,8 @@ def parse_args():
     parser.add_argument(
         "--fitted_gaussians_dir",
         type=str,
-        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
+        # default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/textureless_32gs_5kiter",
+        default="/Users/kohsukeide/dev/perspective-n-gaussian/data/fitted_gs/apple_32gs_10kiter_masked",
         help="Directory containing fitted 2D Gaussians"
     )
     parser.add_argument(
@@ -74,13 +78,13 @@ def parse_args():
     parser.add_argument(
         "--min_overlap",
         type=float,
-        default=0.2,
+        default=0.6,
         help="Minimum overlap ratio between views"
     )
     parser.add_argument(
         "--max_overlap",
         type=float,
-        default=0.7,
+        default=0.8,
         help="Maximum overlap ratio between views (for diversity)"
     )
     parser.add_argument(
@@ -92,7 +96,7 @@ def parse_args():
     parser.add_argument(
         "--transport_threshold",
         type=float,
-        default=1e-6,
+        default=0.0,
         help="Threshold for transport values"
     )
     parser.add_argument(
@@ -127,7 +131,7 @@ def parse_args():
     parser.add_argument(
         "--ba_iterations",
         type=int,
-        default=100,
+        default=200,
         help="Maximum iterations for Bundle Adjustment (must be more than 10)"
     )
     parser.add_argument(
@@ -151,13 +155,13 @@ def parse_args():
     parser.add_argument(
         "--force_single_intrinsic",
         action="store_true",
-        default=False,
+        default=True,
         help="Force using a single intrinsic matrix for all cameras (useful when COLMAP data is incomplete)"
     )
     parser.add_argument(
         "--use_nerf_intrinsics",
         action="store_true",
-        default=True,
+        default=False,
         help="Use camera intrinsics from NeRF dataset's transforms_train.json"
     )
     parser.add_argument(
@@ -205,6 +209,11 @@ def get_image_names(directory: str) -> List[str]:
     image_names = [os.path.basename(path) for path in image_names]
     
     return sorted(image_names)
+
+def c2w_to_w2c(R_ctw, C_w):
+    R_wtc = R_ctw.T
+    t_wtc = -R_wtc @ C_w
+    return R_wtc, t_wtc
 
 def load_nerf_intrinsics(data_dir: str) -> np.ndarray:
     """Load camera intrinsics from NeRF dataset's transforms_train.json file.
@@ -291,8 +300,8 @@ def select_initial_pair(
     gaussian_files: Dict[str, str],
     vocab_size: int = 200,
     feature_type: str = "sift",
-    min_overlap: float = 0.3,
-    max_overlap: float = 0.7,
+    min_overlap: float = 0.6,
+    max_overlap: float = 0.8,
     available_images: List[str] = None
 ) -> Tuple[str, str]:
     """Select the best initial pair of images using Bag of Visual Words.
@@ -335,7 +344,7 @@ def select_initial_pair(
     image_paths = [os.path.join(image_dir, img) for img in available_images]
     selector.process_images(image_paths)
     
-    # Calculate similarity matrix between all pairs
+    # Calculate similarity matrix between all pairs (initialization)
     similarity_matrix = np.zeros((len(available_images), len(available_images)))
     
     # Compute similarities based on the feature type
@@ -383,6 +392,7 @@ def select_initial_pair(
                     similarity_matrix[idx1, idx2] = similarity
                     similarity_matrix[idx2, idx1] = similarity
         else:
+            # randomは問題なので修正必要
             print("Warning: Not enough images with valid feature histograms")
             print("Using random similarity values")
             similarity_matrix = np.random.rand(len(available_images), len(available_images))
@@ -416,7 +426,7 @@ def select_initial_pair(
             for j in range(i+1, len(available_images)):
                 similarity = similarity_matrix[i, j]
                 # 最低限の類似度を確保
-                if similarity > 0.1:
+                if similarity > 0.2:
                     feature_richness = (feature_scores[i] + feature_scores[j]) / 2
                     score = feature_richness
                     
@@ -435,9 +445,6 @@ def select_initial_pair(
     print(f"Selected initial pair: {img1} and {img2}")
     print(f"Similarity: {similarity_matrix[best_pair[0], best_pair[1]]:.4f}")
     
-    # With the CLIP-based ViewSelector, we don't have keypoint counts anymore
-    # Instead, we're using semantic similarity from CLIP embeddings
-    
     return img1, img2, selector
 
 def perform_bundle_adjustment(
@@ -446,7 +453,10 @@ def perform_bundle_adjustment(
     device: torch.device = None,
     verbose: bool = True,
     save_dir: Optional[str] = None,
-    use_staged: bool = True  # Use staged optimization like COLMAP
+    use_staged: bool = True,  # Use staged optimization like COLMAP
+    data_dir: Optional[str] = None,
+    fitted_gaussians_dir: Optional[str] = None,
+    visualize: bool = False
 ) -> Dict:
     """BA実行,カメラパラメータとGS中心位置を最適化 (COLMAP like approach)
     
@@ -457,155 +467,223 @@ def perform_bundle_adjustment(
         verbose: 詳細な出力を表示するかどうか
         save_dir: 結果を保存するディレクトリ
         use_staged: COLMAP風の段階的最適化を使用するか
+        data_dir: データディレクトリ（可視化用）
+        fitted_gaussians_dir: フィッティングGaussianディレクトリ（可視化用）
         
     Returns:
         Dict: 更新された再構成データ
     """
     print("\n--- Performing Bundle Adjustment (COLMAP-like) ---")
     
-    # 観測データ構築 - point3D_observations 構造を使用
-    observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
+    # Get the point ID manager and observation manager from reconstruction data
+    if 'point_id_manager' not in reconstruction_data:
+        raise ValueError("Point ID manager not found in reconstruction data")
+        
+    point_id_manager = reconstruction_data['point_id_manager']
+    observation_manager = reconstruction_data['observation_manager']
     
-    # 観測データをBundleAdjusterの形式に変換
-    num_cameras = len(reconstruction_data["camera_params_list"])
-    match_points_2d = ObservationBuilder.convert_to_match_points_2d(
-        observation_map, num_cameras
-    )
     
-    # 最低限必要な観測数をチェック
-    total_obs = sum(len(obs) for obs in match_points_2d)
-    if total_obs < 10:
-        print(f"Not enough observations ({total_obs}) for meaningful Bundle Adjustment. Skipping.")
+    # Print observation statistics
+    total_points = len(point_id_manager.points)
+    valid_points = len(point_id_manager.get_valid_points())
+    total_cameras = len(point_id_manager.cameras)
+    
+    if verbose:
+        print(f"Total points: {total_points}, Valid points: {valid_points}, Total cameras: {total_cameras}")
+    
+    # Check if we have enough data for BA
+    if valid_points <32 or total_cameras < 2:
+        sys.exit(f"Not enough valid data for Bundle Adjustment (need at least 32 points with 2+ observations and 2 cameras).")
         return reconstruction_data
     
-    # 各カメラの内部パラメータリスト
-    intrinsics_list = []
-    for cam_idx in range(num_cameras):
-        # カメラ固有のKがあればそれを使用
-        cam_key = f"camera{cam_idx+1}_K"
-        if cam_key in reconstruction_data:
-            intrinsics_list.append(reconstruction_data[cam_key])
-        elif "K" in reconstruction_data:
-            intrinsics_list.append(reconstruction_data["K"])
-        else:
-            # Fallback to first camera's K
-            intrinsics_list.append(reconstruction_data.get("camera1_K", np.eye(3)))
-    
-    image_names = reconstruction_data["used_images"]
-    
-    # Used for robust loss
+    # Create bundle adjuster with the point ID manager
     initial_loss_scale = 2.0
-    
     ba = BundleAdjuster(
-        points_3d=reconstruction_data["points_3d"],
-        camera_params_list=reconstruction_data["camera_params_list"],
-        match_points_2d=match_points_2d,
-        intrinsics_list=intrinsics_list,
-        image_names=image_names,
+        point_id_manager=point_id_manager,
         use_robust_loss=True,
         loss_scale=initial_loss_scale  # COLMAP standard scale
     )
     
-    # BA optimization
+    # Run BA optimization
     ba_results = ba.optimize(
         n_iterations=ba_iterations, 
         verbose=verbose,
-        use_staged=use_staged  # Use staged optimization (COLMAP style)
+        use_staged=use_staged,  # Use staged optimization (COLMAP style)
+        epipolar_threshold=30.0
     )
     
     # Check if the final RMSE improved over initial
     improved = False
     
     if "initial_rmse" in ba_results and "final_rmse" in ba_results:
-        if not np.isnan(ba_results["initial_rmse"]) and not np.isnan(ba_results["final_rmse"]):
-            improved = ba_results["final_rmse"] < ba_results["initial_rmse"]
+        improved = ba_results["final_rmse"] < ba_results["initial_rmse"]
     
     # Consider BA successful if either it formally succeeded or it improved the error
-    if ba_results["success"] or improved:
-        # 段階的BAの場合は結果メッセージを調整
-        if use_staged:
-            print(f"Staged Bundle Adjustment completed {'successfully' if ba_results['success'] else 'with error reduction'}.")
-        else:
-            print(f"Bundle Adjustment completed {'successfully' if ba_results['success'] else 'with error reduction'}.")
-            
-        # 結果のRMSE情報を表示    
-        if "initial_rmse" in ba_results and not np.isnan(ba_results["initial_rmse"]):
-            print(f"Initial RMSE: {ba_results['initial_rmse']:.4f} pixels")
+    # if ba_results["success"] or improved: 
+    
+    # 段階的BAの場合は結果メッセージを調整
+    if use_staged:
+        print(f"Staged Bundle Adjustment completed {'successfully' if ba_results['success'] else 'with error reduction'}.")
+    else:
+        print(f"Bundle Adjustment completed {'successfully' if ba_results['success'] else 'with error reduction'}.")
         
-        if "final_rmse" in ba_results and not np.isnan(ba_results["final_rmse"]):
-            print(f"Final RMSE: {ba_results['final_rmse']:.4f} pixels")
-            
-            # Show improvement percentage
-            if "initial_rmse" in ba_results and not np.isnan(ba_results["initial_rmse"]):
-                improvement = (ba_results["initial_rmse"] - ba_results["final_rmse"]) / ba_results["initial_rmse"] * 100
-                print(f"Error reduction: {improvement:.2f}%")
+    
+    
+    initial_cameras_wtc = reconstruction_data['camera_params_list'].copy()
+    initial_points = reconstruction_data['points_3d'].copy()
+    
+    # Update arrays from point ID manager 
+    point_id_manager = reconstruction_data['point_id_manager']
+    
+    # Get all points and camera data for visualization
+    (points_3d, 
+        covariances_3d, 
+        colors_3d, 
+        alphas_3d, 
+        quaternions, 
+        scales) = point_id_manager.get_all_point_arrays()
+    
+    # Update the arrays in reconstruction data
+    reconstruction_data["points_3d"] = points_3d
+    reconstruction_data["covariances_3d"] = covariances_3d 
+    reconstruction_data["color_3d"] = colors_3d 
+    reconstruction_data["alpha_3d"] = alphas_3d
+    
+    if verbose:
+        print(f"Updated point arrays from point ID manager ({len(points_3d)} valid points)")
         
-        # 再構成データを更新
-        reconstruction_data["camera_params_list"] = ba_results["optimized_cameras"]
-        reconstruction_data["points_3d"] = ba_results["optimized_points"]
+    # 既存のカメラパラメータを更新
+    
+    optimized_cameras_wtc = [c2w_to_w2c(R_ctw, C_w) for R_ctw, C_w in ba_results["optimized_cameras"]]
+    reconstruction_data["camera_params_list"] = optimized_cameras_wtc
+    
+    # 最適化された点群を既存のGS中心に反映
+    valid_point_ids = ba.get_point_ids_with_observations(min_observations=2)
+    valid_points = []
+    
+    for point_id in valid_point_ids:
+        if point_id in point_id_manager.points:
+            point = point_id_manager.points[point_id]
+            valid_points.append(point.position)
+    
+    # 結果保存
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
         
-        # 最適化されたGS中心を反映
-        for i, point in enumerate(ba_results["optimized_points"]):
-            if i < len(reconstruction_data["existing_3d_gaussians"]):
-                reconstruction_data["existing_3d_gaussians"][i]["center"] = point
+        # COLMAPフォーマットで出力
+        colmap_ba_dir = os.path.join(save_dir, "colmap_ba")
+        os.makedirs(colmap_ba_dir, exist_ok=True)
+        
+        # Get observation statistics
+        if verbose:
+            point_obs_counts = ba.get_point_observation_counts()
+            points_with_2plus = sum(1 for count in point_obs_counts if count >= 2)
+            print(f"Points with 2+ observations: {points_with_2plus} out of {len(point_obs_counts)}")
+        
+        # Use existing export functions
+        # Get observations from the observation manager
+        match_points_2d = observation_manager.convert_to_match_points_2d()
+        
+        export_colmap_format(
+            output_dir=colmap_ba_dir,
+            points_3d=reconstruction_data["points_3d"],
+            camera_params_list=reconstruction_data["camera_params_list"],
+            match_points_2d=match_points_2d,
+            intrinsics_list=point_id_manager.get_intrinsics_list(),
+            image_names=point_id_manager.get_image_names()
+        )
+        
+        # Get point IDs with observations
+        valid_point_ids = ba.get_point_ids_with_observations(min_observations=2)
+        
+        # Get valid point indices for PLY export
+        valid_point_indices = []
+        for i, point_id in enumerate(ba.point_ids):
+            if point_id in valid_point_ids:
+                valid_point_indices.append(i)
+        
+        # Filter arrays for PLY export
+        if len(valid_point_indices) > 0:
+            valid_points = [ba.points_3d[i] for i in valid_point_indices]
             
-        # 結果保存
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
+            # Get corresponding colors, covariances, and alphas
+            valid_colors = None
+            valid_covariances = None
+            valid_alphas = None
             
-            # COLMAPフォーマットで出力
-            colmap_ba_dir = os.path.join(save_dir, "colmap_ba")
-            os.makedirs(colmap_ba_dir, exist_ok=True)
+            if "color_3d" in reconstruction_data and valid_point_indices:
+                valid_colors = []
+                for point_id in valid_point_ids:
+                    if point_id in point_id_manager.points:
+                        valid_colors.append(point_id_manager.points[point_id].color)
             
-            # Get valid point indices (points with at least 2 observations)
-            valid_point_indices = ba.get_valid_point_indices(min_observations=2)
+            if "covariances_3d" in reconstruction_data and valid_point_indices:
+                valid_covariances = []
+                for point_id in valid_point_ids:
+                    if point_id in point_id_manager.points:
+                        valid_covariances.append(point_id_manager.points[point_id].covariance)
             
-            # 観測数情報を出力
-            if verbose:
-                point_obs_counts = ba.get_point_observation_counts()
-                points_with_2plus = sum(1 for count in point_obs_counts if count >= 2)
-                print(f"Points with 2+ observations: {points_with_2plus} out of {len(point_obs_counts)}")
-                
-            # Use existing export functions
-            export_colmap_format(
-                output_dir=colmap_ba_dir,
-                points_3d=reconstruction_data["points_3d"],
-                camera_params_list=reconstruction_data["camera_params_list"],
-                match_points_2d=ba.match_points_2d,
-                intrinsics_list=ba.intrinsics_list,
-                image_names=ba.image_names
-            )
-            
-            # Filter points for PLY export - COLMAPスタイルで観測数2以上のみ使用
-            valid_points = [reconstruction_data["points_3d"][i] for i in valid_point_indices]
-            valid_colors = [reconstruction_data["color_3d"][i] for i in valid_point_indices] if "color_3d" in reconstruction_data else None
-            valid_covariances = [reconstruction_data["covariances_3d"][i] for i in valid_point_indices] if "covariances_3d" in reconstruction_data else None
-            valid_alphas = [reconstruction_data["alpha_3d"][i] for i in valid_point_indices] if "alpha_3d" in reconstruction_data else None
+            if "alpha_3d" in reconstruction_data and valid_point_indices:
+                valid_alphas = []
+                for point_id in valid_point_ids:
+                    if point_id in point_id_manager.points:
+                        valid_alphas.append(point_id_manager.points[point_id].alpha)
             
             # PLYとして保存
-            ply_path = os.path.join(save_dir, "ba_optimized.ply")
-            if len(valid_points) > 0:  # Only save if we have valid points
-                save_ellipsoids_as_ply(
-                    points_3d=np.array(valid_points),
-                    covariances_3d=np.array(valid_covariances) if valid_covariances else None,
-                    colors_3d=np.array(valid_colors) if valid_colors else None,
-                    alphas_3d=np.array(valid_alphas) if valid_alphas else None,
-                    filename=ply_path,
-                    camera_params=reconstruction_data["camera_params_list"],
-                    use_alpha=True
-                )
+            # ply_path = os.path.join(save_dir, "ba_optimized.ply")
+            # save_ellipsoids_as_ply(
+            #     points_3d=np.array(valid_points),
+            #     covariances_3d=np.array(valid_covariances) if valid_covariances else None,
+            #     colors_3d=np.array(valid_colors) if valid_colors else None,
+            #     alphas_3d=np.array(valid_alphas) if valid_alphas else None,
+            #     filename=ply_path,
+            #     camera_params=ba_results["optimized_cameras"],
+            #     use_alpha=True
+            # )
+        
+        print(f"BA results saved to {save_dir}")
+    
+        # 可視化処理の追加
+        if visualize and save_dir and data_dir:
+            # 既存の可視化コード
+            vis_dir = os.path.join(save_dir, "visualizations")
+            os.makedirs(vis_dir, exist_ok=True)
             
-            print(f"BA results saved to {save_dir}")
-    else:
-        print(f"Bundle Adjustment failed: {ba_results.get('message', 'Unknown error')}")
+            # BA前後の点群とカメラパラメータを辞書に格納
+            ba_vis_results = {
+                'initial_points': initial_points,  # BA前の点群
+                'optimized_points': ba_results['optimized_points'],         # BA後の点群
+                'initial_cameras': initial_cameras_wtc, # BA前のカメラ
+                'optimized_cameras': reconstruction_data['camera_params_list'],       # BA後のカメラ
+                'transport_values': reconstruction_data['transport_values']  
+            }
+            
+            # 統合版のvisualize_ba_results関数を呼び出し
+            # 初期ペア(カメラ1と2)のみを可視化
+            visualize_ba_results(
+                reconstruction_data=reconstruction_data,
+                ba_results=ba_vis_results,
+                data_dir=data_dir,
+                fitted_gaussians_dir=fitted_gaussians_dir,
+                save_dir=vis_dir,
+                device=device,
+                visualize_all_cameras=False  # 初期ペアのみ可視化
+            )
+            
+            # レンダリング結果は既に vis_dir に保存されているので
+            # 追加のvisualize_initial_pair_rendersの呼び出しは不要
+            
+            print(f"Visualization completed. Results saved to {vis_dir}")
+        else:
+            print(f"Could not generate visualizations: data_dir or fitted_gaussians_dir not provided")
+    # else:
+    #     print(f"Bundle Adjustment failed: {ba_results.get('message', 'Unknown error')}")
     
     return reconstruction_data
 
 def perform_initial_reconstruction(
     img1_name: str,
     img2_name: str,
-    data_dir: str,
-    colmap_dir: str,
     fitted_gaussians_dir: str,
     output_dir: str,
     max_iterations: int = 1000,
@@ -653,7 +731,7 @@ def perform_initial_reconstruction(
     _, gaussians1, _, K_from_gs1 = load_gaussians_torch(gaussians1_path, device)
     _, gaussians2, _, K_from_gs2 = load_gaussians_torch(gaussians2_path, device)
     
-    # Camera intrinsics handling - explicit path selection with clear priorities:
+    # Camera intrinsics handling - explicit path selection with priorities:
     # 1. NeRF intrinsics (if provided)
     # 2. Intrinsics from Gaussian fitting
     # 3. Default intrinsic matrix as last resort
@@ -691,15 +769,14 @@ def perform_initial_reconstruction(
         epsilon=0.01,
         lambda_mean=0.0,
         lambda_cov=0.0,
-        lambda_color=0.2,
-        lambda_epipolar=1.0,
+        lambda_color=0.5,
+        lambda_epipolar=0.5,
         device=device
     )
     
     # Optimize fundamental matrix
     print("Optimizing fundamental matrix...")
     solver.optimize_with_RT(max_iter=max_iterations, tol=1e-6)
-    F_optimized = solver.f.detach().cpu().numpy()
     
     # Compute optimal transport
     with torch.no_grad():
@@ -709,53 +786,53 @@ def perform_initial_reconstruction(
     
     # Set up reconstructor - using fixed h_dummy matrix since we don't use homography
     h_dummy = np.eye(3)
+    
+    # PyTorchテンソルをNumPy配列に変換　(for dtu data)
+    if torch.is_tensor(K1):
+        K1 = K1.detach().cpu().numpy()
+    if torch.is_tensor(K2):
+        K2 = K2.detach().cpu().numpy()
+    
+    # これで正しいデータ型でコンストラクタを呼び出す
     reconstructor = Initial3DReconstructor(gaussians1, gaussians2, K1, K2, h_dummy)
     
     # Identify source Gaussians
     print("Identifying source Gaussians...")
     reconstructor.identify_source_gaussians(
         transport_matrix=transport_matrix_np,
-        auto_threshold=True
+        auto_threshold=False
     )
     
     # Get optimized R, t from the solver
     r_optimized = solver.rvec.detach().cpu().numpy()
     t_optimized = solver.tvec.detach().cpu().numpy()
-    R_est = solver.rodrigues(solver.rvec).detach().cpu().numpy()
+    r_est, _ = cv2.Rodrigues(r_optimized) 
     
+    t_norm = np.linalg.norm(t_optimized)
+    if t_norm > 1e-10:
+        t_optimized = t_optimized / t_norm  # 単位距離に正規化
+
     # Set camera matrices explicitly - camera 1 is at origin (identity rotation, zero translation)
     reconstructor.set_camera_matrices_explicitly(
         r1=np.eye(3),
         t1=np.zeros(3),
-        r2=R_est,
+        r2=r_est,
         t2=t_optimized
     )
     
-    # Track correspondences between views for initial all_matches
-    # Determine top_k based on the number of Gaussians (smaller of the two)
-    top_k_value = min(len(gaussians1.means), len(gaussians2.means))
+    # Create an observation manager with a point ID manager
+    # to store observations and points with persistent IDs
+    observation_manager = ObservationManager()
+    point_id_manager = observation_manager.point_manager
     
-    observations1 = ObservationBuilder.track_observations(
-        transport_matrix=transport_matrix_np.T,  # Transpose for first camera perspective
-        means_2d=gaussians1.means,
-        top_k=top_k_value,
-        use_combined_filtering=True  # Apply both top-k and threshold filtering
-    )
-    
-    observations2 = ObservationBuilder.track_observations(
-        transport_matrix=transport_matrix_np,
-        means_2d=gaussians2.means,
-        top_k=top_k_value,
-        use_combined_filtering=True  # Apply both top-k and threshold filtering
-    )
-    
-    # Initialize all_matches for Bundle Adjustment
-    all_matches = [observations1, observations2]
     
     # Triangulate Gaussian centers
     print("Triangulating Gaussian centers...")
     threshold = 0.0  # Don't drop any Gaussians (to cover local optima)
     reconstructor.triangulate_gaussian_centers(transport_matrix_np, threshold=threshold)
+    
+    # Create a mapping between old point indices and new persistent point IDs
+    point_idx_to_id = {}
     
     if len(reconstructor.points_3d) == 0:
         raise ValueError("Triangulation failed: no 3D points generated")
@@ -787,24 +864,97 @@ def perform_initial_reconstruction(
     reconstructor.compute_3d_gaussian_alphas(alpha_mode="average")
     
     # Camera poses for PLY export
-    R1 = np.eye(3)  # world->camera1
-    t1 = np.zeros(3)
-    R2 = R_est      # world->camera2 (R_estはworld->camera2の回転)
-    t2 = t_optimized  # world->camera2 (t_optimizedはworld->camera2の並進)
-    camera_params_list = [(R1, t1), (R2, t2)]
+    # World-to-camera transformations
+    R1_wtc = np.eye(3)  # world->camera1 rotation
+    t1_wtc = np.zeros(3)  # world->camera1 translation
+    R2_wtc = r_est      # world->camera2 rotation
+    t2_wtc = t_optimized  # world->camera2 translation
+    camera_params_list = [(R1_wtc, t1_wtc), (R2_wtc, t2_wtc)]
 
-    # Save results as PLY
-    ply_path = os.path.join(output_dir, "initial_3d_gaussians.ply")
-    save_ellipsoids_as_ply(
-        points_3d=reconstructor.points_3d,
-        covariances_3d=reconstructor.covariances_3d,
-        colors_3d=reconstructor.color_3d,
-        alphas_3d=reconstructor.alpha_3d,
-        filename=ply_path,
-        camera_params=camera_params_list,
-        use_alpha=True
+    # Convert to camera-to-world for the point ID manager
+    # For camera 1 (at origin), camera-to-world is identity and center is at origin
+    R1_ctw = R1_wtc.T  # camera1->world rotation (identity)
+    c1 = np.zeros(3)   # camera1 center in world coordinates (origin)
+    
+    # For camera 2, we need to calculate the center from R2_wtc and t2_wtc
+    R2_ctw = R2_wtc.T  # camera2->world rotation
+    c2 = -R2_ctw @ t2_wtc  # camera2 center in world coordinates
+
+    # Add cameras to point ID manager
+    # Camera 1 (at origin)
+    camera1_id = point_id_manager.add_camera(
+        R=R1_ctw,  # camera-to-world rotation
+        c=c1,      # camera center in world coordinates
+        K=K1,      # intrinsic matrix
+        image_name=img1_name
     )
-    # Prepare source Gaussians data for future use
+    
+    # Camera 2
+    camera2_id = point_id_manager.add_camera(
+        R=R2_ctw,  # camera-to-world rotation
+        c=c2,      # camera center in world coordinates
+        K=K2,      # intrinsic matrix
+        image_name=img2_name
+    )
+    
+    # Add points to point ID manager and store observations
+    for i in range(len(reconstructor.points_3d)):
+        point_3d = reconstructor.points_3d[i]
+        cov_3d = reconstructor.covariances_3d[i]
+        color = reconstructor.color_3d[i]
+        alpha = reconstructor.alpha_3d[i]
+        quaternion = reconstructor.quaternions[i]
+        scale = reconstructor.scales[i]
+        
+        # Add point to point ID manager
+        point_id = point_id_manager.add_point(
+            position=point_3d,
+            covariance=cov_3d,
+            color=color,
+            alpha=alpha,
+            quaternion=quaternion,
+            scale=scale
+        )
+        
+        # Store mapping from index to ID
+        point_idx_to_id[i] = point_id
+    
+    # Track observations between points and cameras using the exact match pairs from triangulation
+    # This ensures we use the exact 2D-2D correspondences that were used to create each 3D point
+    point_ids = [point_idx_to_id[i] for i in range(len(reconstructor.points_3d))]
+    
+    print(f"Tracking observations for {len(point_ids)} points between two cameras using match pairs...")
+    
+    # Use the new method that takes match_pairs directly, which contain the exact correspondence indices
+    observation_manager.track_observations_from_match_pairs(
+        match_pairs=reconstructor.match_pairs,
+        gaussians1_means=gaussians1.means,
+        gaussians2_means=gaussians2.means,
+        point_ids=point_ids,
+        camera1_id=camera1_id,
+        camera2_id=camera2_id
+    )
+    
+    
+    # Print observation statistics
+    total_observations = sum(point.observation_count() for point in observation_manager.point_manager.points.values())
+    points_with_both = sum(1 for point in observation_manager.point_manager.points.values() if point.observation_count() >= 2)
+    print(f"Total observations tracked: {total_observations}")
+    print(f"Points with observations in both cameras: {points_with_both}")
+    
+    # Save results as PLY
+    # ply_path = os.path.join(output_dir, "initial_3d_gaussians.ply")
+    # save_ellipsoids_as_ply(
+    #     points_3d=reconstructor.points_3d,
+    #     covariances_3d=reconstructor.covariances_3d,
+    #     colors_3d=reconstructor.color_3d,
+    #     alphas_3d=reconstructor.alpha_3d,
+    #     filename=ply_path,
+    #     camera_params=camera_params_list,
+    #     use_alpha=True
+    # )
+    
+    # Prepare source Gaussians data for incremental reconstruction
     source_gaussians_data = {}
     source_gaussians_data['source_gaussians1_data'] = reconstructor.source_gaussians1_data
     source_gaussians_data['source_gaussians1_data']['image_name'] = img1_name
@@ -846,6 +996,7 @@ def perform_initial_reconstruction(
         "quaternions": quaternions,
         "scales": scales,
         
+        
         # Camera parameters
         "camera_params_list": camera_params_list,
         "K": K1,  # (need to modify if the intrinsic matrix is not shared)
@@ -856,10 +1007,19 @@ def perform_initial_reconstruction(
         # Metadata
         "used_images": [img1_name, img2_name],
         "total_3d_gaussians": len(reconstructor.points_3d),
-        "all_matches": all_matches, 
         
         # Store the calculated target volume for future viewpoints
-        "target_volume": reconstruction_data_target_volume
+        "target_volume": reconstruction_data_target_volume,
+        
+        # Store the observation manager and point ID manager
+        "observation_manager": observation_manager,
+        "point_id_manager": point_id_manager,
+        
+        # Store point_idx_to_id mapping for backward compatibility
+        "point_idx_to_id": point_idx_to_id,
+        
+        # Store transport values for alpha-blend visualization
+        "transport_values": reconstructor.transport_values
     }
     
     # Perform initial bundle adjustment if enabled
@@ -869,9 +1029,25 @@ def perform_initial_reconstruction(
             reconstruction_data=results,
             ba_iterations=ba_iterations,
             device=device,
-            save_dir=ba_dir
+            save_dir=ba_dir,
+            data_dir=args.data_dir,  
+            fitted_gaussians_dir=args.fitted_gaussians_dir,  
+            visualize=True                         # 可視化を有効にする
         )
     
+        # Add PLY save after BA
+    # ba_ply_path = os.path.join(ba_dir, "initial_ba_gaussians.ply")
+    # save_ellipsoids_as_ply(
+    #         points_3d=results["points_3d"],
+    #         covariances_3d=results["covariances_3d"],
+    #         colors_3d=results["color_3d"],
+    #         alphas_3d=results["alpha_3d"],
+    #         filename=ba_ply_path,
+    #         camera_params=results["camera_params_list"],
+    #         use_alpha=True
+    #     )
+
+    sys.exit()
     # Save to pickle
     results_path = os.path.join(output_dir, "initial_3d_reconstruction.pkl")
     with open(results_path, 'wb') as f:
@@ -1020,9 +1196,9 @@ def process_remaining_source_gaussians(
         return 0
 
 def select_reference_camera(camera_params_list, source_gaussians_data=None):
-    """視点拡張時の参照カメラを選択する - 改良版
+    """視点拡張時の参照カメラを選択
     
-    湧出ガウスの数をベースにした参照カメラ選択。未処理湧出ガウスが最も多いカメラを優先する。
+    湧出ガウスの数をベースにした参照カメラ選択. 未処理湧出ガウスが最も多いカメラを優先.
     
     Args:
         camera_params_list: カメラパラメータのリスト
@@ -1035,29 +1211,26 @@ def select_reference_camera(camera_params_list, source_gaussians_data=None):
         # カメラが1つしかなければそれを使用
         return 0
     
-    # 湧出ガウス情報がない場合、従来通り最新カメラを使用
+    # 湧出ガウス情報がない場合，従来通り最新カメラを使用
     if source_gaussians_data is None:
         return len(camera_params_list) - 1
     
     # 各カメラの未処理湧出ガウス数をカウント
     unprocessed_counts = {}
     for key, data in source_gaussians_data.items():
-        if not key.startswith('source_gaussians') or 'indices' not in data:
-            continue
+        # if not key.startswith('source_gaussians') or 'indices' not in data:
+        #     continue
         
         # カメラインデックスを抽出（例: 'source_gaussians1_data' -> 1）
-        try:
-            cam_idx = int(key.replace('source_gaussians', '').replace('_data', '')) - 1
-            if cam_idx < len(camera_params_list):  # 有効なインデックスか確認
-                if 'processed' in data:
-                    # 未処理の湧出ガウス数をカウント
-                    unproc_count = np.sum(~data['processed'])
-                    unprocessed_counts[cam_idx] = unproc_count
-                else:
-                    # processed フラグが無い場合は全て未処理と見なす
-                    unprocessed_counts[cam_idx] = len(data['indices'])
-        except (ValueError, IndexError):
-            continue
+        cam_idx = int(key.replace('source_gaussians', '').replace('_data', '')) - 1
+        if cam_idx < len(camera_params_list):  # 有効なインデックスか確認
+            if 'processed' in data:
+                # 未処理の湧出ガウス数をカウント
+                unproc_count = np.sum(~data['processed'])
+                unprocessed_counts[cam_idx] = unproc_count
+            else:
+                # processed フラグが無い場合は全て未処理と見なす
+                unprocessed_counts[cam_idx] = len(data['indices'])
     
     # デバッグ情報出力
     for cam_idx, count in unprocessed_counts.items():
@@ -1072,7 +1245,7 @@ def select_reference_camera(camera_params_list, source_gaussians_data=None):
     
     # 未処理湧出ガウスが無いか、情報が不十分な場合は最新カメラを使用
     latest_cam_idx = len(camera_params_list) - 1
-    print(f"未処理湧出ガウスが見つからなかったため、最新カメラ {latest_cam_idx} を使用")
+    print(f"未処理湧出ガウスが見つからなかったため, 最新カメラ {latest_cam_idx} を使用")
     return latest_cam_idx
 
 def add_new_viewpoint(
@@ -1081,9 +1254,8 @@ def add_new_viewpoint(
     fitted_gaussians_dir: str,
     output_dir: str,
     max_iterations: int = 1000,
-    transport_threshold: float = 1e-6,
+    transport_threshold: float = 0.0,
     target_volume: float = None,
-    auto_target_volume: bool = True,
     auto_threshold: bool = True,
     device: torch.device = None,
     enable_ba: bool = True,
@@ -1096,8 +1268,6 @@ def add_new_viewpoint(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Using device: {device}")
-
-    os.makedirs(output_dir, exist_ok=True)
     
     # Get path to fitted Gaussians for new image
     new_gaussians_path = os.path.join(
@@ -1112,13 +1282,17 @@ def add_new_viewpoint(
     existing_3d_gaussians = reconstruction_data["existing_3d_gaussians"]
     camera_params_list = reconstruction_data["camera_params_list"]
     
+    # Get the observation manager and point ID manager
+    observation_manager = reconstruction_data['observation_manager']
+    point_id_manager = reconstruction_data['point_id_manager']
+    
     # Determine which camera intrinsics to use
     if force_single_intrinsic and "K" in reconstruction_data:
         # Force using the shared K from reconstruction_data
         print(f"Using shared intrinsic matrix from initial reconstruction")
         K_new = reconstruction_data["K"]
     elif K_new is None:
-        # If not provided by the 2D Gaussian loader, try to get from reconstruction data (this is redundant but keep it just in case)
+        # If not provided by the 2D Gaussian loader, try to get from reconstruction data
         if "K" in reconstruction_data:
             K_new = reconstruction_data["K"]
             print(f"Using shared K from reconstruction_data")
@@ -1126,31 +1300,18 @@ def add_new_viewpoint(
             K_new = reconstruction_data["camera1_K"]
             print(f"Using first camera's K as fallback")
         else:
-            # Create a default intrinsic matrix as last resort (not necessary as well, just keep it for now)
             assert False, "No intrinsic matrix available"
-            H, W = 800, 800  # Random image size, adjust as needed
-            fx, fy = 1.2*W, 1.2*W  # Random focal length (1.2x image width)
-            cx, cy = W/2, H/2  # Principal point at center
-            
-            K_new = np.array([
-                [fx, 0, cx],
-                [0, fy, cy],
-                [0, 0, 1]
-            ])
-            print(f"WARNING: No intrinsic matrix available. Using default with focal length: {fx:.2f}")
-    else:
-        print(f"Using intrinsic matrix from fitted Gaussians data")
     
-    # Get source Gaussians data - initialize if not present(most likely does not happen→これが起きるということは初期ペア疑った方がいい)
-    if "source_gaussians_data" in reconstruction_data:
-        source_gaussians_data = reconstruction_data["source_gaussians_data"]
-    else:
-        source_gaussians_data = {}
-    
+    # Get source Gaussians data 
+    source_gaussians_data = reconstruction_data["source_gaussians_data"]
+
     # Get used images 
     used_images = reconstruction_data["used_images"]
     reference_camera_idx = select_reference_camera(camera_params_list, source_gaussians_data)
     print(f"Using camera {reference_camera_idx} as reference for new viewpoint")
+    
+    # Get the number of existing points before adding new ones
+    existing_point_count = len(existing_3d_gaussians)
     
     extender = ViewpointExtender(
         existing_3d_gaussians=existing_3d_gaussians,
@@ -1163,7 +1324,7 @@ def add_new_viewpoint(
     )
     
     # 新視点のカメラパラメータ推定と3DGSの更新
-    R_new, t_new = extender.integrate_new_view_and_gaussians(
+    R_new, t_new, match_pairs = extender.integrate_new_view_and_gaussians(
         new_image_2d_gaussians=new_2d_gaussians,
         max_iterations=max_iterations,
         transport_threshold=transport_threshold,
@@ -1171,69 +1332,133 @@ def add_new_viewpoint(
         auto_threshold=auto_threshold
     )
     
-    # 新しい視点との対応関係を抽出
-    # ViewpointExtenderのtransport_solverを使用してcost matrixを計算
-    # 輸送行列の計算
-    with torch.no_grad():
-        cost_matrix = extender.transport_solver.compute_cost_matrix_fundamental(
-            extender.transport_solver.f
+    # Add the new camera to point ID manager
+    new_camera_id = point_id_manager.add_camera(
+        R=R_new,  # camera-to-world rotation
+        c=t_new,  # camera center in world coordinates
+        K=K_new,  # intrinsic matrix
+        image_name=new_image_name
+    )
+    
+    
+    # Get the original point_idx_to_id mapping
+    point_idx_to_id = reconstruction_data['point_idx_to_id'].copy()
+    
+    # Get the number of newly added 3D points
+    new_point_count = len(extender.existing_3d_gaussians) - existing_point_count
+    
+    # Add the new 3D points to the point ID manager and update point_idx_to_id
+    new_point_ids = []
+    for i in range(new_point_count):
+        # Get the new Gaussian data
+        gauss = extender.existing_3d_gaussians[existing_point_count + i]
+        
+        # Add this point to the point ID manager and get its point ID
+        point_id = point_id_manager.add_point(
+            position=gauss["center"],
+            covariance=gauss["covariance"],
+            color=gauss["color"],
+            alpha=gauss["alpha"],
+            quaternion=gauss["quaternion"],
+            scale=gauss["scale"]
         )
-        transport_matrix = extender.transport_solver.unbalanced_sinkhorn_algorithm(cost_matrix)
-        transport_matrix_np = transport_matrix.cpu().numpy()
         
-        # 輸送行列を観測情報として追跡 - use the standard method from ObservationBuilder
-        # Determine top_k for the new viewpoint
-        top_k_value = min(transport_matrix_np.shape[0], len(new_2d_gaussians.means))
+        # Store the mapping from index to ID
+        point_idx_to_id[existing_point_count + i] = point_id
+        new_point_ids.append(point_id)
+
+    print(f"Added {new_point_count} new 3D Gaussians after triangulation")
+
+    # Build the list of triangulated point IDs directly from the newly created points
+    triangulated_point_ids = new_point_ids[:len(match_pairs)]
+    
+    # Verify that we have the correct number of point IDs
+    if len(triangulated_point_ids) != len(match_pairs):
+        print(f"Warning: Mismatch between match_pairs ({len(match_pairs)}) and new points ({len(triangulated_point_ids)})")
+    
+    # 参照カメラIDの取得
+    camera_ids = list(point_id_manager.cameras.keys())
+    reference_cam_id = camera_ids[reference_camera_idx] if reference_camera_idx < len(camera_ids) else None
+    
+    if reference_cam_id is not None and match_pairs and triangulated_point_ids:
+        print(f"Tracking observations for {len(triangulated_point_ids)} points using match pairs")
         
-        observations = ObservationBuilder.track_observations(
-            transport_matrix=transport_matrix_np,
-            means_2d=new_2d_gaussians.means,
-            top_k=top_k_value,
-            use_combined_filtering=True  # Apply both top-k and threshold filtering
+        # ここで参照カメラのGaussianを正しく取得する
+        reference_image_name = used_images[reference_camera_idx]
+        reference_gaussians_path = os.path.join(
+            fitted_gaussians_dir, 
+            f"{reference_image_name.split('.')[0]}_fitted_gaussians.pkl"
+        )
+        _, reference_2d_gaussians, _, _ = load_gaussians_torch(reference_gaussians_path, device)
+        
+        # match_pairsを使用して観測を追跡
+        observation_manager.track_observations_from_match_pairs(
+            match_pairs=match_pairs,
+            gaussians1_means=reference_2d_gaussians.means,  # 参照カメラのガウス
+            gaussians2_means=new_2d_gaussians.means,  # 新しいカメラのガウス
+            point_ids=triangulated_point_ids,
+            camera1_id=reference_cam_id,
+            camera2_id=new_camera_id
         )
         
-        # 新しいカメラの観測情報を追加 - ensure all_matches exists
-        if 'all_matches' not in reconstruction_data:
-            reconstruction_data['all_matches'] = []
-            
-        reconstruction_data['all_matches'].append(observations)
-        
-        # # Ensure transport_matrices exists
-        # if 'transport_matrices' not in reconstruction_data:
-        #     reconstruction_data['transport_matrices'] = []
-        
-        # # 最適輸送行列を保存（後でBundle Adjustmentに使用するかも？の場合初期化はreconstructorで行うべき）
-        # reconstruction_data['transport_matrices'].append(transport_matrix_np)
+        # 十分な観測のある点の数をカウント
+        points_with_multiple = sum(1 for point_id in triangulated_point_ids 
+                                if point_id in point_id_manager.points
+                                and point_id_manager.points[point_id].observation_count() >= 2)
+                              
+        print(f"Added observations for {len(triangulated_point_ids)} points from new viewpoint {new_image_name}")
+        print(f"Points with 2+ observations (valid for BA): {points_with_multiple}")
+    else:
+        print("Warning: Cannot track observations - missing reference camera, match pairs, or point IDs")
     
-    # Extract updated data
-    points_3d, covariances_3d, colors_3d, alphas_3d = [], [], [], []
-    quaternions, scales = [], []
+    # Extract updated data from the point ID manager
+    (points_3d, 
+     covariances_3d, 
+     colors_3d, 
+     alphas_3d, 
+     quaternions, 
+     scales) = point_id_manager.get_all_point_arrays()
     
-    for gauss in extender.existing_3d_gaussians:
-        points_3d.append(gauss["center"])
-        covariances_3d.append(gauss["covariance"])
-        colors_3d.append(gauss["color"])
-        alphas_3d.append(gauss["alpha"])
-        quaternions.append(gauss["quaternion"])
-        scales.append(gauss["scale"])
     
-    # 配列に変換
-    points_3d = np.array(points_3d)
-    covariances_3d = np.array(covariances_3d)
-    colors_3d = np.array(colors_3d)
-    alphas_3d = np.array(alphas_3d)
-    quaternions = np.array(quaternions)
-    scales = np.array(scales)
+    # Update the existing_3d_gaussians format
+    updated_3d_gaussians = []
+    for i, point in enumerate(point_id_manager.get_valid_points()):
+        gauss = {
+            "center": points_3d[i],
+            "covariance": covariances_3d[i],
+            "color": colors_3d[i],
+            "alpha": alphas_3d[i],
+            "quaternion": quaternions[i] ,
+            "scale": scales[i]
+        }
+        updated_3d_gaussians.append(gauss)
     
-    # Update used images list  its 
+    # Update used images list
     used_images = reconstruction_data["used_images"].copy()
     used_images.append(new_image_name)
     
+    # **** 修正1.1：輸送値の保存 ****
+    # Get transport values from the extender
+    if hasattr(extender, 'transport_values') and extender.transport_values is not None:
+        transport_values = extender.transport_values
+    else:
+        # Fallback: extract from point ID manager if available
+        transport_values = None
+        for point_id in triangulated_point_ids:
+            if point_id in point_id_manager.points:
+                point = point_id_manager.points[point_id]
+                if hasattr(point, 'transport_value'):
+                    if transport_values is None:
+                        transport_values = []
+                    transport_values.append(point.transport_value)
+        
+        if transport_values is not None:
+            transport_values = np.array(transport_values)
     
     # Create updated results
     updated_results = {
         # Core 3D Gaussian data
-        "existing_3d_gaussians": extender.existing_3d_gaussians,
+        "existing_3d_gaussians": updated_3d_gaussians,
         "points_3d": points_3d,
         "covariances_3d": covariances_3d,
         "color_3d": colors_3d,
@@ -1251,7 +1476,14 @@ def add_new_viewpoint(
         # Metadata
         "used_images": used_images,
         "total_3d_gaussians": len(points_3d),
-        "all_matches": reconstruction_data.get('all_matches', [])
+        
+        # Persistent point ID system
+        "observation_manager": observation_manager,
+        "point_id_manager": point_id_manager,
+        "point_idx_to_id": point_idx_to_id,  # 更新されたマッピング
+        
+        # 輸送値 (可視化用)，とは言ってもこれは湧出ガウスのみに適用される
+        "transport_values": transport_values
     }
     
     # Save as PLY
@@ -1282,7 +1514,7 @@ def add_new_viewpoint(
         pickle.dump(updated_results, f)
     
     print(f"Added viewpoint {new_image_name}")
-    print(f"Total 3D Gaussians: {len(extender.existing_3d_gaussians)}")
+    print(f"Total 3D Gaussians: {len(updated_3d_gaussians)}")
     print(f"Results saved to {results_path}")
     
     return updated_results
@@ -1301,7 +1533,7 @@ def run_complete_pipeline(args):
     image_dir = os.path.join(args.data_dir, "images")
     colmap_dir = os.path.join(args.data_dir, args.colmap_dir)
     
-    # We'll use the same target_volume throughout the pipeline for consistency
+    # Target volume of the 3D gaussian
     global_target_volume = args.target_volume
     
     all_images = get_image_names(image_dir)
@@ -1370,8 +1602,6 @@ def run_complete_pipeline(args):
         reconstruction_data= perform_initial_reconstruction(
             img1_name=img1,
             img2_name=img2,
-            data_dir=args.data_dir,
-            colmap_dir=args.colmap_dir,
             fitted_gaussians_dir=args.fitted_gaussians_dir,
             output_dir=args.output_dir,
             max_iterations=args.max_iterations,
@@ -1382,7 +1612,6 @@ def run_complete_pipeline(args):
             ba_iterations=args.ba_iterations,
             nerf_K=nerf_K
         )
-        
         # If we calculated the target volume automatically, store it for future use
         if global_target_volume is None and args.auto_target_volume:
             global_target_volume = reconstruction_data.get("target_volume", None)
@@ -1527,10 +1756,12 @@ def run_complete_pipeline(args):
         ba_dir = os.path.join(final_output_dir, "ba_final")
         reconstruction_data = perform_bundle_adjustment(
             reconstruction_data=reconstruction_data,
-            ba_iterations=args.ba_iterations*2,  # more iterations for final BA
+            ba_iterations=args.ba_iterations*2,
             device=device,
             verbose=True,
-            save_dir=ba_dir
+            save_dir=ba_dir,
+            data_dir=args.data_dir,
+            fitted_gaussians_dir=args.fitted_gaussians_dir
         )
     
     # Save final PLY
@@ -1577,12 +1808,9 @@ def run_complete_pipeline(args):
     colmap_output_dir = os.path.join(final_output_dir, "colmap")
     os.makedirs(colmap_output_dir, exist_ok=True)
 
-    # 観測データの構築
-    observation_map = ObservationBuilder.build_observation_map(reconstruction_data)
-    match_points_2d = ObservationBuilder.convert_to_match_points_2d(
-        observation_map, 
-        len(reconstruction_data["camera_params_list"])
-    )
+    # Get observations directly from the observation manager
+    observation_manager = reconstruction_data['observation_manager']
+    match_points_2d = observation_manager.convert_to_match_points_2d()
 
     # 画像名の検証
     assert "used_images" in reconstruction_data, "Image names missing from reconstruction data"
