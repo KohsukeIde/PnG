@@ -29,3 +29,5 @@ __pycache__
 /results/*
 utils/test.py
 utils/rodrigues_comparison.png
+utils/rodrigues_gradient_comparison.png
+utils/rodrigues_numerical_comparison.png
