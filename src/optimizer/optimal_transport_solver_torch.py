@@ -163,10 +163,11 @@ class OptimalTransportSolver:
         F = K2_inv_T @ E @ K1_inv
         return F
 
+
     def unbalanced_sinkhorn_algorithm(
         self,
         cost_matrix: torch.Tensor,
-        rho: float = 0.1,
+        rho: float = 0.1, 
         max_iter: int = 1000,
         tol: float = 1e-6,
     ) -> torch.Tensor:
@@ -219,99 +220,130 @@ class OptimalTransportSolver:
         return transport
 
 
-    def compute_cost_matrix_fundamental_sampson(self, f: torch.Tensor) -> torch.Tensor:
-        """Compute the cost matrix between two sets of 2D Gaussians using the Sampson error
-        with a Fundamental Matrix F. Also includes color difference term as an example.
-
-        Sampson error for a pair of correspondences (p1, p2):
-            d_sampson(p1, p2) = (p2^T * F * p1)^2
-                                --------------------------------
-                                (F * p1)[0]^2 + (F * p1)[1]^2 + (F^T * p2)[0]^2 + (F^T * p2)[1]^2
-
-        The resulting cost is then combined with a color difference term.
-
+    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+        """分布版サンプソン距離を用いた2Dガウス間のコスト行列計算
+        
+        サンプソン距離＋ガウス分布の形状情報も考慮する。
+        
         Args:
-            f (torch.Tensor): The Fundamental matrix (3 x 3).
-
+            f (torch.Tensor): 基礎行列 (3x3)
+            
         Returns:
-            torch.Tensor: Cost matrix of shape (K1, K2).
-                        cost_matrix[i,j] = lambda_epipolar * SampsonError(i,j) + lambda_color * colorDiff(i,j)
+            torch.Tensor: コスト行列 (K1, K2)
         """
-        # ----------------------------------------
-        # Optional: Normalize image points by image width/height or by Hartley normalization
-        # w, h = 1554, 1162
-        # means1_norm = self.means1 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
-        # means2_norm = self.means2 / torch.tensor([w, h], dtype=torch.float32, device=self.device)
-        # (Or use a custom function that does full Hartley normalization.)
-        #
-        # For now, we assume self.means1, self.means2 are in raw image coordinates.
-        # ----------------------------------------
-
-        # Number of Gaussians in each image
+        # 1. ガウス分布の数を取得
         k1 = self.means1.shape[0]
         k2 = self.means2.shape[0]
 
-        # Create homogeneous coords
+        # 2. 同次座標に変換
         ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
         p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
 
         ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
         p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
 
-        # --------------------------
-        #  Sampson error calculation
-        # --------------------------
-        # F * p1 (shape: (3, K1))
-        Fx1 = f @ p1_homo.T
-        # F^T * p2 (shape: (3, K2))
-        Ftx2 = f.t() @ p2_homo.T
-
-        # 分子: (p2^T * F * p1)^2
-        # -> p2_homo (K2,3) dot Fx1 (3, K1) -> shape (K2, K1)
-        # -> transpose to (K1, K2)
-        dot_vals = p2_homo @ Fx1  # (K2, K1)
-        numerator = dot_vals.T.pow(2)  # (K1, K2)
-
-        # 分母: (F p1)_x^2 + (F p1)_y^2 + (F^T p2)_x^2 + (F^T p2)_y^2
-        # (F p1) -> shape (3, K1), take first 2 rows => (2, K1), sum of squares over row => (K1,)
-        Fx1_sq = Fx1[:2, :].pow(2).sum(dim=0)  # shape: (K1,)
-        Ftx2_sq = Ftx2[:2, :].pow(2).sum(dim=0)  # shape: (K2,)
-
-        denominator = Fx1_sq.unsqueeze(1) + Ftx2_sq.unsqueeze(0) + 1e-12  # shape: (K1, K2)
-
-        # Sampson error (K1, K2)
-        sampson_error = numerator / denominator
-        sampson_error = sampson_error / 1e5  
-
-        # ---------------
-        # Color difference
-        # ---------------
-        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1, K2, 3)
-        d_color = torch.sum(color_diff ** 2, dim=2)  # (K1, K2)
-
-        # ------------
-        # Debug prints
-        # ------------
-        # print("=== Sampson Error Stats ===")
-        # print(f"  min={sampson_error.min():.6f}, max={sampson_error.max():.6f}, mean={sampson_error.mean():.6f}")
-        # print("=== Color Diff Stats ===")
-        # print(f"  min={d_color.min():.6f}, max={d_color.max():.6f}, mean={d_color.mean():.6f}")
-
-        # ------------------------------------------
-        # Example: Simple normalization or scaling
-        # ------------------------------------------
-        # e.g. Optional small scaling to keep values in a good range
-        # sampson_error = sampson_error / 2.0
-        # d_color       = d_color / 3.0
-
-        # -------------
-        # Combine costs
-        # -------------
-        cost_matrix = self.lambda_epipolar * sampson_error + self.lambda_color * d_color
-
+        # 3. サンプソン距離の計算に必要な要素
+        # 3.1 エピポーラ制約の計算
+        #     p2^T·F·p1: 制約違反の度合い (対応が完全ならゼロになる)
+        Fp1 = f @ p1_homo.T  # F·p1: (3,K1)
+        FTp2 = f.T @ p2_homo.T  # F^T·p2: (3,K2)
+        
+        # 3.2 エピポーラ線と点の積 (p2^T·F·p1): エピポーラ制約の値
+        epipolar_constraint = torch.matmul(p2_homo, Fp1)  # (K2,K1)
+        epipolar_constraint = epipolar_constraint.T  # (K1,K2)
+        
+        # 3.3 サンプソン距離の分母計算
+        #     (F·p1)_x^2 + (F·p1)_y^2: 画像2上のエピポーラ線の勾配の強さ
+        #     (F^T·p2)_x^2 + (F^T·p2)_y^2: 画像1上のエピポーラ線の勾配の強さ
+        Fp1_sq = torch.sum(Fp1[:2, :]**2, dim=0)  # (K1,)
+        FTp2_sq = torch.sum(FTp2[:2, :]**2, dim=0)  # (K2,)
+        
+        # 3.4 分母を適切な形状に整形 (行列計算のためのブロードキャスト)
+        denom = Fp1_sq.view(-1, 1) + FTp2_sq.view(1, -1)  # (K1,K2)
+        denom = denom + 1e-12  # 数値安定性のための小さな値を追加
+        
+        # 3.5 基本的なサンプソン距離の計算
+        #     d_sampson = (p2^T·F·p1)^2 / ((F·p1)_x^2 + (F·p1)_y^2 + (F^T·p2)_x^2 + (F^T·p2)_y^2)
+        sampson_dist = (epipolar_constraint**2) / denom  # (K1,K2)
+        
+        # 4. ガウス分布の形状情報を考慮した項の計算
+        # 4.1 エピポーラ線の法線ベクトル (正規化)
+        normal1 = Fp1[:2, :].T  # 画像2上のエピポーラ線の法線 (K1,2)
+        normal1 = normal1 / (torch.norm(normal1, dim=1, keepdim=True) + 1e-12)
+        
+        normal2 = FTp2[:2, :].T  # 画像1上のエピポーラ線の法線 (K2,2)
+        normal2 = normal2 / (torch.norm(normal2, dim=1, keepdim=True) + 1e-12)
+        
+        # 4.2 分布版サンプソン距離の計算
+        dist_with_shape = torch.zeros_like(sampson_dist)  # (K1,K2)
+        
+        for i in range(k1):
+            # 4.3 画像1のガウス共分散行列を計算
+            scale1 = self.scales1[i]
+            rot1 = self.rotations1[i]
+            
+            cos_r = torch.cos(rot1)
+            sin_r = torch.sin(rot1)
+            R_2d = torch.tensor([
+                [cos_r, -sin_r],
+                [sin_r, cos_r]
+            ], device=self.device)
+            
+            S_diag = torch.diag(scale1.pow(2))
+            cov1 = R_2d @ S_diag @ R_2d.T  # (2,2)
+            
+            for j in range(k2):
+                # 4.4 画像2のガウス共分散行列を計算
+                scale2 = self.scales2[j]
+                rot2 = self.rotations2[j]
+                
+                cos_r2 = torch.cos(rot2)
+                sin_r2 = torch.sin(rot2)
+                R_2d2 = torch.tensor([
+                    [cos_r2, -sin_r2],
+                    [sin_r2, cos_r2]
+                ], device=self.device)
+                
+                S_diag2 = torch.diag(scale2.pow(2))
+                cov2 = R_2d2 @ S_diag2 @ R_2d2.T  # (2,2)
+                
+                # 4.5 エピポーラ線と共分散の関係を評価
+                # n^T·Σ·n: エピポーラ線の法線方向の分散 (大きいほど不確かさが高い)
+                n1 = normal2[j]  # 画像1上のエピポーラ線の法線 (j点に対応)
+                n2 = normal1[i]  # 画像2上のエピポーラ線の法線 (i点に対応)
+                
+                # 各画像上での形状の不確かさ
+                shape_uncertainty1 = torch.dot(torch.matmul(n1, cov1), n1)  # スカラー
+                shape_uncertainty2 = torch.dot(torch.matmul(n2, cov2), n2)  # スカラー
+                
+                # 4.6 形状の不確かさに基づいて通常のサンプソン距離を調整
+                # 不確かさが大きい（エピポーラ線に垂直な方向に広い）ほど、距離を割り引く
+                uncertainty_factor = 1.0 + shape_uncertainty1 + shape_uncertainty2
+                dist_with_shape[i, j] = sampson_dist[i, j] / uncertainty_factor
+        
+        # 5. 色差分の計算
+        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
+        d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
+        
+        # 6. 各コスト要素の正規化 (95パーセンタイルで正規化)
+        with torch.no_grad():
+            p95_sampson = torch.quantile(dist_with_shape, 0.95)
+            p95_color = torch.quantile(d_color, 0.95)
+        
+        sampson_norm = torch.clamp(dist_with_shape, max=p95_sampson) / p95_sampson
+        color_norm = torch.clamp(d_color, max=p95_color) / p95_color
+        
+        # 7. 最終的なコスト行列の計算
+        cost_matrix = (
+            self.lambda_epipolar * sampson_norm + 
+            self.lambda_color * color_norm
+        )
+        
         return cost_matrix
+    
+    
 
-    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
+    def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
 
         This replaces the Homography-based distance with an epipolar distance.
@@ -457,9 +489,9 @@ class OptimalTransportSolver:
         return cost_matrix
         
 
-    def optimize_with_RT_C2W(self, max_iter=1000, tol=1e-6,
+    def optimize_with_RT(self, max_iter=1000, tol=1e-6,
                             save_diagnostics=True, diagnostics_dir=None,
-                            rot_scale: float = 5.0):
+                            rot_scale: float = 1.0):
         """Optimize camera-to-world parameters (R_cw, c_w) using optimal transport loss.
         
         This method optimizes the camera-to-world transformation parameters (rotation and camera center)
@@ -492,29 +524,29 @@ class OptimalTransportSolver:
                   - self.rvec, self.tvec: World-to-camera parameters (for compatibility)
         """
 
-        # ------------------------- 履歴用 ------------------------- #
-        loss_history, param_history, grad_history = [], {'rvec_cw': [], 'center': []}, {'rvec_cw': [], 'center': []}
-
-        # ------------------------- パラメータ初期化 ----------------------- #
-        if not hasattr(self, 'rvec_cw'):
-            self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
-        if not hasattr(self, 'center'):
-            self.center = nn.Parameter(torch.tensor([0.1, 0.0, 0.0], dtype=torch.float32, device=self.device))
-
-        # ----------- Adam → SGD (momentum0.9, weight_decay0) -------------- #
-        optimizer = torch.optim.SGD(
-            [{'params': self.rvec_cw, 'lr': 5e-4},      # 回転を速め
-            {'params': self.center,  'lr': 5e-4}],    # 並進を遅め
-            momentum=0.9, weight_decay=0.0, dampening=0
-        )
-
-        prev_loss_val = float('inf')
-
         # -------------------------  出力ディレクトリ  ---------------------- #
         transport_dir = os.path.join("results", "transport_RT_C2W")
         os.makedirs(transport_dir, exist_ok=True)
         diagnostics_dir = diagnostics_dir or os.path.join("results", "diagnostics_c2w")
         os.makedirs(diagnostics_dir, exist_ok=True)
+
+        # ------------------------- 履歴用 ------------------------- #
+        loss_history, param_history, grad_history = [], {'rvec_cw': [], 'center': []}, {'rvec_cw': [], 'center': []}
+
+        # ------------------------- パラメータ初期化 ----------------------- #
+        if not hasattr(self, 'rvec_cw'):
+            # self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+            self.rvec_cw = nn.Parameter(torch.tensor([0.1, 0.05, 0.02], dtype=torch.float32, device=self.device))
+        if not hasattr(self, 'center'):
+            self.center = nn.Parameter(torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device))
+
+        # ----------- Adam → SGD (momentum0.9, weight_decay0) -------------- #
+        optimizer = torch.optim.SGD(
+            [{'params': self.rvec_cw, 'lr': 5e-3},      # 回転を速め
+            {'params': self.center,  'lr': 0.0}],    # 並進を遅め
+        )
+
+        prev_loss_val = float('inf')
 
         pbar = tqdm(range(max_iter), desc="Optimizing C2W", leave=True)
 
@@ -634,7 +666,6 @@ class OptimalTransportSolver:
                 param_history=param_history,
                 grad_history=grad_history
             )
-
 
     def save_optimization_diagnostics_C2W(self, 
                                     output_dir: str,
