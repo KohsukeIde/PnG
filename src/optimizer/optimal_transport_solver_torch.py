@@ -219,129 +219,178 @@ class OptimalTransportSolver:
         transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
         return transport
 
+    def _make_cov_matrices(self, scales: torch.Tensor,
+                        rotations: torch.Tensor) -> torch.Tensor:
+        """"""
+        cos_r, sin_r = torch.cos(rotations), torch.sin(rotations)
+        rot = torch.stack(
+            [torch.stack([cos_r, -sin_r], 1),
+            torch.stack([sin_r,  cos_r], 1)],
+            2)                                   # (K,2,2)
+        scale_mat = torch.stack([torch.diag(s**2) for s in scales])
+        return rot @ scale_mat @ rot.transpose(1, 2)   # (K,2,2)
+    
 
-    def compute_cost_matrix_fundamental(self, f: torch.Tensor) -> torch.Tensor:
-        """分布版サンプソン距離を用いた2Dガウス間のコスト行列計算
+    def compute_cost_matrix_fundamental(self, F: torch.Tensor) -> torch.Tensor:
+        """
+        分布版 "対称エピポーラ距離" + 色差  
+        Sampson ではなく  |p×ℓ|/‖ℓ‖  形式を左右合計し，
+        ガウス形状の不確かさ u = nᵀΣn で割引する。
+        """
+        k1, k2 = self.means1.size(0), self.means2.size(0)
+
+        # ------------------- ① 同次座標 -------------------
+        ones1 = torch.ones(k1, 1, device=self.device)
+        ones2 = torch.ones(k2, 1, device=self.device)
+        p1_h = torch.cat([self.means1, ones1], 1)   # (K1,3)
+        p2_h = torch.cat([self.means2, ones2], 1)   # (K2,3)
+
+        # ------------------- ② エピポーラ線 ----------------
+        l1 = (F   @ p2_h.T).T            # image-1 上 (K2,3)
+        l2 = (F.T @ p1_h.T).T            # image-2 上 (K1,3)
+
+        #  法線ベクトルとノルム
+        n1 = l1[:, :2]                                   # (K2,2)
+        n1_norm = n1.norm(dim=1, keepdim=True) + 1e-12
+        n1_unit = n1 / n1_norm                           # (K2,2)
+
+        n2 = l2[:, :2]                                   # (K1,2)
+        n2_norm = n2.norm(dim=1, keepdim=True) + 1e-12
+        n2_unit = n2 / n2_norm                           # (K1,2)
+
+        # ------------------- ③ 点⇔線距離 -------------------
+        #   dist_12(i,j) : p1_i → ℓ1_j
+        numer_12 = torch.abs(p1_h @ l1.T)          # (K1,K2)
+        dist_12  = numer_12 / n1_norm.T            # /‖ℓ1‖  (K1,K2)
+
+        #   dist_21(i,j) : p2_j → ℓ2_i
+        numer_21 = torch.abs(p2_h @ l2.T).T        # (K1,K2)
+        dist_21  = numer_21 / n2_norm              # (K1,K2)
+
+        symmetric_dist = dist_12 + dist_21         # (K1,K2)
+
+        # ------------------- ④ 形状による割引 ---------------
+        cov1 = self._make_cov_matrices(self.scales1, self.rotations1)   # (K1,2,2)
+        cov2 = self._make_cov_matrices(self.scales2, self.rotations2)   # (K2,2,2)
+
+        #   u1_i = n2_i^T Σ1_i n2_i   （n2_i は image-2 上の法線）
+        v1 = torch.bmm(cov1, n2_unit.unsqueeze(-1)).squeeze(-1)    # (K1,2)
+        u1 = (v1 * n2_unit).sum(1)                                 # (K1,)
+
+        #   u2_j = n1_j^T Σ2_j n1_j
+        v2 = torch.bmm(cov2, n1_unit.unsqueeze(-1)).squeeze(-1)    # (K2,2)
+        u2 = (v2 * n1_unit).sum(1)                                 # (K2,)
+
+        uncertainty = 1.0 + u1.view(-1, 1) + u2.view(1, -1)        # (K1,K2)
+        epi_with_shape = symmetric_dist / uncertainty              # (K1,K2)
+
+        # ------------------- ⑤ 色差 -------------------------
+        rgb_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)   # (K1,K2,3)
+        color_dist = (rgb_diff ** 2).sum(2)                          # (K1,K2)
+
+        # ------------------- ⑥ 正規化 -----------------------
+        with torch.no_grad():
+            p95_epi   = torch.quantile(epi_with_shape, 0.95)
+            p95_color = torch.quantile(color_dist, 0.95)
+
+        epi_norm   = torch.clamp(epi_with_shape, max=p95_epi)   / p95_epi
+        color_norm = torch.clamp(color_dist,    max=p95_color) / p95_color
+
+        # ------------------- ⑦ コスト合成 -------------------
+        cost = ( self.lambda_epipolar * epi_norm
+            + self.lambda_color    * color_norm )
+
+        return cost
         
-        サンプソン距離＋ガウス分布の形状情報も考慮する。
+    def compute_cost_matrix_fundamental_sampson(self, F: torch.Tensor) -> torch.Tensor:
+        """ガウス分布の形状を考慮した分布版サンプソン距離によるコスト行列計算
+        
+        サンプソン距離の優れた特性を活かしつつ、ガウス分布の形状情報も
+        考慮することで、特に大きなガウスや楕円形ガウスの対応付けを改善する。
+        完全にベクトル化された実装により、大量のガウスでも高速に計算可能。
         
         Args:
-            f (torch.Tensor): 基礎行列 (3x3)
+            F (torch.Tensor): 基礎行列 (3x3)
             
         Returns:
             torch.Tensor: コスト行列 (K1, K2)
         """
-        # 1. ガウス分布の数を取得
-        k1 = self.means1.shape[0]
-        k2 = self.means2.shape[0]
-
-        # 2. 同次座標に変換
-        ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
-        p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
-
-        ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
-        p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
-
-        # 3. サンプソン距離の計算に必要な要素
-        # 3.1 エピポーラ制約の計算
-        #     p2^T·F·p1: 制約違反の度合い (対応が完全ならゼロになる)
-        Fp1 = f @ p1_homo.T  # F·p1: (3,K1)
-        FTp2 = f.T @ p2_homo.T  # F^T·p2: (3,K2)
+        # 画像1,2のガウス数を取得
+        k1, k2 = self.means1.size(0), self.means2.size(0)
         
-        # 3.2 エピポーラ線と点の積 (p2^T·F·p1): エピポーラ制約の値
-        epipolar_constraint = torch.matmul(p2_homo, Fp1)  # (K2,K1)
-        epipolar_constraint = epipolar_constraint.T  # (K1,K2)
+        # === 1. サンプソン距離の基本形 ===
+        # 同次座標変換
+        ones1 = torch.ones(k1, 1, device=self.device)
+        ones2 = torch.ones(k2, 1, device=self.device)
+        p1 = torch.cat([self.means1, ones1], 1)  # (K1,3)
+        p2 = torch.cat([self.means2, ones2], 1)  # (K2,3)
         
-        # 3.3 サンプソン距離の分母計算
-        #     (F·p1)_x^2 + (F·p1)_y^2: 画像2上のエピポーラ線の勾配の強さ
-        #     (F^T·p2)_x^2 + (F^T·p2)_y^2: 画像1上のエピポーラ線の勾配の強さ
-        Fp1_sq = torch.sum(Fp1[:2, :]**2, dim=0)  # (K1,)
-        FTp2_sq = torch.sum(FTp2[:2, :]**2, dim=0)  # (K2,)
+        # サンプソン距離の主要成分計算
+        Fp1 = F @ p1.T    # 画像2上のエピポーラ線 (3,K1)
+        FTp2 = F.T @ p2.T  # 画像1上のエピポーラ線 (3,K2)
         
-        # 3.4 分母を適切な形状に整形 (行列計算のためのブロードキャスト)
-        denom = Fp1_sq.view(-1, 1) + FTp2_sq.view(1, -1)  # (K1,K2)
-        denom = denom + 1e-12  # 数値安定性のための小さな値を追加
+        # エピポーラ制約の値: (p2^T·F·p1)^2
+        num = (p2 @ Fp1)      # (K2,K1)
+        num = num.T ** 2      # (K1,K2)
         
-        # 3.5 基本的なサンプソン距離の計算
-        #     d_sampson = (p2^T·F·p1)^2 / ((F·p1)_x^2 + (F·p1)_y^2 + (F^T·p2)_x^2 + (F^T·p2)_y^2)
-        sampson_dist = (epipolar_constraint**2) / denom  # (K1,K2)
+        # サンプソン距離の分母: (F·p1)_xy^2 + (F^T·p2)_xy^2
+        denom = (Fp1[:2]**2).sum(0).view(-1, 1) + (FTp2[:2]**2).sum(0).view(1, -1)
         
-        # 4. ガウス分布の形状情報を考慮した項の計算
-        # 4.1 エピポーラ線の法線ベクトル (正規化)
-        normal1 = Fp1[:2, :].T  # 画像2上のエピポーラ線の法線 (K1,2)
-        normal1 = normal1 / (torch.norm(normal1, dim=1, keepdim=True) + 1e-12)
+        # サンプソン距離計算
+        sampson = num / (denom + 1e-12)  # (K1,K2)
         
-        normal2 = FTp2[:2, :].T  # 画像1上のエピポーラ線の法線 (K2,2)
-        normal2 = normal2 / (torch.norm(normal2, dim=1, keepdim=True) + 1e-12)
+        # === 2. ガウス分布の形状を考慮 ===
+        # 2.1 共分散行列の作成
+        # 共分散行列の計算
+        cov1 = self._make_cov_matrices(self.scales1, self.rotations1)  # (K1,2,2)
+        cov2 = self._make_cov_matrices(self.scales2, self.rotations2)  # (K2,2,2)
         
-        # 4.2 分布版サンプソン距離の計算
-        dist_with_shape = torch.zeros_like(sampson_dist)  # (K1,K2)
+        # 2.2 エピポーラ線の法線ベクトル計算（正規化）
+        # ℓ = (a,b,c) の法線は n = (a,b)/||(a,b)||
+        n1 = Fp1[:2].T  # 画像2上のエピポーラ線の法線方向 (K1,2)
+        n1 = n1 / (n1.norm(dim=1, keepdim=True) + 1e-12)
         
-        for i in range(k1):
-            # 4.3 画像1のガウス共分散行列を計算
-            scale1 = self.scales1[i]
-            rot1 = self.rotations1[i]
-            
-            cos_r = torch.cos(rot1)
-            sin_r = torch.sin(rot1)
-            R_2d = torch.tensor([
-                [cos_r, -sin_r],
-                [sin_r, cos_r]
-            ], device=self.device)
-            
-            S_diag = torch.diag(scale1.pow(2))
-            cov1 = R_2d @ S_diag @ R_2d.T  # (2,2)
-            
-            for j in range(k2):
-                # 4.4 画像2のガウス共分散行列を計算
-                scale2 = self.scales2[j]
-                rot2 = self.rotations2[j]
-                
-                cos_r2 = torch.cos(rot2)
-                sin_r2 = torch.sin(rot2)
-                R_2d2 = torch.tensor([
-                    [cos_r2, -sin_r2],
-                    [sin_r2, cos_r2]
-                ], device=self.device)
-                
-                S_diag2 = torch.diag(scale2.pow(2))
-                cov2 = R_2d2 @ S_diag2 @ R_2d2.T  # (2,2)
-                
-                # 4.5 エピポーラ線と共分散の関係を評価
-                # n^T·Σ·n: エピポーラ線の法線方向の分散 (大きいほど不確かさが高い)
-                n1 = normal2[j]  # 画像1上のエピポーラ線の法線 (j点に対応)
-                n2 = normal1[i]  # 画像2上のエピポーラ線の法線 (i点に対応)
-                
-                # 各画像上での形状の不確かさ
-                shape_uncertainty1 = torch.dot(torch.matmul(n1, cov1), n1)  # スカラー
-                shape_uncertainty2 = torch.dot(torch.matmul(n2, cov2), n2)  # スカラー
-                
-                # 4.6 形状の不確かさに基づいて通常のサンプソン距離を調整
-                # 不確かさが大きい（エピポーラ線に垂直な方向に広い）ほど、距離を割り引く
-                uncertainty_factor = 1.0 + shape_uncertainty1 + shape_uncertainty2
-                dist_with_shape[i, j] = sampson_dist[i, j] / uncertainty_factor
+        n2 = FTp2[:2].T  # 画像1上のエピポーラ線の法線方向 (K2,2)
+        n2 = n2 / (n2.norm(dim=1, keepdim=True) + 1e-12)
         
-        # 5. 色差分の計算
+        # 2.3 共分散行列とエピポーラ線法線の積 (n^T·Σ·n)
+        def shape_uncertainty(covs, normals):
+            """共分散行列と法線ベクトルからエピポーラ線方向の不確かさを計算"""
+            # covs: (K,2,2), normals: (K,2) -> returns: (K,)
+            v = torch.bmm(covs, normals.unsqueeze(-1)).squeeze(-1)  # (K,2)
+            return (v * normals).sum(dim=1)  # (K,) n^T·Σ·n を各ガウスごとに計算
+        
+        # 各ガウスのエピポーラ線方向への不確かさ
+        u1 = shape_uncertainty(cov1, n2)  # 画像1のガウスの不確かさ (K1,)
+        u2 = shape_uncertainty(cov2, n1)  # 画像2のガウスの不確かさ (K2,)
+        
+        # 2.4 サンプソン距離を不確かさで割引（形状を考慮した分布版サンプソン距離）
+        # 不確かさが大きいほど（エピポーラ線に垂直な方向に広いガウスほど）、
+        # サンプソン距離を小さく評価する
+        uncertainty_factor = 1.0 + u1.view(-1, 1) + u2.view(1, -1)  # ブロードキャスト (K1,K2)
+        sampson_with_shape = sampson / uncertainty_factor
+        
+        # === 3. 色差分の計算 ===
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
-        d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
+        d_color = (color_diff ** 2).sum(dim=2)  # (K1,K2)
         
-        # 6. 各コスト要素の正規化 (95パーセンタイルで正規化)
+        # === 4. 正規化と最終コスト計算 ===
+        # 4.1 95パーセンタイルでの正規化（外れ値の影響を抑制）
         with torch.no_grad():
-            p95_sampson = torch.quantile(dist_with_shape, 0.95)
+            p95_sampson = torch.quantile(sampson_with_shape, 0.95)
             p95_color = torch.quantile(d_color, 0.95)
         
-        sampson_norm = torch.clamp(dist_with_shape, max=p95_sampson) / p95_sampson
+        # 4.2 正規化と重み付け
+        sampson_norm = torch.clamp(sampson_with_shape, max=p95_sampson) / p95_sampson
         color_norm = torch.clamp(d_color, max=p95_color) / p95_color
         
-        # 7. 最終的なコスト行列の計算
+        # 4.3 最終コスト行列の計算
         cost_matrix = (
             self.lambda_epipolar * sampson_norm + 
             self.lambda_color * color_norm
         )
         
         return cost_matrix
-    
-    
 
     def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
         """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
@@ -535,14 +584,14 @@ class OptimalTransportSolver:
 
         # ------------------------- パラメータ初期化 ----------------------- #
         if not hasattr(self, 'rvec_cw'):
-            # self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
-            self.rvec_cw = nn.Parameter(torch.tensor([0.1, 0.05, 0.02], dtype=torch.float32, device=self.device))
+            self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
+            # self.rvec_cw = nn.Parameter(torch.tensor([0.1, 0.05, 0.02], dtype=torch.float32, device=self.device))
         if not hasattr(self, 'center'):
             self.center = nn.Parameter(torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device))
 
         # ----------- Adam → SGD (momentum0.9, weight_decay0) -------------- #
         optimizer = torch.optim.SGD(
-            [{'params': self.rvec_cw, 'lr': 5e-3},      # 回転を速め
+            [{'params': self.rvec_cw, 'lr': 1e-3},      # 回転を速め
             {'params': self.center,  'lr': 0.0}],    # 並進を遅め
         )
 
