@@ -146,13 +146,14 @@ class OptimalTransportSolver:
         F = K2^-T [t]_x R K1^-1
         """
         # [t]_x (外積行列)
-        tx = torch.zeros((3,3), device=self.device)
-        tx[0,1] = -t_wc[2]
-        tx[0,2] =  t_wc[1]
-        tx[1,0] =  t_wc[2]
-        tx[1,2] = -t_wc[0]
-        tx[2,0] = -t_wc[1]
-        tx[2,1] =  t_wc[0]
+        # tx = torch.zeros((3,3), device=self.device)
+        # tx[0,1] = -t_wc[2]
+        # tx[0,2] =  t_wc[1]
+        # tx[1,0] =  t_wc[2]
+        # tx[1,2] = -t_wc[0]
+        # tx[2,0] = -t_wc[1]
+        # tx[2,1] =  t_wc[0]
+        tx = self._hat(t_wc)
 
         E = tx @ R_wc  # Essential matrix
 
@@ -536,8 +537,7 @@ class OptimalTransportSolver:
         )
 
         return cost_matrix
-        
-
+    
     def optimize_with_RT(self, max_iter=1000, tol=1e-6,
                             save_diagnostics=True, diagnostics_dir=None,
                             rot_scale: float = 1.0):
@@ -589,10 +589,10 @@ class OptimalTransportSolver:
         if not hasattr(self, 'center'):
             self.center = nn.Parameter(torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device))
 
-        # ----------- Adam → SGD (momentum0.9, weight_decay0) -------------- #
+        # ----------- Adam → SGD  -------------- #
         optimizer = torch.optim.SGD(
-            [{'params': self.rvec_cw, 'lr': 1e-3},      # 回転を速め
-            {'params': self.center,  'lr': 0.0}],    # 並進を遅め
+            [{'params': self.rvec_cw, 'lr': 5e-3},      # 回転を速め
+            {'params': self.center,  'lr': 5e-4}],    # 並進を遅め
         )
 
         prev_loss_val = float('inf')
@@ -612,8 +612,7 @@ class OptimalTransportSolver:
 
             # OT 損失
             cost_matrix = self.compute_cost_matrix_fundamental(F)
-            transport   = self.unbalanced_sinkhorn_algorithm(cost_matrix, rho=0.5,
-                                                            max_iter=10000, tol=1e-6)
+            transport   = self.unbalanced_sinkhorn_algorithm(cost_matrix)
             loss = torch.sum(transport * cost_matrix)
             loss.backward()
 
@@ -632,11 +631,15 @@ class OptimalTransportSolver:
             # ---- 更新 ----
             optimizer.step()
 
-            # π クランプ
+            # π クランプ/tvecの正規化
             with torch.no_grad():
                 theta = torch.linalg.norm(self.rvec_cw)
                 if theta > np.pi:
                     self.rvec_cw.mul_(np.pi / theta)
+            
+                norm_t = torch.linalg.norm(self.center)
+                if norm_t > 1e-8:
+                    self.center /= norm_t  
 
             # ---- 収束判定 ----
             loss_diff = abs(prev_loss_val - current_loss)
