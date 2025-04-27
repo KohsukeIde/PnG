@@ -152,15 +152,24 @@ class OptimalTransportSolver:
         # tx[1,2] = -t_wc[0]
         # tx[2,0] = -t_wc[1]
         # tx[2,1] =  t_wc[0]
+        print(f"t_wc: {t_wc}")
         tx = self.skew(t_wc)
-
+        print(f"tx: {tx}")
         E = tx @ R_wc  # Essential matrix
+        print(f"E: {E}")
+        print(f"tx: {tx}")
+        print(f"R_wc: {R_wc}")
+        
+        # sys.exit()
+        assert not torch.isnan(E).any(),  "NaN in essential matrix"
 
         K1_inv = torch.inverse(self.k1)
         K2_inv = torch.inverse(self.k2)
         K2_inv_T = K2_inv.transpose(0,1)
 
         F = K2_inv_T @ E @ K1_inv
+        
+        assert not torch.isnan(F).any(),    "NaN in fundamental matrix"
         return F
 
     def unbalanced_sinkhorn_algorithm(
@@ -959,48 +968,38 @@ class OptimalTransportSolver:
         print(f"Saved optimization diagnostics to {output_dir}")
 
     def se3_exp(self, xi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        xi: (..., 6)  axis-angle と並進を連結した se(3) ベクトル
-        return: R_cw (3×3), t_cw (3,)
-        """
-        omega, rho = xi[..., :3], xi[..., 3:]  # 回転と並進成分に分ける
-        theta2 = torch.linalg.norm(omega, dim=-1, keepdim=True)**2  # 回転の大きさの二乗
-        eps = 1e-8  # iNeRF Appendix Eq.(26)の閾値
-
-        # JAX lax.condと同様に、torch.whereを使って勾配連続性を確保
-        # 小角近似（theta≃0の場合）のテイラー展開係数
-        A_small = 1.0 - theta2/6.0
-        B_small = 0.5 - theta2/24.0
-        C_small = 1.0/6.0 - theta2/120.0
+        """SE3指数写像: 回転行列Rと並進ベクトルtを返す"""
+        # 回転と並進に分解
+        omega = xi[:3]
+        v = xi[3:]
         
-        # 通常の計算（theta≠0の場合）
-        theta = torch.sqrt(theta2)
-        A_normal = torch.sin(theta) / theta
-        B_normal = (1.0 - torch.cos(theta)) / theta**2
-        C_normal = (1.0 - A_normal) / theta**2
+        # 回転の大きさを計算
+        theta2 = (omega * omega).sum()
+        theta2_safe = theta2.clamp_min(1e-8)  # 0除算を防ぐ
+        theta = torch.sqrt(theta2_safe)       # 安全に平方根を計算
         
-        # 条件に応じて値を選択（勾配は両経路に流れる）
-        is_small = theta2 < eps
-        A = torch.where(is_small, A_small, A_normal)
-        B = torch.where(is_small, B_small, B_normal)
-        C = torch.where(is_small, C_small, C_normal)
-
-        # Rodrigues公式による回転行列計算
-        K = torch.zeros((*xi.shape[:-1], 3, 3), device=xi.device, dtype=xi.dtype)
-        K[..., 0, 1] = -omega[..., 2]; K[..., 0, 2] =  omega[..., 1]
-        K[..., 1, 0] =  omega[..., 2]; K[..., 1, 2] = -omega[..., 0]
-        K[..., 2, 0] = -omega[..., 1]; K[..., 2, 1] =  omega[..., 0]
-
-        eye = torch.eye(3, device=xi.device, dtype=xi.dtype)
-        eye = eye.expand_as(K)
-
-        # 回転行列計算: R = I + A*K + B*K^2
-        R = eye + A[..., None] * K + B[..., None] * (K @ K)     # (3×3)
-
-        # 並進ベクトル計算: t = V * rho  (Vは並進ヤコビアン)
-        V = eye + B[..., None] * K + C[..., None] * (K @ K)
-        t = (V @ rho[..., None]).squeeze(-1)                    # (3,)
-
+        # スキュー行列
+        K = self.skew(omega)
+        
+        # 小角度の場合はテイラー展開による近似
+        A = torch.where(theta2 > 1e-4,
+                       torch.sin(theta) / theta,
+                       1.0 - theta2/6.0 + theta2*theta2/120.0)
+        
+        B = torch.where(theta2 > 1e-4,
+                       (1.0 - torch.cos(theta)) / theta2_safe,
+                       0.5 - theta2/24.0 + theta2*theta2/720.0)
+        
+        # 回転行列の計算
+        R = torch.eye(3, device=xi.device) + A * K + B * K @ K
+        
+        # 並進ベクトルのための行列V
+        C = (1.0 - A) / theta2_safe
+        V = torch.eye(3, device=xi.device) + B * K + C * K @ K
+        
+        # 並進ベクトルの計算
+        t = V @ v
+        
         return R, t
 
     def optimize_with_SE3(self, max_iter=1000, tol=1e-6,
@@ -1222,7 +1221,7 @@ class OptimalTransportSolver:
                 grad_history=grad_history
             )
             
-    def _init_se3_like_cam1(self, rot_noise=0.05, trans_noise=0.05):
+    def _init_se3_like_cam1(self, rot_noise=0.2, trans_noise=0.2):
         """Cam-1 の姿勢 (I,0) から微小ノイズを加えて se3_vec を初期化
         
         カメラ1の姿勢（単位行列の回転と原点）から微小なランダムノイズを加えて
@@ -1556,48 +1555,48 @@ class OptimalTransportSolver:
         K[..., 0, 1] = -v[..., 2];  K[..., 0, 2] =  v[..., 1]
         K[..., 1, 0] =  v[..., 2];  K[..., 1, 2] = -v[..., 0]
         K[..., 2, 0] = -v[..., 1];  K[..., 2, 1] =  v[..., 0]
+        print(f"K: {K}")
+        if torch.isnan(K).any():
+            print(f"v: {v}")
+            sys.exit()
         return K
 
     def se3_exp_T(self, xi: torch.Tensor) -> torch.Tensor:
-        """
-        xi: (6,) → 4×4  SE(3)   ― iNeRF Eq.(6)
-        """
-        omega, v = xi[:3], xi[3:]  # 回転と並進成分に分ける
-        theta2 = (omega * omega).sum()  # 回転ベクトルの大きさの二乗
-        eps = 1e-8  # iNeRF Appendix Eq.(26)の閾値
-
-        # JAX lax.condと同様に、torch.whereを使って勾配連続性を確保
-        # 小角近似（theta≃0の場合）のテイラー展開係数
-        A_small = 1.0 - theta2/6.0
-        B_small = 0.5 - theta2/24.0
-        C_small = 1.0/6.0 - theta2/120.0
+        """SE3指数写像: 6次元ベクトルから4x4変換行列を計算"""
+        # 回転と並進に分解
+        omega, v = xi[:3], xi[3:]
         
-        # 通常の計算（theta≠0の場合）
-        theta = torch.sqrt(theta2)
-        A_normal = torch.sin(theta) / theta
-        B_normal = (1.0 - torch.cos(theta)) / theta2
-        C_normal = (1.0 - A_normal) / theta2
+        # 回転の大きさを計算
+        theta2 = (omega * omega).sum()
+        theta2_safe = theta2.clamp_min(1e-8)  # 0除算を防ぐ
+        theta = torch.sqrt(theta2_safe)       # 安全に平方根を計算
         
-        # 条件に応じて値を選択（勾配は両経路に流れる）
-        is_small = theta2 < eps
-        A = torch.where(is_small, A_small, A_normal)
-        B = torch.where(is_small, B_small, B_normal)
-        C = torch.where(is_small, C_small, C_normal)
-
-        # 歪対称行列を計算
+        # スキュー行列
         K = self.skew(omega)
         
-        # 回転行列と並進ヤコビアンを計算
-        eye = torch.eye(3, device=xi.device)
-        R = eye + A * K + B * K @ K
-        V = eye + B * K + C * K @ K
+        # 回転行列の係数
+        # 小角度の場合はテイラー展開による近似を使用
+        A = torch.where(theta2 > 1e-4,
+                        torch.sin(theta) / theta,
+                        1.0 - theta2/6.0 + theta2*theta2/120.0)
         
-        # 並進ベクトルを計算
-        t = V @ v
-
-        # 4x4変換行列を作成
+        B = torch.where(theta2 > 1e-4,
+                        (1.0 - torch.cos(theta)) / theta2_safe,
+                        0.5 - theta2/24.0 + theta2*theta2/720.0)
+        
+        C = (1.0 - A) / theta2_safe  # 既にsafeなtheta2を使用
+        
+        # 回転行列の計算
+        R = torch.eye(3, device=xi.device) + A * K + B * K @ K
+        
+        # 並進ベクトルのための行列V
+        V = torch.eye(3, device=xi.device) + B * K + C * K @ K
+        
+        # 4x4変換行列の構築
         T = torch.eye(4, device=xi.device)
-        T[:3, :3], T[:3, 3] = R, t
+        T[:3, :3] = R
+        T[:3, 3] = V @ v
+        
         return T
 
     def optimize_with_inerf(self, 
@@ -1629,7 +1628,7 @@ class OptimalTransportSolver:
                 R_cw, t_cw = self.se3_exp(self.se3_vec)
             else:
                 # なければランダム初期化
-                self._init_se3_like_cam1(rot_noise=0.05, trans_noise=0.05)
+                self._init_se3_like_cam1(rot_noise=0.2, trans_noise=0.2)
                 R_cw, t_cw = self.se3_exp(self.se3_vec)
                 
             # 4x4の同次変換行列を作成
@@ -1651,7 +1650,7 @@ class OptimalTransportSolver:
         debug_log_path = os.path.join(diagnostics_dir, "gradient_debug_inerf.log")
         with open(debug_log_path, 'w') as f:
             f.write("Iteration, Loss, Delta_Norm, Grad_Norm, Grad_Rot_x, Grad_Rot_y, Grad_Rot_z, Grad_Trans_x, Grad_Trans_y, Grad_Trans_z\n")
-
+        
         # -------------------------  ループ  ------------------------------- #
         for iteration in pbar:
             # 1. Forward pass: 勾配計算のリセット
