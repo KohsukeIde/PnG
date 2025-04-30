@@ -12,7 +12,7 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
-
+from src.primitive.camera import Lie
 
 class OptimalTransportSolver:
     """Optimal Transport Solver for 2D Gaussians with Homography Optimization."""
@@ -72,6 +72,8 @@ class OptimalTransportSolver:
 
         # Convert Gaussian parameters to torch tensors
         self._prepare_gaussians()
+        # Lieクラスのインスタンス化
+        self.lie = Lie()
 
     def _prepare_gaussians(self) -> None:
         """Prepare Gaussian parameters as torch tensors."""
@@ -107,69 +109,16 @@ class OptimalTransportSolver:
             self.gaussians2.alpha, dtype=torch.float32, device=self.device
         )  # Shape: (K2,)
 
-    
-
-    def rodrigues(self, rvec: torch.Tensor) -> torch.Tensor:
-        """SO(3) exponential map with small-angle safeguard and autograd support.
-        
-        rvec: (3,) -> rotation vector
-        Returns: (3,3) rotation matrix using Rodrigues formula
-        """
-        # Calculate norm (rotation angle)
-        theta = torch.linalg.norm(rvec)
-        eps = 1e-6  # 小角近似の閾値
-        
-        # skew-symmetric matrix
-        K = self.skew(rvec)
-        
-        # 小角度近似（θ ≈ 0の場合）
-        R_small = torch.eye(3, dtype=torch.float32, device=rvec.device) + K
-        
-        # 通常の計算
-        r_axis = rvec / torch.max(theta, torch.tensor(eps, device=rvec.device))
-        K_unit = self.skew(r_axis)
-        R_normal = (
-            torch.eye(3, dtype=torch.float32, device=rvec.device)  # Identity matrix
-            + torch.sin(theta) * K_unit                           # sin(θ)K term
-            + (1.0 - torch.cos(theta)) * (K_unit @ K_unit)        # (1-cos(θ))K² term
-        )
-        
-        # 条件に応じて値を選択（勾配は両経路に流れる）
-        is_small = theta < eps
-        R = torch.where(is_small, R_small, R_normal)
-        
-        return R
 
     def _build_F_from_wc(self, R_wc: torch.Tensor, t_wc: torch.Tensor) -> torch.Tensor:
-        """R_wc, t_wc から F を構築。(build_f_from_rtの代替関数)
-        F = K2^-T [t]_x R K1^-1
-        """
-        # [t]_x (外積行列)
-        # tx = torch.zeros((3,3), device=self.device)
-        # tx[0,1] = -t_wc[2]
-        # tx[0,2] =  t_wc[1]
-        # tx[1,0] =  t_wc[2]
-        # tx[1,2] = -t_wc[0]
-        # tx[2,0] = -t_wc[1]
-        # tx[2,1] =  t_wc[0]
-        print(f"t_wc: {t_wc}")
-        tx = self.skew(t_wc)
-        print(f"tx: {tx}")
-        E = tx @ R_wc  # Essential matrix
-        print(f"E: {E}")
-        print(f"tx: {tx}")
-        print(f"R_wc: {R_wc}")
-        
-        # sys.exit()
-        assert not torch.isnan(E).any(),  "NaN in essential matrix"
-
+        """R_wc, t_wc から F を構築。Lieクラスのskew_symmetricを使用。"""
+        tx = self.lie.skew_symmetric(t_wc)
+        E = tx @ R_wc
         K1_inv = torch.inverse(self.k1)
         K2_inv = torch.inverse(self.k2)
         K2_inv_T = K2_inv.transpose(0,1)
-
         F = K2_inv_T @ E @ K1_inv
-        
-        assert not torch.isnan(F).any(),    "NaN in fundamental matrix"
+        assert not torch.isnan(F).any(), "NaN in fundamental matrix"
         return F
 
     def unbalanced_sinkhorn_algorithm(
@@ -546,479 +495,12 @@ class OptimalTransportSolver:
         )
 
         return cost_matrix
-    
-    def optimize_with_RT(self, max_iter=1000, tol=1e-6,
-                            save_diagnostics=True, diagnostics_dir=None,
-                            rot_scale: float = 1.0):
-        """Optimize camera-to-world parameters (R_cw, c_w) using optimal transport loss.
-        
-        This method optimizes the camera-to-world transformation parameters (rotation and camera center)
-        to find the best matching between two sets of 2D Gaussians. It uses SGD optimization
-        with momentum to minimize the optimal transport cost based on the fundamental matrix constraint.
-        
-        The optimized parameters represent the camera-to-world transformation:
-        - rvec_cw: Rotation vector (axis-angle) for camera-to-world rotation
-        - center: Camera center position in world coordinates
-        
-        These parameters are then converted to world-to-camera (R_wc, t_wc) for computing the 
-        fundamental matrix. The method also tracks optimization history and provides
-        visualization of the transport plan and optimization progress.
-        
-        Args:
-            max_iter (int): Maximum number of optimization iterations. Default: 1000.
-            tol (float): Convergence tolerance for loss change. Default: 1e-6.
-            save_diagnostics (bool): Whether to save detailed diagnostic information about 
-                                    the optimization process. Default: True.
-            diagnostics_dir (str, optional): Directory path to save diagnostic information.
-                                            If None, uses "results/diagnostics_c2w". Default: None.
-            rot_scale (float): Scaling factor for rotation gradients, which helps balance
-                            the optimization between rotation and translation parameters. Default: 5.0.
-        
-        Returns:
-            None: The optimized transformation parameters are stored as instance attributes:
-                  - self.rvec_cw: Camera-to-world rotation vector
-                  - self.center: Camera center in world coordinates
-                  - self.f: The resulting fundamental matrix
-                  - self.rvec, self.tvec: World-to-camera parameters (for compatibility)
-        """
 
-        # -------------------------  出力ディレクトリ  ---------------------- #
-        transport_dir = os.path.join("results", "transport_RT_C2W")
-        os.makedirs(transport_dir, exist_ok=True)
-        diagnostics_dir = diagnostics_dir or os.path.join("results", "diagnostics_c2w")
-        os.makedirs(diagnostics_dir, exist_ok=True)
 
-        # ------------------------- 履歴用 ------------------------- #
-        loss_history, param_history, grad_history = [], {'rvec_cw': [], 'center': []}, {'rvec_cw': [], 'center': []}
-
-        # ------------------------- パラメータ初期化 ----------------------- #
-        if not hasattr(self, 'rvec_cw'):
-            self.rvec_cw = nn.Parameter(torch.zeros(3, dtype=torch.float32, device=self.device))
-            # self.rvec_cw = nn.Parameter(torch.tensor([0.1, 0.05, 0.02], dtype=torch.float32, device=self.device))
-        if not hasattr(self, 'center'):
-            self.center = nn.Parameter(torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device))
-
-        # ----------- Adam → SGD  -------------- #
-        optimizer = torch.optim.SGD(
-            [{'params': self.rvec_cw, 'lr': 5e-3},      # 回転を速め
-            {'params': self.center,  'lr': 5e-4}],    # 並進を遅め
-        )
-
-        prev_loss_val = float('inf')
-
-        pbar = tqdm(range(max_iter), desc="Optimizing C2W", leave=True)
-
-        # -------------------------  ループ  ------------------------------- #
-        for iteration in pbar:
-            optimizer.zero_grad()
-
-            # C2W→W2C 変換
-            R_cw = self.rodrigues(self.rvec_cw)
-            R_wc = R_cw.t()
-            t_wc = -R_wc @ self.center
-
-            F = self._build_F_from_wc(R_wc, t_wc)
-
-            # OT 損失
-            cost_matrix = self.compute_cost_matrix_fundamental(F)
-            transport   = self.unbalanced_sinkhorn_algorithm(cost_matrix)
-            loss = torch.sum(transport * cost_matrix)
-            loss.backward()
-
-            # ---- 回転勾配を rot_scale 倍 ----
-            if self.rvec_cw.grad is not None:
-                self.rvec_cw.grad.mul_(rot_scale)
-
-            # ---- ログ ----
-            current_loss = loss.item()
-            loss_history.append(current_loss)
-            param_history['rvec_cw'].append(self.rvec_cw.clone())
-            param_history['center'].append(self.center.clone())
-            grad_history['rvec_cw'].append(self.rvec_cw.grad.clone() if self.rvec_cw.grad is not None else None)
-            grad_history['center'].append(self.center.grad.clone() if self.center.grad is not None else None)
-
-            # ---- 更新 ----
-            optimizer.step()
-
-            # π クランプ/tvecの正規化
-            # with torch.no_grad():
-            #     theta = torch.linalg.norm(self.rvec_cw)
-            #     if theta > np.pi:
-            #         self.rvec_cw.mul_(np.pi / theta)
-            
-            #     norm_t = torch.linalg.norm(self.center)
-            #     if norm_t > 1e-8:
-            #         self.center /= norm_t  
-
-            # ---- 収束判定 ----
-            loss_diff = abs(prev_loss_val - current_loss)
-            if iteration > 5 and loss_diff < tol:
-                pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
-                break
-            prev_loss_val = current_loss
-
-            if iteration % 10 == 0:
-                grad_r = self.rvec_cw.grad.norm().item() if self.rvec_cw.grad is not None else 0
-                grad_c = self.center.grad.norm().item() if self.center.grad is not None else 0
-                pbar.set_postfix(loss=f"{current_loss:.6f}", grad_r=f"{grad_r:.6f}", grad_c=f"{grad_c:.6f}")
-
-                # ---- Transport matrix visualization (元コードと同一) ----
-                if iteration % 10 == 0 or iteration == max_iter - 1:
-                    with torch.no_grad():
-                        t_np = transport.detach().cpu().numpy()
-
-                    rows, cols = t_np.shape
-                    aspect_ratio = cols / rows
-
-                    if rows > cols:
-                        fig_width = 8
-                        fig_height = min(20, fig_width / aspect_ratio)
-                    else:
-                        fig_height = 6
-                        fig_width = min(20, fig_height * aspect_ratio)
-
-                    plt.figure(figsize=(fig_width, fig_height))
-
-                    if rows > 1000 or cols > 1000:
-                        downsample_factor = max(1, int(max(rows, cols) / 1000))
-                        t_np_display = t_np[::downsample_factor, ::downsample_factor]
-                        plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
-                        plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
-                    else:
-                        plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
-                        plt.title(f"Transport Plan at Iteration {iteration}")
-
-                    plt.colorbar(label="Transport Plan Value")
-                    plt.xlabel("Image 2 Gaussians")
-                    plt.ylabel("Image 1 Gaussians")
-
-                    plt.tight_layout()
-                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-                    plt.savefig(plt_path, dpi=150)
-                    plt.close()
-
-        # ------------------------- 最終 F を保存 --------------------------- #
-        with torch.no_grad():
-            R_cw = self.rodrigues(self.rvec_cw)
-            R_wc = R_cw.t()
-            t_wc = -R_wc @ self.center
-            final_F = self._build_F_from_wc(R_wc, t_wc)
-            self.f = final_F
-
-            rvec_numpy, _ = cv2.Rodrigues(R_wc.cpu().numpy())
-            self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
-            self.tvec = nn.Parameter(t_wc)
-
-        # ------------------------- 損失プロット (元コードと同一) ------------ #
-        plt.figure()
-        plt.plot(loss_history, '-o')
-        plt.title("Loss (optimize_with_RT_C2W)")
-        plt.xlabel("Iteration")
-        plt.ylabel("Loss")
-        plt.grid(True)
-        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_RT_C2W.png"))
-        plt.close()
-
-        # ------------------------- 最適化過程描画 ------------- #
-        if save_diagnostics:
-            self.save_optimization_diagnostics_C2W(
-                output_dir=diagnostics_dir,
-                loss_history=loss_history,
-                param_history=param_history,
-                grad_history=grad_history
-            )
-
-    def save_optimization_diagnostics_C2W(self, 
-                                    output_dir: str,
-                                    loss_history: list,
-                                    param_history: dict,
-                                    grad_history: dict) -> None:
-        """Save detailed diagnostics about the optimization process.
-        
-        Analyzes and visualizes the optimization process, including:
-        - Loss trajectory
-        - Parameter evolution
-        - Gradient behavior
-        - Convergence analysis
-        
-        Args:
-            output_dir: Directory to save diagnostic files
-            loss_history: List of loss values at each iteration
-            param_history: Dictionary of parameter histories (e.g. {'rvec': [...], 'tvec': [...]})
-            grad_history: Dictionary of gradient histories corresponding to parameters
-        """
-        import os
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from matplotlib.gridspec import GridSpec
-        from mpl_toolkits.mplot3d import Axes3D
-        
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Convert histories to numpy arrays
-        param_history_np = {}
-        grad_history_np = {}
-        
-        for param_name, history in param_history.items():
-            param_history_np[param_name] = np.array([p.detach().cpu().numpy() for p in history])
-            
-        for param_name, history in grad_history.items():
-            grad_history_np[param_name] = np.array([g.detach().cpu().numpy() if g is not None 
-                                                else np.zeros_like(param_history_np[param_name][0]) 
-                                                for g in history])
-        
-        # Number of iterations
-        iterations = range(len(loss_history))
-        
-        # 1. Loss Trajectory Analysis
-        plt.figure(figsize=(12, 8))
-        plt.subplot(211)
-        plt.plot(iterations, loss_history, 'b-', linewidth=2)
-        plt.title('Loss Value During Optimization')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.grid(True)
-        
-        # Plot loss changes (derivative) to see stability
-        plt.subplot(212)
-        loss_changes = np.array([loss_history[i+1] - loss_history[i] 
-                                for i in range(len(loss_history)-1)])
-        plt.plot(iterations[:-1], loss_changes, 'r-')
-        plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        plt.title('Loss Change Between Iterations')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss Difference')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'loss_analysis.png'), dpi=150)
-        plt.close()
-        
-        # 2. Parameter Trajectory Analysis for each parameter
-        for param_name, param_data in param_history_np.items():
-            if param_data.shape[1] == 3:  # For 3D vectors like rvec or center
-                fig = plt.figure(figsize=(15, 5))
-                plt.plot(iterations, param_data[:, 0], 'r-', label=f'{param_name}[0]')
-                plt.plot(iterations, param_data[:, 1], 'g-', label=f'{param_name}[1]')
-                plt.plot(iterations, param_data[:, 2], 'b-', label=f'{param_name}[2]')
-                plt.title(f'{param_name} Components Over Time')
-                plt.xlabel('Iteration')
-                plt.ylabel('Value')
-                plt.grid(True)
-                plt.legend()
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f'{param_name}_trajectory.png'), dpi=150)
-                plt.close()
-                
-                # 3D Visualization of Parameter Trajectory
-                fig = plt.figure(figsize=(10, 8))
-                ax = fig.add_subplot(111, projection='3d')
-                ax.plot(param_data[:, 0], param_data[:, 1], param_data[:, 2], 'r-', linewidth=2)
-                ax.scatter(param_data[0, 0], param_data[0, 1], param_data[0, 2], c='g', s=100, label='Initial')
-                ax.scatter(param_data[-1, 0], param_data[-1, 1], param_data[-1, 2], c='b', s=100, label='Final')
-                ax.set_title(f'{param_name} Trajectory in 3D')
-                ax.set_xlabel(f'{param_name}[0]')
-                ax.set_ylabel(f'{param_name}[1]')
-                ax.set_zlabel(f'{param_name}[2]')
-                ax.legend()
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f'{param_name}_3d_trajectory.png'), dpi=150)
-                plt.close()
-        
-        # 3. Gradient Analysis for each parameter
-        for param_name, grad_data in grad_history_np.items():
-            if grad_data.shape[1] == 3:  # For 3D vectors
-                # Gradient magnitude
-                grad_magnitude = np.linalg.norm(grad_data, axis=1)
-                
-                fig = plt.figure(figsize=(15, 10))
-                gs = GridSpec(2, 2, figure=fig)
-                
-                # Plot gradient magnitude
-                ax1 = fig.add_subplot(gs[0, :])
-                ax1.plot(iterations, grad_magnitude, 'r-', linewidth=2)
-                ax1.set_title(f'{param_name} Gradient Magnitude')
-                ax1.set_xlabel('Iteration')
-                ax1.set_ylabel('Gradient Norm')
-                ax1.set_yscale('log')  # Log scale to better see changes
-                ax1.grid(True)
-                
-                # Plot gradient components
-                ax2 = fig.add_subplot(gs[1, :])
-                ax2.plot(iterations, grad_data[:, 0], 'r-', label=f'grad_{param_name}[0]')
-                ax2.plot(iterations, grad_data[:, 1], 'g-', label=f'grad_{param_name}[1]')
-                ax2.plot(iterations, grad_data[:, 2], 'b-', label=f'grad_{param_name}[2]')
-                ax2.set_title(f'{param_name} Gradient Components')
-                ax2.set_xlabel('Iteration')
-                ax2.set_ylabel('Gradient Value')
-                ax2.grid(True)
-                ax2.legend()
-                
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, f'{param_name}_gradient_analysis.png'), dpi=150)
-                plt.close()
-        
-        # 4. Generate a text report with analysis
-        with open(os.path.join(output_dir, 'optimization_analysis.txt'), 'w') as f:
-            f.write("OPTIMIZATION PROCESS ANALYSIS\n")
-            f.write("===========================\n\n")
-            
-            # Loss analysis
-            f.write("1. LOSS BEHAVIOR\n")
-            f.write("----------------\n")
-            initial_loss = loss_history[0]
-            final_loss = loss_history[-1]
-            loss_reduction = (initial_loss - final_loss) / initial_loss * 100 if initial_loss != 0 else 0
-            
-            f.write(f"Initial loss: {initial_loss:.6f}\n")
-            f.write(f"Final loss: {final_loss:.6f}\n")
-            f.write(f"Total loss reduction: {loss_reduction:.2f}%\n\n")
-            
-            # Monotonicity check
-            is_monotonic = all(loss_history[i] >= loss_history[i+1] for i in range(len(loss_history)-1))
-            f.write(f"Loss decreases monotonically: {is_monotonic}\n")
-            
-            # Find oscillations or plateaus
-            oscillation_count = sum(1 for i in range(len(loss_history)-2) 
-                                if (loss_history[i] > loss_history[i+1] and 
-                                    loss_history[i+1] < loss_history[i+2]))
-            
-            plateau_threshold = 1e-6  # Define what constitutes a plateau
-            plateau_count = sum(1 for i in range(len(loss_history)-1) 
-                            if abs(loss_history[i] - loss_history[i+1]) < plateau_threshold)
-            
-            f.write(f"Number of oscillations: {oscillation_count}\n")
-            f.write(f"Number of plateaus: {plateau_count}\n\n")
-            
-            # Parameter analysis for each parameter
-            f.write("2. PARAMETER BEHAVIOR\n")
-            f.write("---------------------\n")
-            for param_name, param_data in param_history_np.items():
-                f.write(f"{param_name} (initial): " + np.array2string(param_data[0], precision=6) + "\n")
-                f.write(f"{param_name} (final): " + np.array2string(param_data[-1], precision=6) + "\n")
-                param_change = np.linalg.norm(param_data[-1] - param_data[0])
-                f.write(f"Total {param_name} change magnitude: {param_change:.6f}\n\n")
-            
-            # Gradient analysis for each parameter
-            f.write("3. GRADIENT BEHAVIOR\n")
-            f.write("-------------------\n")
-            for param_name, grad_data in grad_history_np.items():
-                grad_magnitude = np.linalg.norm(grad_data, axis=1)
-                max_grad = np.max(grad_magnitude)
-                min_grad = np.min(grad_magnitude)
-                avg_grad = np.mean(grad_magnitude)
-                
-                f.write(f"{param_name} gradient - Max: {max_grad:.6f}, Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n")
-                
-                # Check for vanishing/exploding gradients
-                vanishing_threshold = 1e-6
-                exploding_threshold = 1e2
-                
-                vanishing_grad = any(grad < vanishing_threshold for grad in grad_magnitude)
-                exploding_grad = any(grad > exploding_threshold for grad in grad_magnitude)
-                
-                f.write(f"{param_name} gradient vanishing: {vanishing_grad}\n")
-                f.write(f"{param_name} gradient exploding: {exploding_grad}\n\n")
-            
-            # Conclusion
-            f.write("4. CONCLUSION\n")
-            f.write("-------------\n")
-            
-            # Determine if the optimization was successful
-            successful = loss_reduction > 50 and final_loss < initial_loss * 0.5
-            
-            if successful:
-                f.write("Optimization appears to be SUCCESSFUL based on significant loss reduction.\n\n")
-            else:
-                f.write("Optimization may have ISSUES based on limited loss reduction.\n\n")
-                
-            # Report potential issues
-            issues = []
-            if not is_monotonic and oscillation_count > len(loss_history) * 0.1:
-                issues.append("- Loss exhibits significant oscillations, suggesting unstable optimization.")
-                
-            if plateau_count > len(loss_history) * 0.3:
-                issues.append("- Loss exhibits plateaus, suggesting the optimizer may be struggling to make progress.")
-                
-            # Check for vanishing or exploding gradients across all parameters
-            any_vanishing = any(
-                np.any(np.linalg.norm(grad_history_np[param_name], axis=1) < vanishing_threshold)
-                for param_name in grad_history_np
-            )
-            
-            any_exploding = any(
-                np.any(np.linalg.norm(grad_history_np[param_name], axis=1) > exploding_threshold)
-                for param_name in grad_history_np
-            )
-            
-            if any_vanishing:
-                issues.append("- Gradients approach zero, suggesting vanishing gradient issues.")
-                
-            if any_exploding:
-                issues.append("- Gradients are very large, suggesting exploding gradient issues.")
-            
-            if issues:
-                f.write("Potential issues detected:\n")
-                for issue in issues:
-                    f.write(issue + "\n")
-            else:
-                f.write("No significant optimization issues detected.\n")
-            
-        print(f"Saved optimization diagnostics to {output_dir}")
-
-    def se3_exp(self, xi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """SE3指数写像: 回転行列Rと並進ベクトルtを返す"""
-        # 回転と並進に分解
-        omega = xi[:3]
-        v = xi[3:]
-        
-        # 回転の大きさを計算
-        theta2 = (omega * omega).sum()
-        theta2_safe = theta2.clamp_min(1e-8)  # 0除算を防ぐ
-        theta = torch.sqrt(theta2_safe)       # 安全に平方根を計算
-        
-        # スキュー行列
-        K = self.skew(omega)
-        
-        # 小角度の場合はテイラー展開による近似
-        A = torch.where(theta2 > 1e-4,
-                       torch.sin(theta) / theta,
-                       1.0 - theta2/6.0 + theta2*theta2/120.0)
-        
-        B = torch.where(theta2 > 1e-4,
-                       (1.0 - torch.cos(theta)) / theta2_safe,
-                       0.5 - theta2/24.0 + theta2*theta2/720.0)
-        
-        # 回転行列の計算
-        R = torch.eye(3, device=xi.device) + A * K + B * K @ K
-        
-        # 並進ベクトルのための行列V
-        C = (1.0 - A) / theta2_safe
-        V = torch.eye(3, device=xi.device) + B * K + C * K @ K
-        
-        # 並進ベクトルの計算
-        t = V @ v
-        
-        return R, t
 
     def optimize_with_SE3(self, max_iter=1000, tol=1e-6,
                         save_diagnostics=True, diagnostics_dir=None):
-        """Optimize camera pose using Lie algebra SE(3) representation.
-        
-        This method uses a unified 6-DoF representation from the Lie algebra se(3) for
-        camera pose optimization, combining rotation and translation into a single parameter vector.
-        This provides better gradient behavior compared to separate optimization parameters.
-        
-        Args:
-            max_iter (int): Maximum number of optimization iterations. Default: 1000.
-            tol (float): Convergence tolerance for loss change. Default: 1e-6.
-            save_diagnostics (bool): Whether to save diagnostic information. Default: True.
-            diagnostics_dir (str, optional): Directory path for diagnostics. Default: None.
-        
-        Returns:
-            None: The optimized transformation parameters are stored as instance attributes.
-        """
+        """Optimize camera pose using Lie algebra SE(3) representation (Lieクラス利用)."""
         # -------------------------  出力ディレクトリ  ---------------------- #
         transport_dir = os.path.join("results", "transport_SE3")
         os.makedirs(transport_dir, exist_ok=True)
@@ -1035,26 +517,24 @@ class OptimalTransportSolver:
             self._init_se3_like_cam1(rot_noise=0.05, trans_noise=0.05)
 
         # ------------------------- オプティマイザ設定 ----------------------- #
-        # iNeRFと同様にAdamを使用し、weight_decayを0に設定
         optimizer = torch.optim.Adam([self.se3_vec], lr=3e-3)
-        # iNeRFと同じ指数関数的学習率減衰: 0.8^(t/100)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8**(1/100))
 
         prev_loss_val = float('inf')
         pbar = tqdm(range(max_iter), desc="Optimizing SE(3)", leave=True)
 
-        # ---- 勾配デバッグ用ログファイル ----
         debug_log_path = os.path.join(diagnostics_dir, "gradient_debug.log")
         with open(debug_log_path, 'w') as f:
             f.write("Iteration, Loss, Grad_Norm, Grad_Rot_x, Grad_Rot_y, Grad_Rot_z, Grad_Trans_x, Grad_Trans_y, Grad_Trans_z\n")
 
-        # -------------------------  ループ  ------------------------------- #
         for iteration in pbar:
             optimizer.zero_grad()
             
-            # SE(3) Lie algebra → 回転行列と並進ベクトル
-            R_cw, t_cw = self.se3_exp(self.se3_vec)
-            
+            # --- LieクラスでSE(3)指数写像 ---
+            T_cw = self.lie.se3_to_SE3(self.se3_vec)  # (3,4) or (4,4) depending on Lie class
+            R_cw = T_cw[:3, :3]
+            t_cw = T_cw[:3, 3]
+
             # 世界→カメラ変換
             R_wc = R_cw.t()
             t_wc = -R_wc @ t_cw
@@ -1065,29 +545,22 @@ class OptimalTransportSolver:
             transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
             loss = torch.sum(transport * cost_matrix)
             
-            # バックワードパス前のデバッグ出力
             if iteration % 10 == 0:
                 print(f"\nIteration {iteration} - Before backward:")
                 print(f"  SE3 params: {self.se3_vec.data}")
                 print(f"  Loss: {loss.item():.6f}")
                 print(f"  Learning rate: {scheduler.get_last_lr()[0]:.6e}")
             
-            # 勾配計算
             loss.backward()
             
-            # 勾配デバッグ - 値とノルムを表示
             if self.se3_vec.grad is not None:
                 grad = self.se3_vec.grad
                 grad_norm = grad.norm().item()
-                
-                # 勾配情報をログに記録
                 with open(debug_log_path, 'a') as f:
                     grad_vals = grad.detach().cpu().numpy()
                     f.write(f"{iteration}, {loss.item():.6f}, {grad_norm:.6f}, " + 
                         f"{grad_vals[0]:.6f}, {grad_vals[1]:.6f}, {grad_vals[2]:.6f}, " +
                         f"{grad_vals[3]:.6f}, {grad_vals[4]:.6f}, {grad_vals[5]:.6f}\n")
-                
-                # 定期的に詳細な勾配情報を表示
                 if iteration % 10 == 0:
                     print(f"  Gradient norm: {grad_norm:.6f}")
                     print(f"  Rot gradient: {grad[:3].detach().cpu().numpy()}")
@@ -1098,36 +571,27 @@ class OptimalTransportSolver:
             else:
                 print("Warning: No gradient computed!")
 
-            # ---- ログ ----
             current_loss = loss.item()
             loss_history.append(current_loss)
             param_history['se3_vec'].append(self.se3_vec.clone())
             grad_history['se3_vec'].append(self.se3_vec.grad.clone() if self.se3_vec.grad is not None else None)
 
-            # ---- 更新 ----
             optimizer.step()
-            
-            # iNeRFと同様の-π~πクリッピング（数値安定性のため）
             with torch.no_grad():
                 self.se3_vec.data[:3].clamp_(-math.pi, math.pi)
-            
-            # 学習率更新
             scheduler.step()
             
-            # 更新後のパラメータをデバッグ表示
             if iteration % 10 == 0:
                 param_change = torch.norm(self.se3_vec.data - param_history['se3_vec'][-1].data)
                 print(f"  Parameter change: {param_change.item():.6f}")
                 print(f"  Updated SE3 params: {self.se3_vec.data}")
 
-            # ---- 収束判定 ----
             loss_diff = abs(prev_loss_val - current_loss)
             if iteration > 5 and loss_diff < tol:
                 pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
                 break
             prev_loss_val = current_loss
 
-            # ---- プログレス更新 ----
             if iteration % 10 == 0:
                 grad_norm = self.se3_vec.grad.norm().item() 
                 rot_grad_norm = self.se3_vec.grad[:3].norm().item() 
@@ -1140,23 +604,18 @@ class OptimalTransportSolver:
                     'lr': f"{scheduler.get_last_lr()[0]:.2e}"
                 })
 
-            # ---- 可視化（既存コードと同じ） ----
             if iteration % 10 == 0 or iteration == max_iter - 1:
                 with torch.no_grad():
                     t_np = transport.detach().cpu().numpy()
-
                 rows, cols = t_np.shape
                 aspect_ratio = cols / rows
-
                 if rows > cols:
                     fig_width = 8
                     fig_height = min(20, fig_width / aspect_ratio)
                 else:
                     fig_height = 6
                     fig_width = min(20, fig_height * aspect_ratio)
-
                 plt.figure(figsize=(fig_width, fig_height))
-
                 if rows > 1000 or cols > 1000:
                     downsample_factor = max(1, int(max(rows, cols) / 1000))
                     t_np_display = t_np[::downsample_factor, ::downsample_factor]
@@ -1165,11 +624,9 @@ class OptimalTransportSolver:
                 else:
                     plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
                     plt.title(f"Transport Plan at Iteration {iteration}")
-
                 plt.colorbar(label="Transport Plan Value")
                 plt.xlabel("Image 2 Gaussians")
                 plt.ylabel("Image 1 Gaussians")
-
                 plt.tight_layout()
                 plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
                 plt.savefig(plt_path, dpi=150)
@@ -1177,32 +634,22 @@ class OptimalTransportSolver:
 
         # ------------------------- 最終パラメータ保存 --------------------------- #
         with torch.no_grad():
-            # 最終的なSE(3)パラメータから変換結果を保存
-            R_cw, t_cw = self.se3_exp(self.se3_vec)
-            self.R_cw = R_cw
-            self.t_cw = t_cw
-            
-            # 世界→カメラ変換も保存
-            R_wc = R_cw.t()
-            t_wc = -R_wc @ t_cw
-            self.R_wc = R_wc
-            self.t_wc = t_wc
-            
-            # 基礎行列を計算して保存
-            final_F = self._build_F_from_wc(R_wc, t_wc)
+            # Lieクラスで最終SE(3)パラメータから変換結果を保存
+            T_cw = self.lie.se3_to_SE3(self.se3_vec)
+            self.R_cw = T_cw[:3, :3]
+            self.t_cw = T_cw[:3, 3]
+            self.R_wc = self.R_cw.t()
+            self.t_wc = -self.R_wc @ self.t_cw
+            final_F = self._build_F_from_wc(self.R_wc, self.t_wc)
             self.f = final_F
-            
-            # 既存APIとの互換性のために従来のパラメータも更新
-            rvec_numpy, _ = cv2.Rodrigues(R_wc.cpu().numpy())
-            self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
-            self.tvec = nn.Parameter(t_wc)
-            
-            # camera-to-world パラメータも更新
-            rvec_cw_numpy, _ = cv2.Rodrigues(R_cw.cpu().numpy())
-            self.rvec_cw = nn.Parameter(torch.from_numpy(rvec_cw_numpy).to(self.device))
-            self.center = nn.Parameter(t_cw)
+            if cv2 is not None:
+                rvec_numpy, _ = cv2.Rodrigues(self.R_wc.cpu().numpy())
+                self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
+                self.tvec = nn.Parameter(self.t_wc)
+                rvec_cw_numpy, _ = cv2.Rodrigues(self.R_cw.cpu().numpy())
+                self.rvec_cw = nn.Parameter(torch.from_numpy(rvec_cw_numpy).to(self.device))
+                self.center = nn.Parameter(self.t_cw)
 
-        # ------------------------- 損失プロット -------------------------- #
         plt.figure()
         plt.plot(loss_history, '-o')
         plt.title("Loss (optimize_with_SE3)")
@@ -1212,7 +659,6 @@ class OptimalTransportSolver:
         plt.savefig(os.path.join(transport_dir, "loss_optimize_with_SE3.png"))
         plt.close()
 
-        # ------------------------- 最適化過程描画 -------------------------- #
         if save_diagnostics:
             self.save_optimization_diagnostics_SE3(
                 output_dir=diagnostics_dir,
@@ -1220,25 +666,13 @@ class OptimalTransportSolver:
                 param_history=param_history,
                 grad_history=grad_history
             )
-            
+
     def _init_se3_like_cam1(self, rot_noise=0.2, trans_noise=0.2):
-        """Cam-1 の姿勢 (I,0) から微小ノイズを加えて se3_vec を初期化
-        
-        カメラ1の姿勢（単位行列の回転と原点）から微小なランダムノイズを加えて
-        SE(3)パラメータを初期化します。シーンが未知の場合の良い初期値になります。
-        
-        Args:
-            rot_noise (float): 回転ノイズの大きさ [rad]。Default: 0.05
-            trans_noise (float): 並進ノイズの大きさ [m]。Default: 0.05
-        """
-        # ① 回転：ランダム軸に ±rot_noise [rad] だけ回す
+        """Cam-1 の姿勢 (I,0) から微小ノイズを加えて se3_vec を初期化"""
         axis = torch.randn(3, device=self.device)
         axis /= axis.norm() + 1e-8
         omega0 = axis * rot_noise * torch.randn(1, device=self.device)
-
-        # ② 並進：cam-1 原点 (0,0,0) から trans_noise [m] だけずらす
         rho0 = trans_noise * torch.randn(3, device=self.device)
-
         self.se3_vec = nn.Parameter(torch.cat([omega0, rho0], dim=0))
 
     def save_optimization_diagnostics_SE3(self, 
@@ -1548,563 +982,3 @@ class OptimalTransportSolver:
                 f.write("No significant optimization issues detected.\n")
                 
         print(f"Saved SE(3) optimization diagnostics to {output_dir}")
-
-    def skew(self, v: torch.Tensor) -> torch.Tensor:
-        """(…,3) → (…,3,3)  skew-sym. matrix"""
-        K = torch.zeros((*v.shape[:-1], 3, 3), device=v.device, dtype=v.dtype)
-        K[..., 0, 1] = -v[..., 2];  K[..., 0, 2] =  v[..., 1]
-        K[..., 1, 0] =  v[..., 2];  K[..., 1, 2] = -v[..., 0]
-        K[..., 2, 0] = -v[..., 1];  K[..., 2, 1] =  v[..., 0]
-        print(f"K: {K}")
-        if torch.isnan(K).any():
-            print(f"v: {v}")
-            sys.exit()
-        return K
-
-    def se3_exp_T(self, xi: torch.Tensor) -> torch.Tensor:
-        """SE3指数写像: 6次元ベクトルから4x4変換行列を計算"""
-        # 回転と並進に分解
-        omega, v = xi[:3], xi[3:]
-        
-        # 回転の大きさを計算
-        theta2 = (omega * omega).sum()
-        theta2_safe = theta2.clamp_min(1e-8)  # 0除算を防ぐ
-        theta = torch.sqrt(theta2_safe)       # 安全に平方根を計算
-        
-        # スキュー行列
-        K = self.skew(omega)
-        
-        # 回転行列の係数
-        # 小角度の場合はテイラー展開による近似を使用
-        A = torch.where(theta2 > 1e-4,
-                        torch.sin(theta) / theta,
-                        1.0 - theta2/6.0 + theta2*theta2/120.0)
-        
-        B = torch.where(theta2 > 1e-4,
-                        (1.0 - torch.cos(theta)) / theta2_safe,
-                        0.5 - theta2/24.0 + theta2*theta2/720.0)
-        
-        C = (1.0 - A) / theta2_safe  # 既にsafeなtheta2を使用
-        
-        # 回転行列の計算
-        R = torch.eye(3, device=xi.device) + A * K + B * K @ K
-        
-        # 並進ベクトルのための行列V
-        V = torch.eye(3, device=xi.device) + B * K + C * K @ K
-        
-        # 4x4変換行列の構築
-        T = torch.eye(4, device=xi.device)
-        T[:3, :3] = R
-        T[:3, 3] = V @ v
-        
-        return T
-
-    def optimize_with_inerf(self, 
-                        max_iter: int = 1000, 
-                        tol: float = 1e-5, 
-                        save_diagnostics: bool = True, 
-                        diagnostics_dir: Optional[str] = None,
-                        viz_every: int = 10,
-                        learning_rate: float = 1e-3):
-        """
-        iNeRF風最適化により、カメラポーズ（R & t）を最適化する。
-        """
-        # -------------------------  出力ディレクトリ  ---------------------- #
-        transport_dir = os.path.join("results", "transport_inerf")
-        os.makedirs(transport_dir, exist_ok=True)
-        diagnostics_dir = diagnostics_dir or os.path.join("results", "diagnostics_inerf")
-        os.makedirs(diagnostics_dir, exist_ok=True)
-
-        # ------------------------- 履歴用 ------------------------- #
-        loss_history = []
-        param_history = {'T': []} if save_diagnostics else None
-        grad_history = {'delta': []} if save_diagnostics else None
-
-        # ------------------------- パラメータ初期化 ----------------------- #
-        if not hasattr(self, 'T'):
-            # 初期パラメータを作成
-            if hasattr(self, 'se3_vec'):
-                # SE3パラメータが既に存在する場合はそれを使う
-                R_cw, t_cw = self.se3_exp(self.se3_vec)
-            else:
-                # なければランダム初期化
-                self._init_se3_like_cam1(rot_noise=0.2, trans_noise=0.2)
-                R_cw, t_cw = self.se3_exp(self.se3_vec)
-                
-            # 4x4の同次変換行列を作成
-            self.T = torch.eye(4, device=self.device)
-            self.T[:3, :3] = R_cw
-            self.T[:3, 3] = t_cw
-
-        # --- iNeRFと同じ: ループ外で1度だけパラメータとoptimizerを生成 ---
-        self.delta = nn.Parameter(torch.zeros(6, device=self.device))
-        # iNeRFと同様、Adamを使用（重み減衰なし）
-        optimizer = torch.optim.Adam([self.delta], lr=learning_rate, weight_decay=0.0)
-        # iNeRFと同じ指数関数的学習率減衰: 0.8^(t/100)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8**(1/100))
-
-        prev_loss_val = float('inf')
-        pbar = tqdm(range(max_iter), desc="Optimizing iNeRF", leave=True)
-
-        # ---- 勾配デバッグ用ログファイル ----
-        debug_log_path = os.path.join(diagnostics_dir, "gradient_debug_inerf.log")
-        with open(debug_log_path, 'w') as f:
-            f.write("Iteration, Loss, Delta_Norm, Grad_Norm, Grad_Rot_x, Grad_Rot_y, Grad_Rot_z, Grad_Trans_x, Grad_Trans_y, Grad_Trans_z\n")
-        
-        # -------------------------  ループ  ------------------------------- #
-        for iteration in pbar:
-            # 1. Forward pass: 勾配計算のリセット
-            optimizer.zero_grad()
-            
-            # 2. Δξからexp(Δξ)を計算
-            T_delta = self.se3_exp_T(self.delta)
-            
-            # 3. 更新: T_new = T_delta * T (左から掛ける - iNeRFと同じ)
-            T_next = T_delta @ self.T
-            
-            # 4. カメラ→ワールド変換行列から回転と並進を抽出
-            R_cw = T_next[:3, :3]
-            t_cw = T_next[:3, 3]
-            
-            # 5. ワールド→カメラ変換に変更
-            R_wc = R_cw.t()
-            t_wc = -R_wc @ t_cw
-            
-            # 6. 基礎行列計算
-            F = self._build_F_from_wc(R_wc, t_wc)
-            
-            # 7. コスト行列と最適輸送計算
-            cost_matrix = self.compute_cost_matrix_fundamental(F)
-            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
-            
-            # 8. 損失計算
-            loss = torch.sum(transport * cost_matrix)
-            
-            # 9. バックワード前のデバッグ情報
-            if iteration % 10 == 0:
-                print(f"\nIteration {iteration} - Before backward:")
-                print(f"  Delta SE3: {self.delta.data}")
-                print(f"  Loss: {loss.item():.6f}")
-                print(f"  Learning rate: {scheduler.get_last_lr()[0]:.6e}")
-                with torch.no_grad():
-                    print(f"  Cost matrix min/max: {cost_matrix.min().item():.6f}/{cost_matrix.max().item():.6f}")
-            
-            # 10. バックワード計算
-            loss.backward()
-            
-            # 11. 勾配チェック
-            if self.delta.grad is not None:
-                # 勾配情報取得
-                grad = self.delta.grad
-                grad_norm = grad.norm().item()
-                delta_norm = self.delta.norm().item()
-                
-                # 勾配情報をログに記録
-                with open(debug_log_path, 'a') as f:
-                    grad_vals = grad.detach().cpu().numpy()
-                    f.write(f"{iteration}, {loss.item():.6f}, {delta_norm:.6f}, {grad_norm:.6f}, " + 
-                        f"{grad_vals[0]:.6f}, {grad_vals[1]:.6f}, {grad_vals[2]:.6f}, " +
-                        f"{grad_vals[3]:.6f}, {grad_vals[4]:.6f}, {grad_vals[5]:.6f}\n")
-                
-                # 詳細な勾配情報を表示
-                if iteration % 10 == 0:
-                    print(f"  Gradient norm: {grad_norm:.6f}")
-                    print(f"  Rot gradient: {grad[:3].detach().cpu().numpy()}")
-                    print(f"  Trans gradient: {grad[3:].detach().cpu().numpy()}")
-                    rot_grad_norm = grad[:3].norm().item()
-                    trans_grad_norm = grad[3:].norm().item()
-                    print(f"  Rot/Trans gradient norm ratio: {rot_grad_norm/max(trans_grad_norm, 1e-10):.6f}")
-            else:
-                print("Warning: No gradient computed!")
-            
-            # 12. 最適化ステップと学習率の更新
-            optimizer.step()
-            scheduler.step()
-            
-            # 13. 履歴の保存（メモリ効率化）
-            current_loss = loss.item()
-            loss_history.append(current_loss)
-            
-            if save_diagnostics:
-                # メモリ効率化: GPUテンソルではなくCPUの浮動小数点値を保存
-                if param_history is not None:
-                    param_history['T'].append(self.T.detach().cpu().clone())
-                
-                if grad_history is not None and self.delta.grad is not None:
-                    grad_history['delta'].append(self.delta.grad.detach().cpu().clone())
-            
-            # 14. 更新されたdeltaを元のポーズに適用し、deltaをリセット（値だけ、モーメンタムは保持）
-            with torch.no_grad():
-                # 回転成分をπ範囲にクランプ（数値安定性のため）
-                self.delta.data[:3].clamp_(-math.pi, math.pi)
-                
-                # T_new = exp(δ) * T
-                self.T = self.se3_exp_T(self.delta) @ self.T
-                
-                # iNeRFスタイル: deltaパラメータを0にリセットするが、Adamのモーメンタムは保持
-                self.delta.zero_()
-                
-                # 数値安定性のためのチェック
-                if torch.isnan(self.T).any():
-                    print("NaN detected in transformation matrix. Stopping optimization.")
-                    break
-            
-            # 15. 収束判定
-            loss_diff = abs(prev_loss_val - current_loss)
-            if iteration > 5 and loss_diff < tol:
-                pbar.set_description(f"Converged (loss_diff={loss_diff:.2e})")
-                break
-            prev_loss_val = current_loss
-            
-            # 16. プログレスバー更新
-            if iteration % 10 == 0:
-                # self.deltaを使用（deltaではなく）
-                delta_norm = self.delta.norm().item()
-                rot_delta_norm = self.delta[:3].norm().item()
-                trans_delta_norm = self.delta[3:].norm().item()
-                ratio = rot_delta_norm / max(trans_delta_norm, 1e-10)
-                pbar.set_postfix({
-                    'loss': f"{current_loss:.6f}",
-                    'delta': f"{delta_norm:.4f}",
-                    'r/t': f"{ratio:.2f}",
-                    'lr': f"{scheduler.get_last_lr()[0]:.2e}"
-                })
-                
-                # 輸送行列の可視化（頻度を下げる）
-                if iteration % 50 == 0 or iteration == max_iter - 1:
-                    with torch.no_grad():
-                        t_np = transport.detach().cpu().numpy()
-
-                    rows, cols = t_np.shape
-                    aspect_ratio = cols / rows
-
-                    if rows > cols:
-                        fig_width = 8
-                        fig_height = min(20, fig_width / aspect_ratio)
-                    else:
-                        fig_height = 6
-                        fig_width = min(20, fig_height * aspect_ratio)
-
-                    plt.figure(figsize=(fig_width, fig_height))
-
-                    if rows > 1000 or cols > 1000:
-                        downsample_factor = max(1, int(max(rows, cols) / 1000))
-                        t_np_display = t_np[::downsample_factor, ::downsample_factor]
-                        plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
-                        plt.title(f"Transport Plan at Iteration {iteration} (Downsampled {downsample_factor}x)")
-                    else:
-                        plt.imshow(t_np, cmap="hot", interpolation="nearest", aspect="auto")
-                        plt.title(f"Transport Plan at Iteration {iteration}")
-
-                    plt.colorbar(label="Transport Plan Value")
-                    plt.xlabel("Image 2 Gaussians")
-                    plt.ylabel("Image 1 Gaussians")
-
-                    plt.tight_layout()
-                    plt_path = os.path.join(transport_dir, f"transport_iter_{iteration}.png")
-                    plt.savefig(plt_path, dpi=150)
-                    plt.close()
-        
-        # ------------------------- 最終パラメータ保存 --------------------------- #
-        with torch.no_grad():
-            # 4x4行列から回転と並進を抽出
-            R_cw = self.T[:3, :3]
-            t_cw = self.T[:3, 3]
-            
-            # 保存
-            self.R_cw = R_cw
-            self.t_cw = t_cw
-            
-            # 世界→カメラ変換も保存
-            R_wc = R_cw.t()
-            t_wc = -R_wc @ t_cw
-            self.R_wc = R_wc
-            self.t_wc = t_wc
-            
-            # 基礎行列を計算して保存
-            final_F = self._build_F_from_wc(R_wc, t_wc)
-            self.f = final_F
-            
-            # 既存APIとの互換性のために従来のパラメータも更新
-            rvec_numpy, _ = cv2.Rodrigues(R_wc.cpu().numpy())
-            self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
-            self.tvec = nn.Parameter(t_wc)
-            
-            # camera-to-world パラメータも更新
-            rvec_cw_numpy, _ = cv2.Rodrigues(R_cw.cpu().numpy())
-            self.rvec_cw = nn.Parameter(torch.from_numpy(rvec_cw_numpy).to(self.device))
-            self.center = nn.Parameter(t_cw)
-            
-            # SE3ベクトルとしても保存 (他の最適化器との互換性のため)
-            se3_vec = torch.zeros(6, device=self.device)
-            rvec_cw = torch.from_numpy(rvec_cw_numpy).to(self.device).float().flatten()
-            se3_vec[:3] = rvec_cw
-            se3_vec[3:] = t_cw
-            self.se3_vec = nn.Parameter(se3_vec)
-        
-        # ------------------------- 損失プロット -------------------------- #
-        plt.figure()
-        plt.plot(loss_history, '-o')
-        plt.title("Loss (optimize_with_inerf)")
-        plt.xlabel("Iteration")
-        plt.ylabel("Loss")
-        plt.grid(True)
-        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_inerf.png"))
-        plt.close()
-
-        # ------------------------- 最適化過程描画 -------------------------- #
-        if save_diagnostics and param_history is not None and grad_history is not None:
-            self.save_optimization_diagnostics_inerf(
-                output_dir=diagnostics_dir,
-                loss_history=loss_history,
-                param_history=param_history,
-                grad_history=grad_history
-            )
-        
-        return loss_history
-
-    def save_optimization_diagnostics_inerf(self, 
-                               output_dir: str,
-                               loss_history: list,
-                               param_history: dict,
-                               grad_history: dict) -> None:
-        """Save detailed diagnostics about the iNeRF optimization process.
-        
-        Analyzes and visualizes the optimization process of the SE(3) parameters, including:
-        - Loss trajectory
-        - Parameter evolution
-        - Gradient behavior
-        - Convergence analysis
-        
-        Args:
-            output_dir: Directory to save diagnostic files
-            loss_history: List of loss values at each iteration
-            param_history: Dictionary of parameter histories (contains 'T')
-            grad_history: Dictionary of gradient histories corresponding to parameters
-        """
-        import os
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from matplotlib.gridspec import GridSpec
-        
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Compute rotation and translation components from T matrices
-        T_history = [T.detach().cpu().numpy() for T in param_history['T']]
-        R_history = [T[:3, :3] for T in T_history]
-        t_history = [T[:3, 3] for T in T_history]
-        
-        # Convert rotation matrices to axis-angle representation
-        rvec_history = []
-        for R in R_history:
-            rvec, _ = cv2.Rodrigues(R)
-            rvec_history.append(rvec.flatten())
-        rvec_history = np.array(rvec_history)
-        t_history = np.array(t_history)
-        
-        # Combine into a parameter history that matches the SE3 format
-        param_history_np = {}
-        param_history_np['se3_vec'] = np.hstack([rvec_history, t_history])
-        
-        # Convert delta gradients to numpy arrays
-        grad_history_np = {}
-        grad_history_np['delta'] = np.array([g.detach().cpu().numpy() if g is not None 
-                                            else np.zeros(6) 
-                                            for g in grad_history['delta']])
-        
-        # Number of iterations
-        iterations = range(len(loss_history))
-        
-        # 1. Loss Trajectory Analysis
-        plt.figure(figsize=(12, 8))
-        plt.subplot(211)
-        plt.plot(iterations, loss_history, 'b-', linewidth=2)
-        plt.title('Loss Value During Optimization')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.grid(True)
-        
-        # Plot loss changes (derivative) to see stability
-        plt.subplot(212)
-        loss_changes = np.array([loss_history[i+1] - loss_history[i] 
-                                for i in range(len(loss_history)-1)])
-        plt.plot(iterations[:-1], loss_changes, 'r-')
-        plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        plt.title('Loss Change Between Iterations')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss Difference')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'loss_analysis.png'), dpi=150)
-        plt.close()
-        
-        # 2. SE(3) Parameter Trajectory Analysis
-        se3_data = param_history_np['se3_vec']
-        
-        # Plot all 6 components
-        fig = plt.figure(figsize=(15, 8))
-        
-        # Rotation components
-        plt.subplot(211)
-        plt.plot(iterations, se3_data[:, 0], 'r-', label='ωx')
-        plt.plot(iterations, se3_data[:, 1], 'g-', label='ωy')
-        plt.plot(iterations, se3_data[:, 2], 'b-', label='ωz')
-        plt.title('Camera Rotation Components Over Time')
-        plt.xlabel('Iteration')
-        plt.ylabel('Value (rad)')
-        plt.grid(True)
-        plt.legend()
-        
-        # Translation components
-        plt.subplot(212)
-        plt.plot(iterations, se3_data[:, 3], 'r-', label='tx')
-        plt.plot(iterations, se3_data[:, 4], 'g-', label='ty')
-        plt.plot(iterations, se3_data[:, 5], 'b-', label='tz')
-        plt.title('Camera Translation Components Over Time')
-        plt.xlabel('Iteration')
-        plt.ylabel('Value')
-        plt.grid(True)
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'camera_trajectory.png'), dpi=150)
-        plt.close()
-        
-        # 3. Delta Gradient Analysis
-        grad_data = grad_history_np['delta']
-        
-        # Gradient magnitude
-        grad_magnitude = np.linalg.norm(grad_data, axis=1)
-        rot_grad_magnitude = np.linalg.norm(grad_data[:, :3], axis=1)
-        trans_grad_magnitude = np.linalg.norm(grad_data[:, 3:], axis=1)
-        
-        fig = plt.figure(figsize=(15, 12))
-        gs = GridSpec(3, 1, figure=fig)
-        
-        # Plot total gradient magnitude
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.plot(iterations, grad_magnitude, 'k-', linewidth=2, label='Total')
-        ax1.plot(iterations, rot_grad_magnitude, 'r-', linewidth=1.5, label='Rotation')
-        ax1.plot(iterations, trans_grad_magnitude, 'b-', linewidth=1.5, label='Translation')
-        ax1.set_title('Delta Gradient Magnitudes')
-        ax1.set_xlabel('Iteration')
-        ax1.set_ylabel('Gradient Norm')
-        ax1.set_yscale('log')  # Log scale to better see changes
-        ax1.grid(True)
-        ax1.legend()
-        
-        # Plot rotation gradient components
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.plot(iterations, grad_data[:, 0], 'r-', label='grad_ωx')
-        ax2.plot(iterations, grad_data[:, 1], 'g-', label='grad_ωy')
-        ax2.plot(iterations, grad_data[:, 2], 'b-', label='grad_ωz')
-        ax2.set_title('Rotation Gradient Components')
-        ax2.set_xlabel('Iteration')
-        ax2.set_ylabel('Gradient Value')
-        ax2.grid(True)
-        ax2.legend()
-        
-        # Plot translation gradient components
-        ax3 = fig.add_subplot(gs[2, 0])
-        ax3.plot(iterations, grad_data[:, 3], 'r-', label='grad_tx')
-        ax3.plot(iterations, grad_data[:, 4], 'g-', label='grad_ty')
-        ax3.plot(iterations, grad_data[:, 5], 'b-', label='grad_tz')
-        ax3.set_title('Translation Gradient Components')
-        ax3.set_xlabel('Iteration')
-        ax3.set_ylabel('Gradient Value')
-        ax3.grid(True)
-        ax3.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'delta_gradient_analysis.png'), dpi=150)
-        plt.close()
-        
-        # 4. Generate a text report with analysis
-        with open(os.path.join(output_dir, 'optimization_analysis.txt'), 'w') as f:
-            f.write("iNeRF OPTIMIZATION PROCESS ANALYSIS\n")
-            f.write("====================================\n\n")
-            
-            # Loss analysis
-            f.write("1. LOSS BEHAVIOR\n")
-            f.write("----------------\n")
-            initial_loss = loss_history[0]
-            final_loss = loss_history[-1]
-            loss_reduction = (initial_loss - final_loss) / initial_loss * 100 if initial_loss != 0 else 0
-            
-            f.write(f"Initial loss: {initial_loss:.6f}\n")
-            f.write(f"Final loss: {final_loss:.6f}\n")
-            f.write(f"Total loss reduction: {loss_reduction:.2f}%\n")
-            f.write(f"Number of iterations: {len(loss_history)}\n\n")
-            
-            # Parameter analysis
-            f.write("2. PARAMETER ANALYSIS\n")
-            f.write("---------------------\n")
-            initial_params = param_history_np['se3_vec'][0]
-            final_params = param_history_np['se3_vec'][-1]
-            
-            f.write("Initial camera parameters (rvec, t):\n")
-            f.write(f"  Rotation: [{initial_params[0]:.4f}, {initial_params[1]:.4f}, {initial_params[2]:.4f}]\n")
-            f.write(f"  Translation: [{initial_params[3]:.4f}, {initial_params[4]:.4f}, {initial_params[5]:.4f}]\n\n")
-            
-            f.write("Final camera parameters (rvec, t):\n")
-            f.write(f"  Rotation: [{final_params[0]:.4f}, {final_params[1]:.4f}, {final_params[2]:.4f}]\n")
-            f.write(f"  Translation: [{final_params[3]:.4f}, {final_params[4]:.4f}, {final_params[5]:.4f}]\n\n")
-            
-            # Gradient analysis
-            f.write("3. GRADIENT ANALYSIS\n")
-            f.write("--------------------\n")
-            
-            avg_grad_magnitude = np.mean(grad_magnitude)
-            max_grad_magnitude = np.max(grad_magnitude)
-            min_grad_magnitude = np.min(grad_magnitude)
-            
-            f.write(f"Average gradient magnitude: {avg_grad_magnitude:.6f}\n")
-            f.write(f"Maximum gradient magnitude: {max_grad_magnitude:.6f}\n")
-            f.write(f"Minimum gradient magnitude: {min_grad_magnitude:.6f}\n\n")
-            
-            avg_rot_grad = np.mean(rot_grad_magnitude)
-            avg_trans_grad = np.mean(trans_grad_magnitude)
-            avg_ratio = avg_rot_grad / max(avg_trans_grad, 1e-10)
-            
-            f.write(f"Average rotation gradient: {avg_rot_grad:.6f}\n")
-            f.write(f"Average translation gradient: {avg_trans_grad:.6f}\n")
-            f.write(f"Average rotation/translation ratio: {avg_ratio:.6f}\n\n")
-            
-            # Check for potential issues
-            issues = []
-            
-            # Gradient vanishing check
-            if min_grad_magnitude < 1e-6:
-                issues.append("Potential gradient vanishing detected.")
-                
-            # Gradient explosion check    
-            if max_grad_magnitude > 1e3:
-                issues.append("Potential gradient explosion detected.")
-                
-            # Rotation/translation ratio imbalance
-            if avg_ratio > 100 or avg_ratio < 0.01:
-                issues.append(f"Imbalanced rotation/translation gradients (ratio: {avg_ratio:.2f}).")
-                
-            # Oscillations check
-            if len(loss_history) >= 3:
-                oscillation_count = sum(1 for i in range(len(loss_history)-2) 
-                                       if (loss_history[i] > loss_history[i+1] and 
-                                           loss_history[i+1] < loss_history[i+2]))
-                oscillation_ratio = oscillation_count / (len(loss_history) - 2)
-                
-                if oscillation_ratio > 0.3:
-                    issues.append(f"High oscillation detected ({oscillation_ratio:.2%} of iterations).")
-            
-            if issues:
-                f.write("4. POTENTIAL ISSUES\n")
-                f.write("-------------------\n")
-                for issue in issues:
-                    f.write(f"- {issue}\n")
-            else:
-                f.write("4. OPTIMIZATION APPEARS STABLE\n")
-                f.write("------------------------------\n")
-                f.write("No significant optimization issues detected.\n")
-        
-        print(f"Saved iNeRF optimization diagnostics to {output_dir}")
