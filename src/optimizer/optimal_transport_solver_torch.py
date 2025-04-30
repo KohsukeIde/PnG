@@ -23,7 +23,7 @@ class OptimalTransportSolver:
         gaussians2: TwoDGaussians,
         k1: Optional[np.ndarray] = None,
         k2: Optional[np.ndarray] = None,
-        epsilon: float = 0.01,
+        epsilon: float = 0.1,
         lambda_mean: float = 1.0,
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
@@ -257,7 +257,10 @@ class OptimalTransportSolver:
         cost = ( self.lambda_epipolar * epi_norm
             + self.lambda_color    * color_norm )
         
-        cost = cost / cost.max().detach()
+        # cost = (self.lambda_epipolar * epi_with_shape
+        #     + self.lambda_color * color_dist)
+        
+        # cost = cost / cost.max().detach()
 
         return cost
         
@@ -498,9 +501,29 @@ class OptimalTransportSolver:
 
 
 
+    def _init_se3_like_cam1(self, rot_noise=0.05, trans_noise=0.05, seed=42):
+        """回転と並進を別々のパラメータとして初期化"""
+        # シード設定（再現性のため）
+        if seed is not None:
+            torch.manual_seed(seed)
+        
+        # 回転初期化（微小なランダム軸角）
+        axis = torch.randn(3, device=self.device)
+        axis /= axis.norm() + 1e-8
+        omega = axis * rot_noise * torch.randn(1, device=self.device)
+        
+        # 並進初期化
+        rho = trans_noise * torch.randn(3, device=self.device)
+        
+        # 別々のパラメータとして定義
+        self.rot_vec = nn.Parameter(omega.clone())
+        self.trans_vec = nn.Parameter(rho.clone())
+
     def optimize_with_SE3(self, max_iter=1000, tol=1e-6,
-                        save_diagnostics=True, diagnostics_dir=None):
-        """Optimize camera pose using Lie algebra SE(3) representation (Lieクラス利用)."""
+                        save_diagnostics=True, diagnostics_dir=None,
+                        rot_lr=5e-3, trans_lr=5e-4, momentum=0.9,
+                        grad_clip=0.1, seed=None):
+        """Optimize camera pose using Lie algebra SE(3) representation with separate rotation/translation."""
         # -------------------------  出力ディレクトリ  ---------------------- #
         transport_dir = os.path.join("results", "transport_SE3")
         os.makedirs(transport_dir, exist_ok=True)
@@ -509,15 +532,18 @@ class OptimalTransportSolver:
 
         # ------------------------- 履歴用 ------------------------- #
         loss_history = []
-        param_history = {'se3_vec': []}
-        grad_history = {'se3_vec': []}
+        param_history = {'rot_vec': [], 'trans_vec': []}
+        grad_history = {'rot_vec': [], 'trans_vec': []}
 
         # ------------------------- パラメータ初期化 ----------------------- #
-        if not hasattr(self, "se3_vec"):
-            self._init_se3_like_cam1(rot_noise=0.05, trans_noise=0.05)
+        if not hasattr(self, "rot_vec") or not hasattr(self, "trans_vec"):
+            self._init_se3_like_cam1(rot_noise=0.05, trans_noise=0.05, seed=seed)
 
         # ------------------------- オプティマイザ設定 ----------------------- #
-        optimizer = torch.optim.Adam([self.se3_vec], lr=3e-3)
+        optimizer = torch.optim.SGD([
+            {'params': self.rot_vec, 'lr': rot_lr, 'momentum': momentum, 'nesterov': False},
+            {'params': self.trans_vec, 'lr': trans_lr, 'momentum': momentum, 'nesterov': False}
+        ])
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8**(1/100))
 
         prev_loss_val = float('inf')
@@ -525,13 +551,14 @@ class OptimalTransportSolver:
 
         debug_log_path = os.path.join(diagnostics_dir, "gradient_debug.log")
         with open(debug_log_path, 'w') as f:
-            f.write("Iteration, Loss, Grad_Norm, Grad_Rot_x, Grad_Rot_y, Grad_Rot_z, Grad_Trans_x, Grad_Trans_y, Grad_Trans_z\n")
+            f.write("Iteration, Loss, Rot_Grad_Norm, Trans_Grad_Norm, Rot_x, Rot_y, Rot_z, Trans_x, Trans_y, Trans_z\n")
 
         for iteration in pbar:
             optimizer.zero_grad()
             
-            # --- LieクラスでSE(3)指数写像 ---
-            T_cw = self.lie.se3_to_SE3(self.se3_vec)  # (3,4) or (4,4) depending on Lie class
+            # --- SE(3)指数写像（分離したパラメータを結合して渡す） ---
+            se3_vec = torch.cat([self.rot_vec, self.trans_vec])
+            T_cw = self.lie.se3_to_SE3(se3_vec)  # (3,4) or (4,4)
             R_cw = T_cw[:3, :3]
             t_cw = T_cw[:3, 3]
 
@@ -547,44 +574,60 @@ class OptimalTransportSolver:
             
             if iteration % 10 == 0:
                 print(f"\nIteration {iteration} - Before backward:")
-                print(f"  SE3 params: {self.se3_vec.data}")
+                print(f"  Rot params: {self.rot_vec.data}")
+                print(f"  Trans params: {self.trans_vec.data}")
                 print(f"  Loss: {loss.item():.6f}")
-                print(f"  Learning rate: {scheduler.get_last_lr()[0]:.6e}")
+                print(f"  Rot LR: {rot_lr:.6e}, Trans LR: {trans_lr:.6e}")
             
             loss.backward()
             
-            if self.se3_vec.grad is not None:
-                grad = self.se3_vec.grad
-                grad_norm = grad.norm().item()
+            # 勾配クリッピング（高周波ノイズ抑制）
+            torch.nn.utils.clip_grad_norm_([self.rot_vec, self.trans_vec], max_norm=grad_clip)
+            
+            if self.rot_vec.grad is not None and self.trans_vec.grad is not None:
+                rot_grad = self.rot_vec.grad
+                trans_grad = self.trans_vec.grad
+                rot_grad_norm = rot_grad.norm().item()
+                trans_grad_norm = trans_grad.norm().item()
+                
                 with open(debug_log_path, 'a') as f:
-                    grad_vals = grad.detach().cpu().numpy()
-                    f.write(f"{iteration}, {loss.item():.6f}, {grad_norm:.6f}, " + 
-                        f"{grad_vals[0]:.6f}, {grad_vals[1]:.6f}, {grad_vals[2]:.6f}, " +
-                        f"{grad_vals[3]:.6f}, {grad_vals[4]:.6f}, {grad_vals[5]:.6f}\n")
+                    rot_vals = rot_grad.detach().cpu().numpy()
+                    trans_vals = trans_grad.detach().cpu().numpy()
+                    f.write(f"{iteration}, {loss.item():.6f}, {rot_grad_norm:.6f}, {trans_grad_norm:.6f}, " + 
+                        f"{rot_vals[0]:.6f}, {rot_vals[1]:.6f}, {rot_vals[2]:.6f}, " +
+                        f"{trans_vals[0]:.6f}, {trans_vals[1]:.6f}, {trans_vals[2]:.6f}\n")
+                
                 if iteration % 10 == 0:
-                    print(f"  Gradient norm: {grad_norm:.6f}")
-                    print(f"  Rot gradient: {grad[:3].detach().cpu().numpy()}")
-                    print(f"  Trans gradient: {grad[3:].detach().cpu().numpy()}")
-                    rot_grad_norm = grad[:3].norm().item()
-                    trans_grad_norm = grad[3:].norm().item()
+                    print(f"  Rot gradient norm: {rot_grad_norm:.6f}")
+                    print(f"  Trans gradient norm: {trans_grad_norm:.6f}")
                     print(f"  Rot/Trans gradient norm ratio: {rot_grad_norm/max(trans_grad_norm, 1e-10):.6f}")
             else:
                 print("Warning: No gradient computed!")
 
             current_loss = loss.item()
             loss_history.append(current_loss)
-            param_history['se3_vec'].append(self.se3_vec.clone())
-            grad_history['se3_vec'].append(self.se3_vec.grad.clone() if self.se3_vec.grad is not None else None)
+            param_history['rot_vec'].append(self.rot_vec.clone())
+            param_history['trans_vec'].append(self.trans_vec.clone())
+            grad_history['rot_vec'].append(self.rot_vec.grad.clone() if self.rot_vec.grad is not None else None)
+            grad_history['trans_vec'].append(self.trans_vec.grad.clone() if self.trans_vec.grad is not None else None)
 
             optimizer.step()
+            
+            # リトラクション: 回転ベクトルを基本領域（|θ| ≤ π）に投影
             with torch.no_grad():
-                self.se3_vec.data[:3].clamp_(-math.pi, math.pi)
+                theta = self.rot_vec.data.norm()
+                if theta > math.pi:
+                    self.rot_vec.data.mul_(math.pi / theta)
+            
             scheduler.step()
             
             if iteration % 10 == 0:
-                param_change = torch.norm(self.se3_vec.data - param_history['se3_vec'][-1].data)
-                print(f"  Parameter change: {param_change.item():.6f}")
-                print(f"  Updated SE3 params: {self.se3_vec.data}")
+                rot_change = torch.norm(self.rot_vec.data - param_history['rot_vec'][-2].data) if iteration > 0 else torch.tensor(0)
+                trans_change = torch.norm(self.trans_vec.data - param_history['trans_vec'][-2].data) if iteration > 0 else torch.tensor(0)
+                print(f"  Rot parameter change: {rot_change.item():.6f}")
+                print(f"  Trans parameter change: {trans_change.item():.6f}")
+                print(f"  Updated Rot params: {self.rot_vec.data}")
+                print(f"  Updated Trans params: {self.trans_vec.data}")
 
             loss_diff = abs(prev_loss_val - current_loss)
             if iteration > 5 and loss_diff < tol:
@@ -593,17 +636,17 @@ class OptimalTransportSolver:
             prev_loss_val = current_loss
 
             if iteration % 10 == 0:
-                grad_norm = self.se3_vec.grad.norm().item() 
-                rot_grad_norm = self.se3_vec.grad[:3].norm().item() 
-                trans_grad_norm = self.se3_vec.grad[3:].norm().item()
+                rot_grad_norm = self.rot_vec.grad.norm().item() if self.rot_vec.grad is not None else 0
+                trans_grad_norm = self.trans_vec.grad.norm().item() if self.trans_vec.grad is not None else 0
                 ratio = rot_grad_norm/max(trans_grad_norm, 1e-10) 
                 pbar.set_postfix({
                     'loss': f"{current_loss:.6f}",
-                    'grad': f"{grad_norm:.4f}",
+                    'r_grad': f"{rot_grad_norm:.4f}",
                     'r/t': f"{ratio:.2f}",
                     'lr': f"{scheduler.get_last_lr()[0]:.2e}"
                 })
 
+            # トランスポートプラン可視化（元のコードと同じ）
             if iteration % 10 == 0 or iteration == max_iter - 1:
                 with torch.no_grad():
                     t_np = transport.detach().cpu().numpy()
@@ -634,8 +677,9 @@ class OptimalTransportSolver:
 
         # ------------------------- 最終パラメータ保存 --------------------------- #
         with torch.no_grad():
-            # Lieクラスで最終SE(3)パラメータから変換結果を保存
-            T_cw = self.lie.se3_to_SE3(self.se3_vec)
+            # 最終SE(3)パラメータから変換結果を保存
+            se3_vec = torch.cat([self.rot_vec, self.trans_vec])
+            T_cw = self.lie.se3_to_SE3(se3_vec)
             self.R_cw = T_cw[:3, :3]
             self.t_cw = T_cw[:3, 3]
             self.R_wc = self.R_cw.t()
@@ -645,7 +689,7 @@ class OptimalTransportSolver:
             if cv2 is not None:
                 rvec_numpy, _ = cv2.Rodrigues(self.R_wc.cpu().numpy())
                 self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
-                self.tvec = nn.Parameter(self.t_wc)
+                self.tvec = nn.Parameter(self.t_cw)
                 rvec_cw_numpy, _ = cv2.Rodrigues(self.R_cw.cpu().numpy())
                 self.rvec_cw = nn.Parameter(torch.from_numpy(rvec_cw_numpy).to(self.device))
                 self.center = nn.Parameter(self.t_cw)
@@ -667,42 +711,36 @@ class OptimalTransportSolver:
                 grad_history=grad_history
             )
 
-    def _init_se3_like_cam1(self, rot_noise=0.2, trans_noise=0.2):
-        """Cam-1 の姿勢 (I,0) から微小ノイズを加えて se3_vec を初期化"""
-        axis = torch.randn(3, device=self.device)
-        axis /= axis.norm() + 1e-8
-        omega0 = axis * rot_noise * torch.randn(1, device=self.device)
-        rho0 = trans_noise * torch.randn(3, device=self.device)
-        self.se3_vec = nn.Parameter(torch.cat([omega0, rho0], dim=0))
-
     def save_optimization_diagnostics_SE3(self, 
-                                    output_dir: str,
-                                    loss_history: list,
-                                    param_history: dict,
-                                    grad_history: dict) -> None:
-        """Save detailed diagnostics about the SE(3) optimization process.
+                                output_dir: str,
+                                loss_history: list,
+                                param_history: dict,
+                                grad_history: dict) -> None:
+        """分離したSE(3)パラメータの最適化過程に関する詳細な診断情報を保存する
         
-        Analyzes and visualizes the optimization process of the SE(3) parameters, including:
-        - Loss trajectory
-        - SE(3) parameter evolution (rotation and translation components)
-        - Gradient behavior
-        - Convergence analysis
+        回転と並進を分離して最適化したSE(3)パラメータについて、以下の診断情報を生成・保存します：
+        - 損失軌跡の分析
+        - パラメータ進化の分析（回転と並進の各成分）
+        - 勾配挙動の分析
+        - 収束性分析
+        - 3D軌跡可視化
+        - テキスト形式のサマリーレポート
         
         Args:
-            output_dir: Directory to save diagnostic files
-            loss_history: List of loss values at each iteration
-            param_history: Dictionary of parameter histories (contains 'se3_vec')
-            grad_history: Dictionary of gradient histories corresponding to parameters
+            output_dir: 診断ファイルを保存するディレクトリ
+            loss_history: イテレーションごとの損失値リスト
+            param_history: パラメータ履歴の辞書（'rot_vec'と'trans_vec'を含む）
+            grad_history: 勾配履歴の辞書（'rot_vec'と'trans_vec'を含む）
         """
         import os
         import numpy as np
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
         
-        # Create output directory
+        # 出力ディレクトリ作成
         os.makedirs(output_dir, exist_ok=True)
         
-        # Convert histories to numpy arrays
+        # 履歴をNumPy配列に変換
         param_history_np = {}
         grad_history_np = {}
         
@@ -714,10 +752,10 @@ class OptimalTransportSolver:
                                                 else np.zeros_like(param_history_np[param_name][0]) 
                                                 for g in history])
         
-        # Number of iterations
+        # イテレーション数
         iterations = range(len(loss_history))
         
-        # 1. Loss Trajectory Analysis
+        # ======================= 1. 損失軌跡の分析 =======================
         plt.figure(figsize=(12, 8))
         plt.subplot(211)
         plt.plot(iterations, loss_history, 'b-', linewidth=2)
@@ -726,7 +764,7 @@ class OptimalTransportSolver:
         plt.ylabel('Loss')
         plt.grid(True)
         
-        # Plot loss changes (derivative) to see stability
+        # 損失の変化（微分）をプロット
         plt.subplot(212)
         loss_changes = np.array([loss_history[i+1] - loss_history[i] 
                                 for i in range(len(loss_history)-1)])
@@ -741,29 +779,30 @@ class OptimalTransportSolver:
         plt.savefig(os.path.join(output_dir, 'loss_analysis.png'), dpi=150)
         plt.close()
         
-        # 2. SE(3) Parameter Trajectory Analysis
-        se3_data = param_history_np['se3_vec']
+        # =============== 2. SE(3)パラメータ軌跡の分析 ===============
+        rot_data = param_history_np['rot_vec']
+        trans_data = param_history_np['trans_vec']
         
-        # Plot all 6 components
+        # 全6成分をプロット
         fig = plt.figure(figsize=(15, 8))
         
-        # Rotation components
+        # 回転成分
         plt.subplot(211)
-        plt.plot(iterations, se3_data[:, 0], 'r-', label='ωx')
-        plt.plot(iterations, se3_data[:, 1], 'g-', label='ωy')
-        plt.plot(iterations, se3_data[:, 2], 'b-', label='ωz')
-        plt.title('SE(3) Rotation Components (ω) Over Time')
+        plt.plot(iterations, rot_data[:, 0], 'r-', label='wx')
+        plt.plot(iterations, rot_data[:, 1], 'g-', label='wy')
+        plt.plot(iterations, rot_data[:, 2], 'b-', label='wz')
+        plt.title('SE(3) Rotation Components (w) Over Time')
         plt.xlabel('Iteration')
         plt.ylabel('Value')
         plt.grid(True)
         plt.legend()
         
-        # Translation components
+        # 並進成分
         plt.subplot(212)
-        plt.plot(iterations, se3_data[:, 3], 'r-', label='ρx')
-        plt.plot(iterations, se3_data[:, 4], 'g-', label='ρy')
-        plt.plot(iterations, se3_data[:, 5], 'b-', label='ρz')
-        plt.title('SE(3) Translation Components (ρ) Over Time')
+        plt.plot(iterations, trans_data[:, 0], 'r-', label='tx')
+        plt.plot(iterations, trans_data[:, 1], 'g-', label='ty')
+        plt.plot(iterations, trans_data[:, 2], 'b-', label='tz')
+        plt.title('SE(3) Translation Components (t) Over Time')
         plt.xlabel('Iteration')
         plt.ylabel('Value')
         plt.grid(True)
@@ -773,49 +812,50 @@ class OptimalTransportSolver:
         plt.savefig(os.path.join(output_dir, 'se3_components_trajectory.png'), dpi=150)
         plt.close()
         
-        # 3D Visualization of rotation and translation trajectories
+        # =============== 3. 3D軌跡可視化 ===============
         fig = plt.figure(figsize=(15, 7))
         
-        # 3D plot of rotation components
+        # 回転成分の3D軌跡
         ax1 = fig.add_subplot(121, projection='3d')
-        ax1.plot(se3_data[:, 0], se3_data[:, 1], se3_data[:, 2], 'r-', linewidth=2)
-        ax1.scatter(se3_data[0, 0], se3_data[0, 1], se3_data[0, 2], c='g', s=100, label='Initial')
-        ax1.scatter(se3_data[-1, 0], se3_data[-1, 1], se3_data[-1, 2], c='b', s=100, label='Final')
-        ax1.set_title('Rotation Components (ω) Trajectory in 3D')
-        ax1.set_xlabel('ωx')
-        ax1.set_ylabel('ωy')
-        ax1.set_zlabel('ωz')
+        ax1.plot(rot_data[:, 0], rot_data[:, 1], rot_data[:, 2], 'r-', linewidth=2)
+        ax1.scatter(rot_data[0, 0], rot_data[0, 1], rot_data[0, 2], c='g', s=100, label='Initial')
+        ax1.scatter(rot_data[-1, 0], rot_data[-1, 1], rot_data[-1, 2], c='b', s=100, label='Final')
+        ax1.set_title('Rotation Components (w) Trajectory in 3D')
+        ax1.set_xlabel('wx')
+        ax1.set_ylabel('wy')
+        ax1.set_zlabel('wz')
         ax1.legend()
         
-        # 3D plot of translation components
+        # 並進成分の3D軌跡
         ax2 = fig.add_subplot(122, projection='3d')
-        ax2.plot(se3_data[:, 3], se3_data[:, 4], se3_data[:, 5], 'r-', linewidth=2)
-        ax2.scatter(se3_data[0, 3], se3_data[0, 4], se3_data[0, 5], c='g', s=100, label='Initial')
-        ax2.scatter(se3_data[-1, 3], se3_data[-1, 4], se3_data[-1, 5], c='b', s=100, label='Final')
-        ax2.set_title('Translation Components (ρ) Trajectory in 3D')
-        ax2.set_xlabel('ρx')
-        ax2.set_ylabel('ρy')
-        ax2.set_zlabel('ρz')
+        ax2.plot(trans_data[:, 0], trans_data[:, 1], trans_data[:, 2], 'r-', linewidth=2)
+        ax2.scatter(trans_data[0, 0], trans_data[0, 1], trans_data[0, 2], c='g', s=100, label='Initial')
+        ax2.scatter(trans_data[-1, 0], trans_data[-1, 1], trans_data[-1, 2], c='b', s=100, label='Final')
+        ax2.set_title('Translation Components (t) Trajectory in 3D')
+        ax2.set_xlabel('tx')
+        ax2.set_ylabel('ty')
+        ax2.set_zlabel('tz')
         ax2.legend()
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'se3_3d_trajectory.png'), dpi=150)
         plt.close()
         
-        # 3. Gradient Analysis
-        grad_data = grad_history_np['se3_vec']
+        # =============== 4. 勾配分析 ===============
+        rot_grad_data = grad_history_np['rot_vec']
+        trans_grad_data = grad_history_np['trans_vec']
         
-        # Gradient magnitude
-        grad_magnitude = np.linalg.norm(grad_data, axis=1)
-        rot_grad_magnitude = np.linalg.norm(grad_data[:, :3], axis=1)
-        trans_grad_magnitude = np.linalg.norm(grad_data[:, 3:], axis=1)
+        # 勾配の大きさ（ノルム）
+        rot_grad_magnitude = np.linalg.norm(rot_grad_data, axis=1)
+        trans_grad_magnitude = np.linalg.norm(trans_grad_data, axis=1)
+        total_grad_magnitude = np.sqrt(rot_grad_magnitude**2 + trans_grad_magnitude**2)
         
         fig = plt.figure(figsize=(15, 12))
         gs = GridSpec(3, 1, figure=fig)
         
-        # Plot total gradient magnitude
+        # 総合勾配の大きさプロット
         ax1 = fig.add_subplot(gs[0, 0])
-        ax1.plot(iterations, grad_magnitude, 'k-', linewidth=2, label='Total')
+        ax1.plot(iterations, total_grad_magnitude, 'k-', linewidth=2, label='Total')
         ax1.plot(iterations, rot_grad_magnitude, 'r-', linewidth=1.5, label='Rotation')
         ax1.plot(iterations, trans_grad_magnitude, 'b-', linewidth=1.5, label='Translation')
         ax1.set_title('SE(3) Gradient Magnitude')
@@ -825,22 +865,22 @@ class OptimalTransportSolver:
         ax1.grid(True)
         ax1.legend()
         
-        # Plot rotation gradient components
+        # 回転勾配成分プロット
         ax2 = fig.add_subplot(gs[1, 0])
-        ax2.plot(iterations, grad_data[:, 0], 'r-', label='grad_ωx')
-        ax2.plot(iterations, grad_data[:, 1], 'g-', label='grad_ωy')
-        ax2.plot(iterations, grad_data[:, 2], 'b-', label='grad_ωz')
+        ax2.plot(iterations, rot_grad_data[:, 0], 'r-', label='grad_wx')
+        ax2.plot(iterations, rot_grad_data[:, 1], 'g-', label='grad_wy')
+        ax2.plot(iterations, rot_grad_data[:, 2], 'b-', label='grad_wz')
         ax2.set_title('Rotation Gradient Components')
         ax2.set_xlabel('Iteration')
         ax2.set_ylabel('Gradient Value')
         ax2.grid(True)
         ax2.legend()
         
-        # Plot translation gradient components
+        # 並進勾配成分プロット
         ax3 = fig.add_subplot(gs[2, 0])
-        ax3.plot(iterations, grad_data[:, 3], 'r-', label='grad_ρx')
-        ax3.plot(iterations, grad_data[:, 4], 'g-', label='grad_ρy')
-        ax3.plot(iterations, grad_data[:, 5], 'b-', label='grad_ρz')
+        ax3.plot(iterations, trans_grad_data[:, 0], 'r-', label='grad_tx')
+        ax3.plot(iterations, trans_grad_data[:, 1], 'g-', label='grad_ty')
+        ax3.plot(iterations, trans_grad_data[:, 2], 'b-', label='grad_tz')
         ax3.set_title('Translation Gradient Components')
         ax3.set_xlabel('Iteration')
         ax3.set_ylabel('Gradient Value')
@@ -851,28 +891,46 @@ class OptimalTransportSolver:
         plt.savefig(os.path.join(output_dir, 'se3_gradient_analysis.png'), dpi=150)
         plt.close()
         
-        # 4. Plot ratio of rotation to translation gradient norms
+        # =============== 5. 回転/並進勾配比率分析 ===============
         plt.figure(figsize=(12, 6))
-        # Add small epsilon to avoid division by zero
+        # ゼロ除算防止のためのイプシロン
         ratio = rot_grad_magnitude / (trans_grad_magnitude + 1e-10)
         plt.plot(iterations, ratio, 'b-', linewidth=2)
         plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.7, label='Balanced ratio (1.0)')
         plt.title('Ratio of Rotation to Translation Gradient Norms')
         plt.xlabel('Iteration')
         plt.ylabel('Ratio')
-        plt.yscale('log')  # Log scale to better see changes
+        plt.yscale('log')  # Log scaleで変化を見やすく
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'gradient_ratio.png'), dpi=150)
         plt.close()
         
-        # 5. Generate a text report with analysis
+        # =============== 6. パラメータ変化量の分析 ===============
+        plt.figure(figsize=(12, 6))
+        # 各イテレーションでのパラメータの変化量
+        rot_changes = np.array([np.linalg.norm(rot_data[i+1] - rot_data[i]) for i in range(len(rot_data)-1)])
+        trans_changes = np.array([np.linalg.norm(trans_data[i+1] - trans_data[i]) for i in range(len(trans_data)-1)])
+        
+        plt.plot(iterations[:-1], rot_changes, 'r-', label='Rotation Change')
+        plt.plot(iterations[:-1], trans_changes, 'b-', label='Translation Change')
+        plt.title('Parameter Change Magnitude per Iteration')
+        plt.xlabel('Iteration')
+        plt.ylabel('Change Magnitude')
+        plt.yscale('log')  # Log scaleで変化を見やすく
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'parameter_changes.png'), dpi=150)
+        plt.close()
+        
+        # =============== 7. テキスト形式のサマリーレポート ===============
         with open(os.path.join(output_dir, 'optimization_analysis.txt'), 'w') as f:
-            f.write("SE(3) OPTIMIZATION PROCESS ANALYSIS\n")
-            f.write("==================================\n\n")
+            f.write("SE(3) OPTIMIZATION PROCESS ANALYSIS (SEPARATED PARAMETERS)\n")
+            f.write("=====================================================\n\n")
             
-            # Loss analysis
+            # 損失分析
             f.write("1. LOSS BEHAVIOR\n")
             f.write("----------------\n")
             initial_loss = loss_history[0]
@@ -883,72 +941,88 @@ class OptimalTransportSolver:
             f.write(f"Final loss: {final_loss:.6f}\n")
             f.write(f"Total loss reduction: {loss_reduction:.2f}%\n\n")
             
-            # Monotonicity check
+            # 単調減少性チェック
             is_monotonic = all(loss_history[i] >= loss_history[i+1] for i in range(len(loss_history)-1))
             f.write(f"Loss decreases monotonically: {is_monotonic}\n")
             
-            # Find oscillations or plateaus
+            # 振動とプラトー（平坦部）の検出
             oscillation_count = sum(1 for i in range(len(loss_history)-2) 
                                     if (loss_history[i] > loss_history[i+1] and 
                                         loss_history[i+1] < loss_history[i+2]))
             
-            plateau_threshold = 1e-6  # Define what constitutes a plateau
+            plateau_threshold = 1e-6  # プラトー判定の閾値
             plateau_count = sum(1 for i in range(len(loss_history)-1) 
                             if abs(loss_history[i] - loss_history[i+1]) < plateau_threshold)
             
             f.write(f"Number of oscillations: {oscillation_count}\n")
             f.write(f"Number of plateaus: {plateau_count}\n\n")
             
-            # Parameter analysis
+            # パラメータ分析
             f.write("2. SE(3) PARAMETER BEHAVIOR\n")
             f.write("-------------------------\n")
-            f.write(f"SE(3) vector (initial): " + np.array2string(se3_data[0], precision=6) + "\n")
-            f.write(f"SE(3) vector (final): " + np.array2string(se3_data[-1], precision=6) + "\n")
             
-            # Split into rotation and translation
-            f.write(f"Rotation component (ω) initial: " + np.array2string(se3_data[0, :3], precision=6) + "\n")
-            f.write(f"Rotation component (ω) final: " + np.array2string(se3_data[-1, :3], precision=6) + "\n")
-            rot_change = np.linalg.norm(se3_data[-1, :3] - se3_data[0, :3])
+            # 回転成分
+            f.write(f"Rotation component (w) initial: " + np.array2string(rot_data[0], precision=6) + "\n")
+            f.write(f"Rotation component (w) final: " + np.array2string(rot_data[-1], precision=6) + "\n")
+            rot_change = np.linalg.norm(rot_data[-1] - rot_data[0])
             f.write(f"Total rotation change magnitude: {rot_change:.6f}\n\n")
             
-            f.write(f"Translation component (ρ) initial: " + np.array2string(se3_data[0, 3:], precision=6) + "\n")
-            f.write(f"Translation component (ρ) final: " + np.array2string(se3_data[-1, 3:], precision=6) + "\n")
-            trans_change = np.linalg.norm(se3_data[-1, 3:] - se3_data[0, 3:])
+            # 並進成分
+            f.write(f"Translation component (t) initial: " + np.array2string(trans_data[0], precision=6) + "\n")
+            f.write(f"Translation component (t) final: " + np.array2string(trans_data[-1], precision=6) + "\n")
+            trans_change = np.linalg.norm(trans_data[-1] - trans_data[0])
             f.write(f"Total translation change magnitude: {trans_change:.6f}\n\n")
             
-            # Gradient analysis
+            # 勾配分析
             f.write("3. GRADIENT BEHAVIOR\n")
             f.write("-------------------\n")
-            max_grad = np.max(grad_magnitude)
-            min_grad = np.min(grad_magnitude)
-            avg_grad = np.mean(grad_magnitude)
             
-            f.write(f"Total gradient - Max: {max_grad:.6f}, Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n")
-            f.write(f"Rotation gradient - Max: {np.max(rot_grad_magnitude):.6f}, " 
-                    f"Min: {np.min(rot_grad_magnitude):.6f}, Avg: {np.mean(rot_grad_magnitude):.6f}\n")
-            f.write(f"Translation gradient - Max: {np.max(trans_grad_magnitude):.6f}, "
-                    f"Min: {np.min(trans_grad_magnitude):.6f}, Avg: {np.mean(trans_grad_magnitude):.6f}\n")
+            # 回転勾配の統計
+            max_rot_grad = np.max(rot_grad_magnitude)
+            min_rot_grad = np.min(rot_grad_magnitude)
+            avg_rot_grad = np.mean(rot_grad_magnitude)
+            f.write(f"Rotation gradient - Max: {max_rot_grad:.6f}, " 
+                    f"Min: {min_rot_grad:.6f}, Avg: {avg_rot_grad:.6f}\n")
             
-            # Check for vanishing/exploding gradients
+            # 並進勾配の統計
+            max_trans_grad = np.max(trans_grad_magnitude)
+            min_trans_grad = np.min(trans_grad_magnitude)
+            avg_trans_grad = np.mean(trans_grad_magnitude)
+            f.write(f"Translation gradient - Max: {max_trans_grad:.6f}, "
+                    f"Min: {min_trans_grad:.6f}, Avg: {avg_trans_grad:.6f}\n")
+            
+            # 総合勾配の統計
+            max_grad = np.max(total_grad_magnitude)
+            min_grad = np.min(total_grad_magnitude)
+            avg_grad = np.mean(total_grad_magnitude)
+            f.write(f"Total gradient - Max: {max_grad:.6f}, Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n\n")
+            
+            # 勾配消失/爆発チェック
             vanishing_threshold = 1e-6
             exploding_threshold = 1e2
             
-            vanishing_grad = any(grad < vanishing_threshold for grad in grad_magnitude)
-            exploding_grad = any(grad > exploding_threshold for grad in grad_magnitude)
+            vanishing_rot_grad = any(grad < vanishing_threshold for grad in rot_grad_magnitude)
+            exploding_rot_grad = any(grad > exploding_threshold for grad in rot_grad_magnitude)
             
-            f.write(f"Gradient vanishing detected: {vanishing_grad}\n")
-            f.write(f"Gradient exploding detected: {exploding_grad}\n\n")
+            vanishing_trans_grad = any(grad < vanishing_threshold for grad in trans_grad_magnitude)
+            exploding_trans_grad = any(grad > exploding_threshold for grad in trans_grad_magnitude)
             
-            # Ratio of rotation/translation gradients - good indicator of balance
+            f.write(f"Rotation gradient vanishing detected: {vanishing_rot_grad}\n")
+            f.write(f"Rotation gradient exploding detected: {exploding_rot_grad}\n")
+            f.write(f"Translation gradient vanishing detected: {vanishing_trans_grad}\n")
+            f.write(f"Translation gradient exploding detected: {exploding_trans_grad}\n\n")
+            
+            # 回転/並進勾配の比率 - 最適化バランスの重要な指標
             avg_ratio = np.mean(ratio)
             f.write(f"Average rotation/translation gradient ratio: {avg_ratio:.4f}\n")
-            f.write(f"Ideal ratio should be close to 1.0 for balanced optimization\n\n")
+            f.write("Ideal ratio should be close to 1.0 for balanced optimization\n")
+            f.write("Higher values mean rotation is dominating, lower values mean translation is dominating\n\n")
             
-            # Conclusion
+            # 結論
             f.write("4. CONCLUSION\n")
             f.write("-------------\n")
             
-            # Determine if the optimization was successful
+            # 最適化の成功判定
             successful = loss_reduction > 50 and final_loss < initial_loss * 0.5
             
             if successful:
@@ -956,7 +1030,7 @@ class OptimalTransportSolver:
             else:
                 f.write("Optimization may have ISSUES based on limited loss reduction.\n\n")
                 
-            # Report potential issues
+            # 潜在的な問題点のレポート
             issues = []
             if not is_monotonic and oscillation_count > len(loss_history) * 0.1:
                 issues.append("- Loss exhibits significant oscillations, suggesting unstable optimization.")
@@ -964,15 +1038,18 @@ class OptimalTransportSolver:
             if plateau_count > len(loss_history) * 0.3:
                 issues.append("- Loss exhibits plateaus, suggesting the optimizer may be struggling to make progress.")
             
-            if vanishing_grad:
+            if vanishing_rot_grad or vanishing_trans_grad:
                 issues.append("- Gradients approach zero, suggesting vanishing gradient issues.")
                 
-            if exploding_grad:
+            if exploding_rot_grad or exploding_trans_grad:
                 issues.append("- Gradients are very large, suggesting exploding gradient issues.")
                 
-            if avg_ratio > 10.0 or avg_ratio < 0.1:
-                issues.append(f"- Rotation/translation gradient ratio ({avg_ratio:.2f}) is far from balanced, "
-                            "which may cause biased optimization.")
+            if avg_ratio > 10.0:
+                issues.append(f"- Rotation/translation gradient ratio ({avg_ratio:.2f}) is much higher than 1.0, "
+                            "which means rotation updates are dominating the optimization.")
+            elif avg_ratio < 0.1:
+                issues.append(f"- Rotation/translation gradient ratio ({avg_ratio:.2f}) is much lower than 1.0, "
+                            "which means translation updates are dominating the optimization.")
             
             if issues:
                 f.write("Potential issues detected:\n")
@@ -981,4 +1058,34 @@ class OptimalTransportSolver:
             else:
                 f.write("No significant optimization issues detected.\n")
                 
+            # 最適化改善のための提案
+            f.write("\n5. SUGGESTIONS FOR IMPROVEMENT\n")
+            f.write("------------------------------\n")
+            
+            suggestions = []
+            
+            if avg_ratio > 5.0:
+                suggestions.append("- Consider decreasing rotation learning rate or increasing translation learning rate.")
+            elif avg_ratio < 0.2:
+                suggestions.append("- Consider increasing rotation learning rate or decreasing translation learning rate.")
+                
+            if exploding_rot_grad or exploding_trans_grad:
+                suggestions.append("- Consider using a smaller learning rate or increasing gradient clipping threshold.")
+                
+            if vanishing_rot_grad or vanishing_trans_grad:
+                suggestions.append("- Consider using a larger learning rate or different optimizer (e.g. Adam).")
+                
+            if oscillation_count > len(loss_history) * 0.2:
+                suggestions.append("- Increase momentum or add decay to learning rate to stabilize optimization.")
+                
+            if plateau_count > len(loss_history) * 0.4:
+                suggestions.append("- Try different learning rate schedule or optimizer to escape plateaus.")
+                
+            if len(suggestions) > 0:
+                for suggestion in suggestions:
+                    f.write(suggestion + "\n")
+            else:
+                f.write("No specific improvements needed. The optimization appears to be well-configured.\n")
+                
         print(f"Saved SE(3) optimization diagnostics to {output_dir}")
+ 
