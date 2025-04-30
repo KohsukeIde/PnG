@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
 from src.primitive.camera import Lie
+from utils.optimizers.SAM import SAM
 
 class OptimalTransportSolver:
     """Optimal Transport Solver for 2D Gaussians with Homography Optimization."""
@@ -540,10 +541,11 @@ class OptimalTransportSolver:
             self._init_se3_like_cam1(rot_noise=0.05, trans_noise=0.05, seed=seed)
 
         # ------------------------- オプティマイザ設定 ----------------------- #
-        optimizer = torch.optim.SGD([
-            {'params': self.rot_vec, 'lr': rot_lr, 'momentum': momentum, 'nesterov': False},
-            {'params': self.trans_vec, 'lr': trans_lr, 'momentum': momentum, 'nesterov': False}
-        ])
+        base_optimizer = torch.optim.SGD  # クラスを渡す（インスタンスではない）
+        optimizer = SAM([
+            {'params': self.rot_vec, 'lr': rot_lr, 'momentum': momentum, 'nesterov': True},
+            {'params': self.trans_vec, 'lr': trans_lr, 'momentum': momentum, 'nesterov': True}
+        ], base_optimizer, rho=0.05, adaptive=True)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8**(1/100))
 
         prev_loss_val = float('inf')
@@ -582,7 +584,7 @@ class OptimalTransportSolver:
             loss.backward()
             
             # 勾配クリッピング（高周波ノイズ抑制）
-            torch.nn.utils.clip_grad_norm_([self.rot_vec, self.trans_vec], max_norm=grad_clip)
+            # torch.nn.utils.clip_grad_norm_([self.rot_vec, self.trans_vec], max_norm=grad_clip)
             
             if self.rot_vec.grad is not None and self.trans_vec.grad is not None:
                 rot_grad = self.rot_vec.grad
@@ -611,7 +613,25 @@ class OptimalTransportSolver:
             grad_history['rot_vec'].append(self.rot_vec.grad.clone() if self.rot_vec.grad is not None else None)
             grad_history['trans_vec'].append(self.trans_vec.grad.clone() if self.trans_vec.grad is not None else None)
 
-            optimizer.step()
+            # 修正方法1: first_stepとsecond_stepを明示的に使用
+            # 1回目の順伝搬・逆伝搬はすでに行われているのでfirst_stepを実行
+            optimizer.first_step(zero_grad=True)
+
+            # 2回目の順伝搬・逆伝搬
+            se3_vec = torch.cat([self.rot_vec, self.trans_vec])
+            T_cw = self.lie.se3_to_SE3(se3_vec)
+            R_cw = T_cw[:3, :3]
+            t_cw = T_cw[:3, 3]
+            R_wc = R_cw.t()
+            t_wc = -R_wc @ t_cw
+            F = self._build_F_from_wc(R_wc, t_wc)
+            cost_matrix = self.compute_cost_matrix_fundamental(F)
+            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
+            loss_2 = torch.sum(transport * cost_matrix)
+            loss_2.backward()
+
+            # 2回目のステップで実際にパラメータ更新
+            optimizer.second_step(zero_grad=True)
             
             # リトラクション: 回転ベクトルを基本領域（|θ| ≤ π）に投影
             with torch.no_grad():
