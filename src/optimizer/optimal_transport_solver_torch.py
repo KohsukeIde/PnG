@@ -217,14 +217,14 @@ class OptimalTransportSolver:
         n2_norm = n2.norm(dim=1, keepdim=True) + 1e-12
         n2_unit = n2 / n2_norm
 
-        # -------- ③ 点⇔線 “符号付き” 距離 --------
+        # -------- ③ 点⇔線  "符号付き" 距離 --------
         #     d_12(i,j):  p1_i → ℓ1_j
         #     d_21(i,j):  p2_j → ℓ2_i
         # ※ abs を外して「符号付き」にしても結果は d^2 なので同じですが、そのまま再利用します
         dist_12 = torch.abs(p1_h @ l1.T) / n1_norm.T      # (K1,K2)
         dist_21 = torch.abs(p2_h @ l2.T).T / n2_norm      # (K1,K2)
 
-        # -------- ④ “距離²＋分散” へ置換 --------
+        # -------- ④ "距離²＋分散" へ置換 --------
         # CHANGE 1:  割り算 → 2乗して足し算
         dist_sq_sum = dist_12.pow(2) + dist_21.pow(2)     # d_12² + d_21²  (K1,K2)
 
@@ -644,7 +644,7 @@ class OptimalTransportSolver:
                 pbar.set_postfix({
                     'loss': f"{current_loss:.6f}",
                     'r_grad': f"{rot_grad_norm:.4f}",
-                    'r/t': f"{ratio:.2f}",
+                    'r_t': f"{ratio:.2f}",
                     'lr': f"{scheduler.get_last_lr()[0]:.2e}"
                 })
 
@@ -1359,7 +1359,7 @@ class OptimalTransportSolver:
         # ------------------------- 診断情報保存 --------------------------- #
         if save_diagnostics:
             # 詳細な診断情報を保存
-            self.save_optimization_diagnostics_DSO_B(
+            self.save_optimization_diagnostics_DSO(
                 output_dir=diagnostics_dir,
                 loss_history=loss_history,
                 delta_history=delta_history,
@@ -1369,7 +1369,7 @@ class OptimalTransportSolver:
         
         return loss_history
 
-    def save_optimization_diagnostics_DSO_B(self, 
+    def save_optimization_diagnostics_DSO(self, 
                                    output_dir: str,
                                    loss_history: list,
                                    delta_history: list,
@@ -1790,3 +1790,1219 @@ class OptimalTransportSolver:
                 f.write("No specific improvements needed. The optimization appears to be well-configured.\n")
         
         print(f"Saved DSO Type-B optimization diagnostics to {output_dir}")
+
+    def optimize_with_essential(self, max_iter=1000, tol=1e-6,
+                                save_diagnostics=True, diagnostics_dir=None,
+                                lr_E=5e-5, momentum=0.0,
+                                grad_clip=0.1, seed=None):
+        """
+        Directly optimise the Essential matrix E (rank-2, σ1=σ2) via
+        projected-gradient descent with differentiable SVD.
+        """
+        # ----------- I/O dirs -----------
+        transport_dir  = os.path.join("results", "transport_E")
+        os.makedirs(transport_dir, exist_ok=True)
+        diagnostics_dir = diagnostics_dir or os.path.join("results",
+                                                          "diagnostics_E")
+        os.makedirs(diagnostics_dir, exist_ok=True)
+
+        # ----------- history -----------
+        loss_history, E_norm_hist = [], []
+        grad_hist = []
+        param_history = {'E_raw': []}
+
+        # ----------- parameter init -----------
+        torch.manual_seed(seed or 0)
+        if not hasattr(self, "E_raw"):
+            # random 3×3 then project once so we start on manifold
+            E0 = torch.randn(3, 3, device=self.device)
+            U, S, Vh = torch.linalg.svd(E0, full_matrices=False)
+            V = Vh.mH  # linalg.svd returns Vh (conjugate-transpose)
+            
+            # 符号ロック：det(U@V^T)が負ならU[:, 2]の符号を反転
+            if torch.det(U @ V.mH) < 0:
+                U[:, 2] *= -1
+                
+            # 初期化時は完全なEssential matrix制約を適用
+            E0 = U @ torch.diag(torch.tensor([1., 1., 0.], device=self.device)) @ V
+            E0 /= E0.norm() + 1e-9
+            self.E_raw = nn.Parameter(E0.clone())
+        else:
+            # ensure requires_grad on reload
+            self.E_raw.requires_grad_(True)
+
+        # -------- optimizer & scheduler --------
+        optimizer = torch.optim.SGD([self.E_raw], lr=lr_E,
+                                    momentum=momentum)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=0.8**(1/100)
+        )
+
+        prev_loss = float('inf')
+        pbar = tqdm(range(max_iter), desc="Optimizing E", leave=True)
+
+        debug_log = os.path.join(diagnostics_dir, "gradient_debug_E.log")
+        with open(debug_log, 'w') as f:
+            f.write("iter,loss,E_grad_norm,e11,e12,e13,e21,e22,e23,e31,e32,e33\n")
+
+        # -------- main loop -----------
+        for it in pbar:
+            optimizer.zero_grad()
+
+            # ----- 1. projection INSIDE graph -----
+            # --- (A) グラフ内プロジェクション（安全版：σ₃=0のみ） ---
+            U, S, Vh = torch.linalg.svd(self.E_raw, full_matrices=False)
+            V = Vh.mH  # linalg.svd returns Vh (conjugate-transpose)
+            
+            # 符号ロック：det(U@V^T)が負の場合 - インプレースを避ける！
+            if torch.det(U @ V.mH) < 0:
+                # U[:, 2] *= -1 のかわりに新しいテンソルを作成
+                new_U = U.clone()
+                new_U[:, 2] = -U[:, 2]
+                U = new_U
+                
+            S_proj = S.clone()
+            S_proj[-1] = 0.0             # rank-2 だけ保証、σ1≠σ2 は触らない
+            E = U @ torch.diag(S_proj) @ V
+            E = E / (E.norm() + 1e-9)    # スケール正規化
+
+            # ----- 2. build F = K2^{-T}EK1^{-1} -----
+            K1_inv = torch.inverse(self.k1)
+            K2_inv = torch.inverse(self.k2)
+            F = K2_inv.t() @ E @ K1_inv
+
+            # ----- 3. loss (OT) -----
+            cost = self.compute_cost_matrix_fundamental(F)
+            Tplan = self.unbalanced_sinkhorn_algorithm(cost)
+            
+            # after transport is computed
+            if torch.isnan(Tplan).any():
+                raise RuntimeError("transport NaN")
+                
+            loss = torch.sum(Tplan * cost)
+
+            # ----- 4. back-prop -----
+            # just before loss.backward()
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError("loss Nan/Inf")
+
+            loss.backward()
+            
+            # 安全策②：勾配がNaNなら0に置換（保険）
+            if torch.isnan(self.E_raw.grad).any():
+                # NaNを検出したが、安全に続行するため0に置き換え
+                torch.nan_to_num_(self.E_raw.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                print(f"Warning: NaN gradients detected at iteration {it}, replaced with zeros")
+
+            # log gradient info every 10 it
+            if it % 10 == 0:
+                gnorm = self.E_raw.grad.norm().item() if self.E_raw.grad is not None else 0
+                with torch.no_grad():
+                    vals = self.E_raw.detach().cpu().view(-1).numpy()
+                with open(debug_log, 'a') as f:
+                    f.write(f"{it},{loss.item():.6f},{gnorm:.6f}," +
+                            ",".join([f"{v:.6f}" for v in vals]) + "\n")
+                print(f"\nIter {it}  loss {loss.item():.6f}  |E_grad| {gnorm:.3e}")
+                
+                # Save gradient history
+                if self.E_raw.grad is not None:
+                    grad_hist.append(self.E_raw.grad.detach().clone())
+                
+                # デバッグ情報：特異値をチェック
+                with torch.no_grad():
+                    _, S_debug, _ = torch.linalg.svd(self.E_raw.data, full_matrices=False)
+                    print(f"  Current singular values: {S_debug.cpu().numpy()}")
+                
+            # Save parameter history
+            param_history['E_raw'].append(self.E_raw.detach().clone())
+
+            # grad-clip & step
+            torch.nn.utils.clip_grad_norm_([self.E_raw], grad_clip)
+            optimizer.step()
+
+            # ----- 5. projection OUTSIDE graph (for next iter stability) -----
+            # --- (B) no-grad 投影（ステップ後）---
+            # ここでは完全なEssential matrix制約（σ₁=σ₂, σ₃=0）を適用
+            with torch.no_grad():
+                U, S, Vh = torch.linalg.svd(self.E_raw.data, full_matrices=False)
+                V = Vh.mH
+                
+                # 符号ロック - ここはno_gradなのでインプレースでも問題なし
+                if torch.det(U @ V.mH) < 0:
+                    U[:, 2] *= -1
+                    
+                self.E_raw.data = U @ torch.diag(torch.tensor(
+                                [1., 1., 0.], device=self.device)) @ V
+                self.E_raw.data /= self.E_raw.data.norm() + 1e-9
+                E_norm_hist.append(self.E_raw.data.norm().item())
+
+            scheduler.step()
+            # ----- 6. book-keeping -----
+            loss_val = loss.item()
+            loss_history.append(loss_val)
+
+            pbar.set_postfix({'loss': f"{loss_val:.6f}",
+                              'E|grad|': f"{self.E_raw.grad.norm().item():.2e}",
+                              'lr': f"{scheduler.get_last_lr()[0]:.2e}"})
+
+            if abs(prev_loss - loss_val) < tol and it > 5:
+                pbar.set_description(f"Converged (Δloss<{tol})")
+                break
+            prev_loss = loss_val
+
+            # transport-plan viz every 20 it
+            if it % 20 == 0 or it == max_iter - 1:
+                with torch.no_grad():
+                    T_np = Tplan.detach().cpu().numpy()
+                rows, cols = T_np.shape
+                aspect_ratio = cols / rows
+                if rows > cols:
+                    fig_width = 8
+                    fig_height = min(20, fig_width / aspect_ratio)
+                else:
+                    fig_height = 6
+                    fig_width = min(20, fig_height * aspect_ratio)
+                plt.figure(figsize=(fig_width, fig_height))
+                if rows > 1000 or cols > 1000:
+                    downsample_factor = max(1, int(max(rows, cols) / 1000))
+                    t_np_display = T_np[::downsample_factor, ::downsample_factor]
+                    plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+                    plt.title(f"Transport Plan at Iteration {it} (Downsampled {downsample_factor}x)")
+                else:
+                    plt.imshow(T_np, cmap="hot", interpolation="nearest", aspect="auto")
+                    plt.title(f"Transport Plan at Iteration {it}")
+                plt.colorbar(label="Transport Plan Value")
+                plt.xlabel("Image 2 Gaussians")
+                plt.ylabel("Image 1 Gaussians")
+                plt.tight_layout()
+                plt.savefig(os.path.join(transport_dir, f"Tplan_{it:04d}.png"))
+                plt.close()
+
+        # -------- save final pose --------
+        with torch.no_grad():
+            # decompose E → R,t̂   (Kruppa / SVD)
+            U, S, Vh = torch.linalg.svd(self.E_raw.data, full_matrices=False)
+            V = Vh.mH
+            
+            # 符号ロック：det(U@V^T)が負ならU[:, 2]の符号を反転
+            if torch.det(U @ V.mH) < 0:
+                U[:, 2] *= -1
+                
+            W = torch.tensor([[0,-1,0],[1,0,0],[0,0,1]], device=self.device, dtype=torch.float32)
+            R1 = U @ W  @ V
+            R2 = U @ W.t() @ V
+            t_hat = U[:, 2]
+
+            # Ensure R is a rotation matrix (det=1)
+            if torch.det(R1) < 0:
+                R1 = -R1
+            if torch.det(R2) < 0:
+                R2 = -R2
+
+            # choose the first R, t to store (chirality check left to user)
+            self.R_wc = R1
+            self.t_wc = t_hat
+            self.f = K2_inv.t() @ self.E_raw.data @ K1_inv
+            
+            # Also compute and store the camera-to-world transformation
+            self.R_cw = self.R_wc.t()
+            self.t_cw = -self.R_cw @ t_hat
+
+            # Store as OpenCV parameters if cv2 is available
+            if cv2 is not None:
+                rvec_numpy, _ = cv2.Rodrigues(self.R_wc.cpu().numpy())
+                self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
+                self.tvec = nn.Parameter(self.t_cw)
+                rvec_cw_numpy, _ = cv2.Rodrigues(self.R_cw.cpu().numpy())
+                self.rvec_cw = nn.Parameter(torch.from_numpy(rvec_cw_numpy).to(self.device))
+                self.center = nn.Parameter(self.t_cw)
+
+        # -------- diagnostics --------
+        plt.figure()
+        plt.plot(loss_history, '-o')
+        plt.title("Loss (optimize_with_essential)")
+        plt.xlabel("Iteration"); plt.ylabel("Loss"); plt.grid(True)
+        plt.savefig(os.path.join(transport_dir, "loss_optimize_with_E.png"))
+        plt.close()
+
+        if save_diagnostics:
+            np.save(os.path.join(diagnostics_dir, "loss_E.npy"),
+                    np.array(loss_history))
+            np.save(os.path.join(diagnostics_dir, "E_norm.npy"),
+                    np.array(E_norm_hist))
+            
+            # Extended diagnostics: similar to optimize_with_SE3
+            self.save_optimization_diagnostics_E(
+                output_dir=diagnostics_dir,
+                loss_history=loss_history,
+                param_history=param_history,
+                grad_history=grad_hist
+            )
+            
+            print(f"Saved diagnostics to {diagnostics_dir}")
+
+        return loss_history
+
+    def save_optimization_diagnostics_E(self, 
+                                       output_dir: str,
+                                       loss_history: list,
+                                       param_history: dict,
+                                       grad_history: list) -> None:
+        """Essential matrix最適化の診断情報を保存する
+        
+        Essential matrix直接最適化の詳細な診断情報を生成・保存します：
+        - 損失軌跡の分析
+        - E_rawパラメータの挙動
+        - 勾配挙動の分析
+        - 収束性分析
+        - テキスト形式のサマリーレポート
+        
+        Args:
+            output_dir: 診断ファイルを保存するディレクトリ
+            loss_history: イテレーションごとの損失値リスト
+            param_history: パラメータ履歴の辞書（'E_raw'を含む）
+            grad_history: 勾配履歴のリスト
+        """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        
+        # 出力ディレクトリ作成
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 履歴をNumPy配列に変換
+        E_raw_history = np.array([p.detach().cpu().numpy() for p in param_history['E_raw']])
+        
+        # 勾配の履歴をNumPy配列に変換（Noneがある場合はゼロで置換）
+        if grad_history:
+            grad_history_np = np.array([g.detach().cpu().numpy() if g is not None 
+                                       else np.zeros_like(E_raw_history[0]) 
+                                       for g in grad_history])
+        else:
+            # 勾配履歴がない場合は空の配列を作成
+            grad_history_np = np.array([])
+        
+        # イテレーション数
+        iterations = range(len(loss_history))
+        
+        # ======================= 1. 損失軌跡の分析 =======================
+        plt.figure(figsize=(12, 8))
+        plt.subplot(211)
+        plt.plot(iterations, loss_history, 'b-', linewidth=2)
+        plt.title('Loss Value During Essential Matrix Optimization')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        
+        # 損失の変化（微分）をプロット
+        plt.subplot(212)
+        loss_changes = np.array([loss_history[i+1] - loss_history[i] 
+                                for i in range(len(loss_history)-1)])
+        plt.plot(iterations[:-1], loss_changes, 'r-')
+        plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        plt.title('Loss Change Between Iterations')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss Difference')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'loss_analysis_E.png'), dpi=150)
+        plt.close()
+        
+        # =============== 2. Essential行列要素の可視化 ===============
+        if E_raw_history.shape[0] > 0:
+            fig = plt.figure(figsize=(15, 10))
+            gs = GridSpec(3, 3, figure=fig)
+            
+            for i in range(3):
+                for j in range(3):
+                    ax = fig.add_subplot(gs[i, j])
+                    ax.plot(iterations, E_raw_history[:, i, j], 'b-', linewidth=1.5)
+                    ax.set_title(f'E_raw[{i},{j}]')
+                    ax.set_xlabel('Iteration')
+                    ax.set_ylabel('Value')
+                    ax.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'essential_matrix_elements.png'), dpi=150)
+            plt.close()
+        
+        # =============== 3. 勾配分析 ===============
+        if len(grad_history_np) > 0:
+            # 勾配ノルムを計算
+            grad_norms = np.linalg.norm(grad_history_np.reshape(grad_history_np.shape[0], -1), axis=1)
+            
+            fig = plt.figure(figsize=(12, 6))
+            plt.plot(range(len(grad_norms)), grad_norms, 'r-', linewidth=2)
+            plt.title('Essential Matrix Gradient Norm')
+            plt.xlabel('Iteration')
+            plt.ylabel('Gradient Norm')
+            plt.yscale('log')
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'gradient_norm_analysis_E.png'), dpi=150)
+            plt.close()
+            
+            # 勾配要素のヒートマップ
+            if grad_history_np.shape[0] > 0:
+                plt.figure(figsize=(10, 8))
+                grad_avg = np.mean(np.abs(grad_history_np), axis=0)  # 各要素の絶対値の平均
+                plt.imshow(grad_avg, cmap='hot', interpolation='nearest')
+                plt.colorbar(label='Avg Absolute Gradient')
+                plt.title('Average Absolute Gradient Magnitude per Matrix Element')
+                
+                # 行列要素のラベル
+                element_labels = [f'e{i+1}{j+1}' for i in range(3) for j in range(3)]
+                element_labels = np.array(element_labels).reshape(3, 3)
+                
+                # 各セルに値を表示
+                for i in range(3):
+                    for j in range(3):
+                        plt.text(j, i, f'{element_labels[i,j]}\n{grad_avg[i,j]:.2e}', 
+                                 ha='center', va='center', color='w' if grad_avg[i,j] > np.mean(grad_avg) else 'k')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'gradient_heatmap_E.png'), dpi=150)
+                plt.close()
+        
+        # =============== 4. Essential行列のノルムとRank分析 ===============
+        if E_raw_history.shape[0] > 0:
+            # Frobenius ノルムを計算
+            E_norms = np.linalg.norm(E_raw_history.reshape(E_raw_history.shape[0], -1), axis=1)
+            
+            # 各イテレーションでのSVD特異値を計算
+            svd_values = []
+            for E_mat in E_raw_history:
+                U, S, V = np.linalg.svd(E_mat)
+                svd_values.append(S)
+            svd_values = np.array(svd_values)
+            
+            fig = plt.figure(figsize=(15, 10))
+            
+            # Frobeniusノルム
+            ax1 = fig.add_subplot(211)
+            ax1.plot(iterations, E_norms, 'b-', linewidth=2)
+            ax1.set_title('Essential Matrix Frobenius Norm')
+            ax1.set_xlabel('Iteration')
+            ax1.set_ylabel('Norm')
+            ax1.grid(True)
+            
+            # 特異値
+            ax2 = fig.add_subplot(212)
+            for i in range(3):
+                ax2.plot(iterations, svd_values[:, i], 
+                         label=f'σ{i+1}', linewidth=2)
+            ax2.set_title('Singular Values of Essential Matrix')
+            ax2.set_xlabel('Iteration')
+            ax2.set_ylabel('Value')
+            ax2.grid(True)
+            ax2.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'essential_norm_rank_analysis.png'), dpi=150)
+            plt.close()
+            
+            # σ1/σ2比率の分析（理想的には1）
+            plt.figure(figsize=(10, 6))
+            sigma_ratio = svd_values[:, 0] / (svd_values[:, 1] + 1e-10)
+            plt.plot(iterations, sigma_ratio, 'g-', linewidth=2)
+            plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.7, label='Ideal ratio (σ1=σ2)')
+            plt.title('Ratio of First to Second Singular Values (σ1/σ2)')
+            plt.xlabel('Iteration')
+            plt.ylabel('Ratio')
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'singular_value_ratio.png'), dpi=150)
+            plt.close()
+            
+            # σ3の分析（理想的には0）
+            plt.figure(figsize=(10, 6))
+            plt.plot(iterations, svd_values[:, 2], 'r-', linewidth=2)
+            plt.axhline(y=0.0, color='g', linestyle='--', alpha=0.7, label='Ideal value (σ3=0)')
+            plt.title('Third Singular Value (σ3)')
+            plt.xlabel('Iteration')
+            plt.ylabel('Value')
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'third_singular_value.png'), dpi=150)
+            plt.close()
+        
+        # =============== 5. テキスト形式のサマリーレポート ===============
+        with open(os.path.join(output_dir, 'optimization_analysis_E.txt'), 'w') as f:
+            f.write("ESSENTIAL MATRIX OPTIMIZATION PROCESS ANALYSIS\n")
+            f.write("===========================================\n\n")
+            
+            # 損失分析
+            f.write("1. LOSS BEHAVIOR\n")
+            f.write("----------------\n")
+            initial_loss = loss_history[0]
+            final_loss = loss_history[-1]
+            loss_reduction = (initial_loss - final_loss) / initial_loss * 100 if initial_loss != 0 else 0
+            
+            f.write(f"Initial loss: {initial_loss:.6f}\n")
+            f.write(f"Final loss: {final_loss:.6f}\n")
+            f.write(f"Total loss reduction: {loss_reduction:.2f}%\n\n")
+            
+            # 単調減少性チェック
+            is_monotonic = all(loss_history[i] >= loss_history[i+1] for i in range(len(loss_history)-1))
+            f.write(f"Loss decreases monotonically: {is_monotonic}\n")
+            
+            # 振動とプラトー（平坦部）の検出
+            oscillation_count = sum(1 for i in range(len(loss_history)-2) 
+                                    if (loss_history[i] > loss_history[i+1] and 
+                                        loss_history[i+1] < loss_history[i+2]))
+            
+            plateau_threshold = 1e-6  # プラトー判定の閾値
+            plateau_count = sum(1 for i in range(len(loss_history)-1) 
+                            if abs(loss_history[i] - loss_history[i+1]) < plateau_threshold)
+            
+            f.write(f"Number of oscillations: {oscillation_count}\n")
+            f.write(f"Number of plateaus: {plateau_count}\n\n")
+            
+            # Essential行列の特性分析
+            if E_raw_history.shape[0] > 0:
+                f.write("2. ESSENTIAL MATRIX PROPERTIES\n")
+                f.write("----------------------------\n")
+                
+                # 初期値と最終値
+                f.write("Initial E_raw matrix:\n")
+                f.write(str(E_raw_history[0]) + "\n\n")
+                
+                f.write("Final E_raw matrix:\n")
+                f.write(str(E_raw_history[-1]) + "\n\n")
+                
+                # ノルム分析
+                initial_norm = np.linalg.norm(E_raw_history[0])
+                final_norm = np.linalg.norm(E_raw_history[-1])
+                f.write(f"Initial Frobenius norm: {initial_norm:.6f}\n")
+                f.write(f"Final Frobenius norm: {final_norm:.6f}\n\n")
+                
+                # 特異値分析
+                U, S, V = np.linalg.svd(E_raw_history[-1])
+                f.write(f"Final singular values: {S[0]:.6f}, {S[1]:.6f}, {S[2]:.6f}\n")
+                f.write(f"σ1/σ2 ratio: {S[0]/S[1]:.6f} (ideal is 1.0)\n")
+                f.write(f"σ3 value: {S[2]:.6e} (ideal is 0.0)\n\n")
+            
+            # 勾配分析
+            if len(grad_history_np) > 0:
+                f.write("3. GRADIENT BEHAVIOR\n")
+                f.write("-------------------\n")
+                
+                # 勾配の統計
+                max_grad = np.max(grad_norms)
+                min_grad = np.min(grad_norms)
+                avg_grad = np.mean(grad_norms)
+                f.write(f"Gradient norm - Max: {max_grad:.6f}, " 
+                        f"Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n")
+                
+                # 勾配消失/爆発チェック
+                vanishing_threshold = 1e-6
+                exploding_threshold = 1e2
+                
+                vanishing_grad = any(grad < vanishing_threshold for grad in grad_norms)
+                exploding_grad = any(grad > exploding_threshold for grad in grad_norms)
+                
+                f.write(f"Gradient vanishing detected: {vanishing_grad}\n")
+                f.write(f"Gradient exploding detected: {exploding_grad}\n\n")
+            
+            # 結論
+            f.write("4. CONCLUSION\n")
+            f.write("-------------\n")
+            
+            # 最適化の成功判定
+            successful = loss_reduction > 50 and final_loss < initial_loss * 0.5
+            
+            if successful:
+                f.write("Optimization appears to be SUCCESSFUL based on significant loss reduction.\n\n")
+            else:
+                f.write("Optimization may have ISSUES based on limited loss reduction.\n\n")
+                
+            # 潜在的な問題点のレポート
+            issues = []
+            if not is_monotonic and oscillation_count > len(loss_history) * 0.1:
+                issues.append("- Loss exhibits significant oscillations, suggesting unstable optimization.")
+                
+            if plateau_count > len(loss_history) * 0.3:
+                issues.append("- Loss exhibits plateaus, suggesting the optimizer may be struggling to make progress.")
+            
+            if E_raw_history.shape[0] > 0:
+                U, S, V = np.linalg.svd(E_raw_history[-1])
+                if S[0]/S[1] > 1.1:
+                    issues.append(f"- Final σ1/σ2 ratio ({S[0]/S[1]:.2f}) is not close to 1.0, " 
+                                  "which violates Essential matrix constraints.")
+                
+                if S[2] > 0.01:
+                    issues.append(f"- Final σ3 value ({S[2]:.2e}) is not close to 0.0, "
+                                  "which violates Essential matrix rank-2 constraint.")
+            
+            if len(grad_history_np) > 0:
+                if vanishing_grad:
+                    issues.append("- Gradients approach zero, suggesting vanishing gradient issues.")
+                    
+                if exploding_grad:
+                    issues.append("- Gradients are very large, suggesting exploding gradient issues.")
+            
+            if issues:
+                f.write("Potential issues detected:\n")
+                for issue in issues:
+                    f.write(issue + "\n")
+            else:
+                f.write("No significant optimization issues detected.\n")
+                
+            # 最適化改善のための提案
+            f.write("\n5. SUGGESTIONS FOR IMPROVEMENT\n")
+            f.write("------------------------------\n")
+            
+            suggestions = []
+            
+            if len(grad_history_np) > 0 and exploding_grad:
+                suggestions.append("- Consider using a smaller learning rate or increasing gradient clipping threshold.")
+                
+            if len(grad_history_np) > 0 and vanishing_grad:
+                suggestions.append("- Consider using a larger learning rate or different optimizer (e.g. Adam).")
+                
+            if oscillation_count > len(loss_history) * 0.2:
+                suggestions.append("- Increase momentum or add decay to learning rate to stabilize optimization.")
+                
+            if plateau_count > len(loss_history) * 0.4:
+                suggestions.append("- Try different learning rate schedule or optimizer to escape plateaus.")
+                
+            if E_raw_history.shape[0] > 0:
+                U, S, V = np.linalg.svd(E_raw_history[-1])
+                if S[0]/S[1] > 1.1 or S[2] > 0.01:
+                    suggestions.append("- Consider more frequent or more accurate projections onto the Essential matrix manifold.")
+                    suggestions.append("- Try different initialization or parameterization of the Essential matrix.")
+            
+            if len(suggestions) > 0:
+                for suggestion in suggestions:
+                    f.write(suggestion + "\n")
+            else:
+                f.write("No specific improvements needed. The optimization appears to be well-configured.\n")
+        
+        print(f"Saved Essential matrix optimization diagnostics to {output_dir}")
+
+    def optimize_with_essential_geoopt(
+        self,
+        max_iter: int = 5000,
+        tol: float = 1e-6,
+        save_diagnostics: bool = True,
+        diagnostics_dir: Optional[str] = None,
+        rot_lr: float = 5e-3,
+        trans_lr: float = 5e-3,
+        grad_clip: Optional[float] = None,
+        seed: Optional[int] = None
+    ):
+        """
+        Camera-2 の姿勢 (R_wc, t̂_wc) を
+            (R, t̂) ∈ SO(3) × S²
+        の **製品多様体** 上で内在的に最適化し，
+        Fundamental matrix を経由して
+        Optimal-Transport 誤差を最小化する。
+
+        * **R_wc** : world→camera₂ 回転（3×3）
+        * **t̂_wc**: camera 水平移動方向（単位ベクトル）
+          -  Essential/Fundamental 行列はスケール自由なので長さは 1 で十分  
+          -  スケールを同時に探したければ別の ℝ パラメータを掛けても OK
+        """
+        import os, math, geoopt, torch
+        from tqdm import tqdm
+        import matplotlib.pyplot as plt
+
+        # -------------------- 出力セットアップ -------------------- #
+        results_dir = os.path.join("results", "transport_geoopt")
+        os.makedirs(results_dir, exist_ok=True)
+        diagnostics_dir = diagnostics_dir or os.path.join(
+            "results", "diagnostics_geoopt")
+        os.makedirs(diagnostics_dir, exist_ok=True)
+
+        # -------------------- 乱数シード -------------------- #
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        # -------------------- Manifold パラメータ -------------------- #
+        #   Geoopt 0.6 以降: SO() と Sphere()
+        so3_manifold = geoopt.manifolds.special_orthogonal.SO()
+        s2_manifold  = geoopt.manifolds.sphere.Sphere()
+
+        # 既に初期値を持っていれば流用（例: QCQP-SDP 初期化後）
+        if not hasattr(self, "R_wc_param") or not hasattr(self, "t_hat_param"):
+            R0 = torch.eye(3, device=self.device)
+            t0 = torch.tensor([1.0, 0.0, 0.0], device=self.device)  # +X 方向
+            self.R_wc_param = geoopt.ManifoldParameter(
+                R0, manifold=so3_manifold)
+            self.t_hat_param = geoopt.ManifoldParameter(
+                t0 / t0.norm(), manifold=s2_manifold)
+
+        # -------------------- Optimizer -------------------- #
+        optimizer = geoopt.optim.RiemannianAdam(
+            [
+                {"params": [self.R_wc_param], "lr": rot_lr},
+                {"params": [self.t_hat_param], "lr": trans_lr},
+            ]
+        )
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=0.8 ** (1 / 100)
+        )
+
+        # -------------------- ログ・診断用変数 -------------------- #
+        loss_history = []
+        # 詳細な診断のためのパラメータと勾配履歴
+        R_param_history = []
+        t_param_history = []
+        R_grad_history = []
+        t_grad_history = []
+        E_history = []  # Essential matrix履歴
+        F_history = []  # Fundamental matrix履歴
+        
+        # デバッグログ設定
+        debug_log_path = os.path.join(diagnostics_dir, "gradient_debug_geoopt.log")
+        with open(debug_log_path, 'w') as f:
+            f.write("Iteration,Loss,R_Grad_Norm,t_Grad_Norm,R_t_Grad_Ratio\n")
+
+        # -------------------- メインループ -------------------- #
+        pbar = tqdm(range(max_iter), desc="Optimizing (SO3×S2)", leave=True)
+        prev_loss = float("inf")
+        
+        for it in pbar:
+            optimizer.zero_grad()
+
+            R_wc = self.R_wc_param                  # (3,3) on-manifold
+            t_wc = self.t_hat_param                 # (3,)  unit vector
+
+            # Fundamental matrix → Cost → Transport → Loss
+            F = self._build_F_from_wc(R_wc, t_wc)   
+            C = self.compute_cost_matrix_fundamental(F)  
+            T = self.unbalanced_sinkhorn_algorithm(C)    
+            loss = (T * C).sum()
+
+            loss.backward()
+
+            # ------------ 勾配クリッピング (任意) ------------ #
+            if grad_clip is not None:
+                geoopt.utils.clip_grad_norm_(
+                    [self.R_wc_param, self.t_hat_param], grad_clip
+                )
+
+            # 勾配ノルムのモニタと診断情報の記録
+            with torch.no_grad():
+                # 勾配ノルムの計算
+                gR = self.R_wc_param.grad.norm().item()
+                gt = self.t_hat_param.grad.norm().item()
+                r_t_ratio = gR / (gt + 1e-10)
+                
+                # Essential matrix計算（診断用）
+                E = self.lie.skew_symmetric(t_wc) @ R_wc
+                
+                # 履歴の記録
+                loss_history.append(loss.item())
+                R_param_history.append(R_wc.detach().clone())
+                t_param_history.append(t_wc.detach().clone())
+                R_grad_history.append(self.R_wc_param.grad.detach().clone() if self.R_wc_param.grad is not None else None)
+                t_grad_history.append(self.t_hat_param.grad.detach().clone() if self.t_hat_param.grad is not None else None)
+                E_history.append(E.detach().clone())
+                F_history.append(F.detach().clone())
+                
+                # デバッグログに記録
+                with open(debug_log_path, 'a') as f:
+                    f.write(f"{it},{loss.item():.8f},{gR:.8f},{gt:.8f},{r_t_ratio:.8f}\n")
+                
+                # 定期的な詳細ログ出力
+                if it % 20 == 0:
+                    # Essential matrixの特異値分析
+                    U, S, Vh = torch.linalg.svd(E, full_matrices=False)
+                    print(f"\nIteration {it}")
+                    print(f"  Loss: {loss.item():.8f}")
+                    print(f"  R grad norm: {gR:.8f}, t grad norm: {gt:.8f}, ratio: {r_t_ratio:.3f}")
+                    print(f"  E singular values: {S.cpu().numpy()}")
+                    print(f"  σ1/σ2 ratio: {(S[0]/S[1]).item():.3f} (ideal: 1.0)")
+                    print(f"  σ3 value: {S[2].item():.6f} (ideal: 0.0)")
+
+            optimizer.step()
+            scheduler.step()
+
+            # --------- 収束チェック --------- #
+            curr_loss = loss.item()
+            pbar.set_postfix(
+                loss=f"{curr_loss:.6f}",
+                gR=f"{gR:.4f}",
+                gt=f"{gt:.4f}",
+                r_t=f"{r_t_ratio:.2f}",  # r/t から r_t に変更
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+            )
+            if it > 5 and abs(prev_loss - curr_loss) < tol:
+                pbar.set_description("Converged")
+                break
+            prev_loss = curr_loss
+
+            # --------- 途中の Transport 可視化 (20iter 毎) --------- #
+            if it % 20 == 0 or it == max_iter - 1:
+                with torch.no_grad():
+                    T_np = T.detach().cpu().numpy()
+                    rows, cols = T_np.shape
+                    aspect_ratio = cols / rows
+                    if rows > cols:
+                        fig_width = 8
+                        fig_height = min(20, fig_width / aspect_ratio)
+                    else:
+                        fig_height = 6
+                        fig_width = min(20, fig_height * aspect_ratio)
+                        
+                    plt.figure(figsize=(fig_width, fig_height))
+                    
+                    if rows > 1000 or cols > 1000:
+                        downsample_factor = max(1, int(max(rows, cols) / 1000))
+                        t_np_display = T_np[::downsample_factor, ::downsample_factor]
+                        plt.imshow(t_np_display, cmap="hot", interpolation="nearest", aspect="auto")
+                        plt.title(f"Transport Plan at Iteration {it} (Downsampled {downsample_factor}x)")
+                    else:
+                        plt.imshow(T_np, cmap="hot", interpolation="nearest", aspect="auto")
+                        plt.title(f"Transport Plan at Iteration {it}")
+                        
+                    plt.colorbar(label="Transport")
+                    plt.xlabel("Image 2 Gaussians")
+                    plt.ylabel("Image 1 Gaussians")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(results_dir, f"transport_iter_{it:05d}.png"), dpi=150)
+                    plt.close()
+
+        # -------------------- 最終保存 -------------------- #
+        with torch.no_grad():
+            self.R_wc = self.R_wc_param.detach()
+            self.t_wc = self.t_hat_param.detach()
+            self.f = self._build_F_from_wc(self.R_wc, self.t_wc)
+            # 解析用に SE(3) 形式 (camera→world) も保持
+            self.R_cw = self.R_wc.t()
+            self.t_cw = -self.R_cw @ self.t_wc
+            
+            # 最終Essential matrixの保存
+            final_E = self.lie.skew_symmetric(self.t_wc) @ self.R_wc
+            self.E_raw = nn.Parameter(final_E)
+            
+            # OpenCV形式のパラメータも保存
+            if cv2 is not None:
+                rvec_numpy, _ = cv2.Rodrigues(self.R_wc.cpu().numpy())
+                self.rvec = nn.Parameter(torch.from_numpy(rvec_numpy).to(self.device))
+                self.tvec = nn.Parameter(self.t_cw)
+                rvec_cw_numpy, _ = cv2.Rodrigues(self.R_cw.cpu().numpy())
+                self.rvec_cw = nn.Parameter(torch.from_numpy(rvec_cw_numpy).to(self.device))
+                self.center = nn.Parameter(self.t_cw)
+
+        # --------- 損失曲線 --------- #
+        plt.figure(figsize=(10, 6))
+        plt.plot(loss_history, "-o", markersize=3)
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title("Loss (optimize_with_essential_geoopt)")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, "loss_curve.png"), dpi=150)
+        plt.close()
+
+        # --------- 診断情報の保存 --------- #
+        if save_diagnostics:
+            # 簡易グラフ：勾配ノルム
+            plt.figure(figsize=(10, 6))
+            R_grad_norms = [g.norm().item() if g is not None else 0 for g in R_grad_history]
+            t_grad_norms = [g.norm().item() if g is not None else 0 for g in t_grad_history]
+            plt.semilogy(R_grad_norms, 'r-', label="‖grad R‖")
+            plt.semilogy(t_grad_norms, 'b-', label="‖grad t̂‖")
+            plt.legend(); plt.grid(True)
+            plt.title("Gradient norms")
+            plt.xlabel("Iteration")
+            plt.ylabel("Norm (log scale)")
+            plt.tight_layout()
+            plt.savefig(os.path.join(diagnostics_dir, "grad_norm.png"), dpi=150)
+            plt.close()
+            
+            # 詳細な診断情報
+            self.save_optimization_diagnostics_geoopt(
+                output_dir=diagnostics_dir,
+                loss_history=loss_history,
+                R_param_history=R_param_history,
+                t_param_history=t_param_history,
+                R_grad_history=R_grad_history,
+                t_grad_history=t_grad_history,
+                E_history=E_history
+            )
+
+        print(f"[Geoopt] finished after {it+1} iterations, final loss = {curr_loss:.6f}")
+        return loss_history
+
+    def save_optimization_diagnostics_geoopt(self, 
+                                    output_dir: str,
+                                    loss_history: list,
+                                    R_param_history: list,
+                                    t_param_history: list,
+                                    R_grad_history: list,
+                                    t_grad_history: list,
+                                    E_history: list) -> None:
+        """
+        SO(3)×S²リーマン多様体上での最適化の詳細な診断情報を保存します。
+        
+        Args:
+            output_dir: 診断ファイルを保存するディレクトリ
+            loss_history: 各イテレーションでの損失値
+            R_param_history: 各イテレーションでの回転行列パラメータ (SO(3))
+            t_param_history: 各イテレーションでの並進単位ベクトル (S²)
+            R_grad_history: 各イテレーションでのRの勾配
+            t_grad_history: 各イテレーションでのtの勾配
+            E_history: 各イテレーションでのEssential matrix
+        """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        # 出力ディレクトリの作成
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # リスト→NumPy配列への変換
+        iterations = range(len(loss_history))
+        
+        # 勾配ノルム計算
+        R_grad_norms = np.array([g.norm().item() if g is not None else 0 for g in R_grad_history])
+        t_grad_norms = np.array([g.norm().item() if g is not None else 0 for g in t_grad_history])
+        total_grad_norms = np.sqrt(R_grad_norms**2 + t_grad_norms**2)
+        
+        # 勾配比率 (R/t)
+        R_t_ratios = R_grad_norms / (t_grad_norms + 1e-10)
+        
+        # パラメータをNumPy配列に変換
+        R_params_np = np.array([R.cpu().numpy() for R in R_param_history])
+        t_params_np = np.array([t.cpu().numpy() for t in t_param_history])
+        
+        # Essential matrixの特異値履歴
+        singular_values = []
+        for E in E_history:
+            U, S, Vh = torch.linalg.svd(E, full_matrices=False)
+            singular_values.append(S.cpu().numpy())
+        
+        singular_values = np.array(singular_values)
+        
+        # ======================= 1. 損失軌跡の分析 =======================
+        plt.figure(figsize=(12, 8))
+        plt.subplot(211)
+        plt.plot(iterations, loss_history, 'b-', linewidth=2)
+        plt.title('Loss Value During Optimization (SO(3)×S²)')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        
+        # 損失の変化率
+        if len(loss_history) > 1:
+            plt.subplot(212)
+            loss_changes = np.array([loss_history[i+1] - loss_history[i] 
+                                    for i in range(len(loss_history)-1)])
+            plt.plot(iterations[:-1], loss_changes, 'r-')
+            plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+            plt.title('Loss Change Between Iterations')
+            plt.xlabel('Iteration')
+            plt.ylabel('Loss Difference')
+            plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'loss_analysis_geoopt.png'), dpi=150)
+        plt.close()
+        
+        # ======================= 2. 勾配分析 =======================
+        fig = plt.figure(figsize=(15, 12))
+        gs = GridSpec(3, 1, figure=fig)
+        
+        # 総合勾配ノルム
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.plot(iterations, total_grad_norms, 'k-', linewidth=2, label='Total')
+        ax1.plot(iterations, R_grad_norms, 'r-', linewidth=1.5, label='SO(3)')
+        ax1.plot(iterations, t_grad_norms, 'b-', linewidth=1.5, label='S²')
+        ax1.set_title('Riemannian Gradient Magnitude')
+        ax1.set_xlabel('Iteration')
+        ax1.set_ylabel('Gradient Norm')
+        ax1.set_yscale('log')
+        ax1.grid(True)
+        ax1.legend()
+        
+        # R/t勾配比率
+        ax2 = fig.add_subplot(gs[1, 0])
+        ax2.plot(iterations, R_t_ratios, 'g-', linewidth=2)
+        ax2.axhline(y=1.0, color='r', linestyle='--', alpha=0.7, label='Balanced ratio (1.0)')
+        ax2.set_title('Ratio of SO(3) to S² Gradient Norms')
+        ax2.set_xlabel('Iteration')
+        ax2.set_ylabel('Ratio')
+        ax2.set_yscale('log')
+        ax2.grid(True)
+        ax2.legend()
+        
+        # 特徴的な勾配成分の可視化
+        if len(R_grad_history) > 0 and R_grad_history[0] is not None:
+            # Rの重要な勾配成分を抽出
+            R_grad_components = []
+            for g in R_grad_history:
+                if g is not None:
+                    # 行列ノルムが最大の行を選択
+                    row_norms = torch.norm(g, dim=1)
+                    max_row_idx = torch.argmax(row_norms).item()
+                    R_grad_components.append(g[max_row_idx].cpu().numpy())
+                else:
+                    R_grad_components.append(np.zeros(3))
+            
+            R_grad_components = np.array(R_grad_components)
+            
+            ax3 = fig.add_subplot(gs[2, 0])
+            for i in range(3):
+                ax3.plot(iterations, R_grad_components[:, i], '-', label=f'R_grad[{i}]')
+            
+            for i in range(3):
+                ax3.plot(iterations, [g[i].item() if g is not None else 0 for g in t_grad_history], 
+                        '--', label=f't_grad[{i}]')
+            
+            ax3.set_title('Selected Gradient Components')
+            ax3.set_xlabel('Iteration')
+            ax3.set_ylabel('Value')
+            ax3.grid(True)
+            ax3.legend(ncol=2)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'gradient_analysis_geoopt.png'), dpi=150)
+        plt.close()
+        
+        # ======================= 3. Essential matrix特異値分析 =======================
+        plt.figure(figsize=(12, 8))
+        
+        # 特異値
+        plt.subplot(211)
+        plt.plot(iterations, singular_values[:, 0], 'r-', label='σ₁')
+        plt.plot(iterations, singular_values[:, 1], 'g-', label='σ₂')
+        plt.plot(iterations, singular_values[:, 2], 'b-', label='σ₃')
+        plt.title('Singular Values of Essential Matrix')
+        plt.xlabel('Iteration')
+        plt.ylabel('Value')
+        plt.grid(True)
+        plt.legend()
+        
+        # σ₁/σ₂比率と σ₃
+        plt.subplot(212)
+        sigma_ratios = singular_values[:, 0] / (singular_values[:, 1] + 1e-10)
+        plt.plot(iterations, sigma_ratios, 'r-', label='σ₁/σ₂ (ideal: 1.0)')
+        plt.plot(iterations, singular_values[:, 2], 'b-', label='σ₃ (ideal: 0.0)')
+        plt.title('Essential Matrix Constraints')
+        plt.xlabel('Iteration')
+        plt.ylabel('Value')
+        plt.grid(True)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'essential_matrix_analysis_geoopt.png'), dpi=150)
+        plt.close()
+        
+        # ======================= 4. 3D単位並進ベクトル軌跡の可視化 =======================
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # 単位球面の表示
+        u = np.linspace(0, 2 * np.pi, 20)
+        v = np.linspace(0, np.pi, 20)
+        x = 0.98 * np.outer(np.cos(u), np.sin(v))
+        y = 0.98 * np.outer(np.sin(u), np.sin(v))
+        z = 0.98 * np.outer(np.ones_like(u), np.cos(v))
+        ax.plot_surface(x, y, z, color='lightgray', alpha=0.2)
+        
+        # t_hatの軌跡プロット
+        ax.plot(t_params_np[:, 0], t_params_np[:, 1], t_params_np[:, 2], 'r-', linewidth=2)
+        ax.scatter(t_params_np[0, 0], t_params_np[0, 1], t_params_np[0, 2], 
+                   c='g', s=100, label='Initial')
+        ax.scatter(t_params_np[-1, 0], t_params_np[-1, 1], t_params_np[-1, 2], 
+                   c='b', s=100, label='Final')
+        
+        ax.set_title('Translation Direction on Unit Sphere (S²)')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 't_trajectory_3d_geoopt.png'), dpi=150)
+        plt.close()
+        
+        # ======================= 5. 回転行列の進化分析 =======================
+        # 回転行列の一部の要素を可視化
+        plt.figure(figsize=(12, 8))
+        
+        # 対角要素
+        plt.subplot(211)
+        for i in range(3):
+            plt.plot(iterations, R_params_np[:, i, i], '-', label=f'R[{i},{i}]')
+        plt.title('Diagonal Elements of Rotation Matrix')
+        plt.xlabel('Iteration')
+        plt.ylabel('Value')
+        plt.grid(True)
+        plt.legend()
+        
+        # オイラー角への変換（近似的）
+        euler_angles = []
+        for R in R_params_np:
+            # 簡易的なオイラー角抽出（厳密にはログマップが必要）
+            try:
+                if np.abs(R[2, 0]) < 1:
+                    theta = -np.arcsin(R[2, 0])
+                    phi = np.arctan2(R[2, 1]/np.cos(theta), R[2, 2]/np.cos(theta))
+                    psi = np.arctan2(R[1, 0]/np.cos(theta), R[0, 0]/np.cos(theta))
+                else:  # gimbal lock
+                    phi = 0
+                    if R[2, 0] == -1:
+                        theta = np.pi/2
+                        psi = phi + np.arctan2(R[0, 1], R[0, 2])
+                    else:
+                        theta = -np.pi/2
+                        psi = -phi + np.arctan2(-R[0, 1], -R[0, 2])
+                euler_angles.append([phi, theta, psi])
+            except:
+                euler_angles.append([0, 0, 0])  # fallback
+        
+        euler_angles = np.array(euler_angles)
+        
+        # オイラー角プロット
+        plt.subplot(212)
+        labels = ['φ (roll)', 'θ (pitch)', 'ψ (yaw)']
+        for i in range(3):
+            plt.plot(iterations, euler_angles[:, i], '-', label=labels[i])
+        plt.title('Approximate Euler Angles')
+        plt.xlabel('Iteration')
+        plt.ylabel('Angle (rad)')
+        plt.grid(True)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'rotation_analysis_geoopt.png'), dpi=150)
+        plt.close()
+        
+        # ======================= 6. テキスト形式のサマリーレポート =======================
+        with open(os.path.join(output_dir, 'optimization_summary_geoopt.txt'), 'w') as f:
+            f.write("SO(3)×S² RIEMANNIAN OPTIMIZATION PROCESS ANALYSIS\n")
+            f.write("==============================================\n\n")
+            
+            # 損失分析
+            f.write("1. LOSS BEHAVIOR\n")
+            f.write("----------------\n")
+            initial_loss = loss_history[0]
+            final_loss = loss_history[-1]
+            loss_reduction = (initial_loss - final_loss) / initial_loss * 100 if initial_loss != 0 else 0
+            
+            f.write(f"Initial loss: {initial_loss:.6f}\n")
+            f.write(f"Final loss: {final_loss:.6f}\n")
+            f.write(f"Total loss reduction: {loss_reduction:.2f}%\n\n")
+            
+            # 単調減少性チェック
+            if len(loss_history) > 1:
+                is_monotonic = all(loss_history[i] >= loss_history[i+1] for i in range(len(loss_history)-1))
+                f.write(f"Loss decreases monotonically: {is_monotonic}\n")
+                
+                # 振動とプラトーの検出
+                oscillation_count = sum(1 for i in range(len(loss_history)-2) 
+                                       if (loss_history[i] > loss_history[i+1] and 
+                                           loss_history[i+1] < loss_history[i+2]))
+                
+                plateau_threshold = 1e-6
+                plateau_count = sum(1 for i in range(len(loss_history)-1) 
+                                  if abs(loss_history[i] - loss_history[i+1]) < plateau_threshold)
+                
+                f.write(f"Number of oscillations: {oscillation_count}\n")
+                f.write(f"Number of plateaus: {plateau_count}\n\n")
+            
+            # 勾配分析
+            f.write("2. GRADIENT BEHAVIOR\n")
+            f.write("-------------------\n")
+            
+            # 勾配の統計
+            max_grad = np.max(total_grad_norms)
+            min_grad = np.min(total_grad_norms)
+            avg_grad = np.mean(total_grad_norms)
+            f.write(f"Gradient norm - Max: {max_grad:.6f}, " 
+                    f"Min: {min_grad:.6f}, Avg: {avg_grad:.6f}\n")
+            
+            # R/t勾配比率
+            avg_ratio = np.mean(R_t_ratios)
+            max_ratio = np.max(R_t_ratios)
+            min_ratio = np.min(R_t_ratios)
+            f.write(f"SO(3)/S² gradient ratio - Avg: {avg_ratio:.3f}, Max: {max_ratio:.3f}, Min: {min_ratio:.3f}\n")
+            f.write(f"This ratio shows the balance between rotation and translation optimization.\n")
+            f.write(f"Previous SE(3) optimization typically showed ratios of 200-800.\n\n")
+            
+            # Essential matrix分析
+            f.write("3. ESSENTIAL MATRIX PROPERTIES\n")
+            f.write("----------------------------\n")
+            
+            # 最終特異値
+            final_sv = singular_values[-1]
+            final_ratio = final_sv[0] / final_sv[1]
+            f.write(f"Final singular values: {final_sv[0]:.6f}, {final_sv[1]:.6f}, {final_sv[2]:.6f}\n")
+            f.write(f"σ₁/σ₂ ratio: {final_ratio:.6f} (ideal: 1.0)\n")
+            f.write(f"σ₃ value: {final_sv[2]:.6e} (ideal: 0.0)\n\n")
+            
+            # 理論的な制約チェック
+            sv_constraint_satisfied = final_ratio < 1.1 and final_sv[2] < 0.01
+            f.write(f"Essential matrix constraints are {'satisfied' if sv_constraint_satisfied else 'NOT fully satisfied'}.\n\n")
+            
+            # 最終ソリューション
+            f.write("4. FINAL SOLUTION\n")
+            f.write("---------------\n")
+            
+            f.write("Final rotation matrix R_wc:\n")
+            for i in range(3):
+                f.write(f"  {R_params_np[-1, i, 0]:8.5f}  {R_params_np[-1, i, 1]:8.5f}  {R_params_np[-1, i, 2]:8.5f}\n")
+            
+            f.write("\nFinal translation direction t̂_wc:\n")
+            f.write(f"  {t_params_np[-1, 0]:8.5f}  {t_params_np[-1, 1]:8.5f}  {t_params_np[-1, 2]:8.5f}\n\n")
+            
+            # リーマン多様体最適化の利点
+            f.write("5. ADVANTAGES OF RIEMANNIAN OPTIMIZATION\n")
+            f.write("------------------------------------\n")
+            f.write("- Natural 5 DoF parameterization on SO(3)×S² product manifold\n")
+            f.write("- Balanced gradients between rotation and translation components\n")
+            f.write(f"  (Average SO(3)/S² gradient ratio: {avg_ratio:.3f})\n")
+            f.write("- Automatic retraction onto manifold at each step\n")
+            f.write("- Separate learning rates for rotation and translation\n")
+            f.write("- Inherent handling of Essential matrix constraints\n\n")
+            
+            # 結論
+            f.write("6. CONCLUSION AND NEXT STEPS\n")
+            f.write("---------------------------\n")
+            
+            # 最適化の成功判定
+            successful = loss_reduction > 50 and final_loss < initial_loss * 0.5
+            
+            if successful:
+                f.write("Optimization appears to be SUCCESSFUL based on significant loss reduction.\n\n")
+            else:
+                f.write("Optimization may have ISSUES based on limited loss reduction.\n\n")
+            
+            # 潜在的な問題点
+            issues = []
+            if len(loss_history) > 2 and (not is_monotonic and oscillation_count > len(loss_history) * 0.1):
+                issues.append("- Loss exhibits significant oscillations, suggesting learning rate may be too high.")
+                
+            if final_ratio > 1.1:
+                issues.append(f"- Final σ₁/σ₂ ratio ({final_ratio:.2f}) is not close to 1.0")
+                
+            if final_sv[2] > 0.01:
+                issues.append(f"- Final σ₃ value ({final_sv[2]:.2e}) is not close to 0.0")
+            
+            if issues:
+                f.write("Potential issues detected:\n")
+                for issue in issues:
+                    f.write(issue + "\n")
+                f.write("\n")
+            else:
+                f.write("No significant optimization issues detected.\n\n")
+                
+            # 次のステップ
+            f.write("Next steps:\n")
+            f.write("- Perform chirality check for the correct solution\n")
+            f.write("- Consider using QCQP-SDP initialization for global optimality\n")
+            f.write("- Triangulate 3D Gaussians using the optimized pose\n")
+            f.write("- If absolute scale is needed, extend with a scale parameter\n")
+        
+        print(f"Saved detailed SO(3)×S² optimization diagnostics to {output_dir}")
+
