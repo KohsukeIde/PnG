@@ -3,10 +3,8 @@ import os,sys,time
 import torch
 import torch.nn.functional as torch_F
 import collections
-from easydict import EasyDict as edict
+# from easydict import EasyDict as edict
 
-import util
-from util import log,debug
 
 class Pose():
     """
@@ -275,33 +273,33 @@ def rotation_distance(R1,R2,eps=1e-7):
     angle = ((trace-1)/2).clamp(-1+eps,1-eps).acos_() # numerical stability near -1/+1
     return angle
 
-def procrustes_analysis(X0,X1): # [N,3]
-    # translation
-    t0 = X0.mean(dim=0,keepdim=True)
-    t1 = X1.mean(dim=0,keepdim=True)
-    X0c = X0-t0
-    X1c = X1-t1
-    # scale
-    s0 = (X0c**2).sum(dim=-1).mean().sqrt()
-    s1 = (X1c**2).sum(dim=-1).mean().sqrt()
-    X0cs = X0c/s0
-    X1cs = X1c/s1
-    # rotation (use double for SVD, float loses precision)
-    U,S,V = (X0cs.t()@X1cs).double().svd(some=True)
-    R = (U@V.t()).float()
-    if R.det()<0: R[2] *= -1
-    # align X1 to X0: X1to0 = (X1-t1)/s1@R.t()*s0+t0
-    sim3 = edict(t0=t0[0],t1=t1[0],s0=s0,s1=s1,R=R)
-    return sim3
+# def procrustes_analysis(X0,X1): # [N,3]
+#     # translation
+#     t0 = X0.mean(dim=0,keepdim=True)
+#     t1 = X1.mean(dim=0,keepdim=True)
+#     X0c = X0-t0
+#     X1c = X1-t1
+#     # scale
+#     s0 = (X0c**2).sum(dim=-1).mean().sqrt()
+#     s1 = (X1c**2).sum(dim=-1).mean().sqrt()
+#     X0cs = X0c/s0
+#     X1cs = X1c/s1
+#     # rotation (use double for SVD, float loses precision)
+#     U,S,V = (X0cs.t()@X1cs).double().svd(some=True)
+#     R = (U@V.t()).float()
+#     if R.det()<0: R[2] *= -1
+#     # align X1 to X0: X1to0 = (X1-t1)/s1@R.t()*s0+t0
+#     sim3 = edict(t0=t0[0],t1=t1[0],s0=s0,s1=s1,R=R)
+#     return sim3
 
-def get_novel_view_poses(opt,pose_anchor,N=60,scale=1):
-    # create circular viewpoints (small oscillations)
-    theta = torch.arange(N)/N*2*np.pi
-    R_x = angle_to_rotation_matrix((theta.sin()*0.05).asin(),"X")
-    R_y = angle_to_rotation_matrix((theta.cos()*0.05).asin(),"Y")
-    pose_rot = pose(R=R_y@R_x)
-    pose_shift = pose(t=[0,0,-4*scale])
-    pose_shift2 = pose(t=[0,0,3.8*scale])
-    pose_oscil = pose.compose([pose_shift,pose_rot,pose_shift2])
-    pose_novel = pose.compose([pose_oscil,pose_anchor.cpu()[None]])
-    return pose_novel
+# def get_novel_view_poses(opt,pose_anchor,N=60,scale=1):
+#     # create circular viewpoints (small oscillations)
+#     theta = torch.arange(N)/N*2*np.pi
+#     R_x = angle_to_rotation_matrix((theta.sin()*0.05).asin(),"X")
+#     R_y = angle_to_rotation_matrix((theta.cos()*0.05).asin(),"Y")
+#     pose_rot = pose(R=R_y@R_x)
+#     pose_shift = pose(t=[0,0,-4*scale])
+#     pose_shift2 = pose(t=[0,0,3.8*scale])
+#     pose_oscil = pose.compose([pose_shift,pose_rot,pose_shift2])
+#     pose_novel = pose.compose([pose_oscil,pose_anchor.cpu()[None]])
+#     return pose_novel
