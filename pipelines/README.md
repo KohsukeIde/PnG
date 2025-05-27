@@ -2,7 +2,7 @@
 
 ## Overview
 
-Perspective-n-Gaussians (PnG) proposes a novel approach to overcoming the limitations of Gaussian Splatting (GS) in reconstructing complex 3D scenes, particularly where traditional Structure-from-Motion (SfM) techniques fail. This work addresses critical challenges by reframing image and geometry matching as optimal transport problems, enabling robust camera and geometry reconstruction even in challenging environments while preserving all plausible solutions.
+Perspective-n-Gaussians (PnG) proposes a novel approach to overcoming the limitations of Gaussian Splatting (GS) in reconstructing complex 3D scenes, particularly where traditional Structure-from-Motion (SfM) techniques fail (such as textureless or a scene with repeating texture. meaning that utilizing the traditional "feature points" is not possible). This work addresses critical challenges by reframing image and geometry matching as optimal transport problems, enabling robust camera and geometry reconstruction even in challenging environments while preserving all plausible solutions.
 
 ---
 
