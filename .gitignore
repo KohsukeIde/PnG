@@ -31,3 +31,6 @@ utils/test.py
 utils/rodrigues_comparison.png
 utils/rodrigues_gradient_comparison.png
 utils/rodrigues_numerical_comparison.png
+perspective_n_gaussian.pdf
+overview.tex
+/.kiro/*
