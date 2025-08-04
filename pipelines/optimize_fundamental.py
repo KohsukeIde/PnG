@@ -31,11 +31,11 @@ def get_top_correspondences_fundamental(solver, num_points=100):
     with torch.no_grad():
         cost_matrix = solver.compute_cost_matrix_fundamental(solver.f)
         transport_matrix = solver.unbalanced_sinkhorn_algorithm(cost_matrix)
-    
+
     T_np = transport_matrix.cpu().numpy()
     points1 = solver.means1.cpu().numpy()
     points2 = solver.means2.cpu().numpy()
-    
+
     print(f"Transport matrix shape: {T_np.shape}")
     print(f"Transport matrix min value: {T_np.min()}")
     print(f"Transport matrix max value: {T_np.max()}")
@@ -47,7 +47,7 @@ def get_top_correspondences_fundamental(solver, num_points=100):
 
     flat_indices = np.argsort(-T_np.ravel())  # 降順ソート
     rows, cols = np.unravel_index(flat_indices, T_np.shape)
-    
+
     for row, col in zip(rows, cols):
         if len(matches) >= num_points:
             break
@@ -247,8 +247,7 @@ def main():
     solver.f = None
     # 7) Optimize with Fundamental
     print("\n--- Optimizing Fundamental Matrix ---")
-    solver.optimize_with_RT(max_iter=1000, tol=1e-6)
-    # solver.optimize_with_fundamental(max_iter=1000, tol=1e-6)
+    solver.optimize_with_SE3(max_iter=1000, tol=1e-6)
 
     print("Initial F from ransac")
     print(F_ransac)
