@@ -107,8 +107,8 @@ def test_noise_injection():
     
     # Test with noise
     noise_params = NoiseParams(
-        position_noise_std=0.05,
-        color_noise_std=0.1
+        position_noise=0.05,
+        color_noise=0.1
     )
     
     noisy_gaussians = generator.add_controlled_noise(base_gaussians, noise_params)

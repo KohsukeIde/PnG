@@ -29,200 +29,91 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 
 
 def analyze_transport_matrices():
-    """Analyze transport matrices under different transformation scenarios."""
-    print("=== Analyzing Transport Matrices ===\n")
+    """Analyze transport matrices under epipolar-consistent scenarios (GT F + Sampson)."""
+    print("=== Analyzing Transport Matrices (Epipolar-Consistent) ===\n")
 
-    # Create visualizer
     visualizer = TransportMatrixVisualizer(figures_dir=FIGURES_DIR)
-
-    # Create toy problem generator
     generator = ToyProblemGenerator(seed=42)
 
-    # Test different scenarios
-    scenarios = {
-        'identical': TransformationParams(),  # No transformation
-        'translation': TransformationParams(translation=np.array([0.3, 0.2])),
-        'rotation': TransformationParams(rotation=np.pi/4),
-        'scale': TransformationParams(scale=1.5),
-        # Color-only change (handled specially)
-        'color_change': TransformationParams(),
-        'combined': TransformationParams(
-            translation=np.array([0.2, 0.1]),
-            rotation=np.pi/6,
-            scale=1.2
-        )
-    }
+    # Intrinsics
+    K = np.array([[800, 0, 400], [0, 800, 400], [0, 0, 1]], dtype=np.float32)
 
-    # Camera intrinsics for solver
-    K = np.array([
-        [800, 0, 400],
-        [0, 800, 400],
-        [0, 0, 1]
-    ], dtype=np.float32)
+    def R_yaw(rad: float) -> np.ndarray:
+        return np.array([[np.cos(rad), 0, np.sin(rad)], [0, 1, 0], [-np.sin(rad), 0, np.cos(rad)]], dtype=np.float32)
+
+    epi_scenarios = {
+        'epi_translation': { 'R_wc': R_yaw(0.0),  't_wc': np.array([0.25, 0.02, 0.0], dtype=np.float32) },
+        'epi_yaw_rotation': { 'R_wc': R_yaw(0.12), 't_wc': np.array([0.18, 0.01, 0.02], dtype=np.float32) },
+        'epi_forward_scale_like': { 'R_wc': R_yaw(0.02), 't_wc': np.array([0.05, 0.0, 0.15], dtype=np.float32) },
+        'epi_combined': { 'R_wc': R_yaw(0.10), 't_wc': np.array([0.25, 0.02, 0.05], dtype=np.float32) },
+        'epi_color_change': { 'R_wc': R_yaw(0.08), 't_wc': np.array([0.20, 0.01, 0.03], dtype=np.float32) },
+    }
 
     transport_matrices = {}
 
-    for scenario_name, transform_params in scenarios.items():
-        print(f"\n--- Testing {scenario_name} scenario ---")
+    for name, params in epi_scenarios.items():
+        print(f"\n--- Testing {name} ---")
+        g1, g2, corr, F_gt = generator.generate_epipolar_correspondences_3dgs(
+            n_gaussians=15, K=K, R_wc=params['R_wc'], t_wc=params['t_wc']
+        )
 
-        # Generate Gaussians
-        gaussians1 = generator.generate_synthetic_gaussians(
-            n_gaussians=15, color_mode='gradient')
+        # If color-change scenario: randomize g2 colors (geometry/F unchanged)
+        if 'color_change' in name:
+            rng = np.random.RandomState(123)
+            g2.rgb = rng.uniform(0, 1, size=g2.rgb.shape).astype(np.float32)
 
-        if scenario_name == 'color_change':
-            # Create color-only change (same positions, different colors)
-            gaussians2 = generator.generate_synthetic_gaussians(
-                n_gaussians=15, color_mode='random')
-            correspondences = np.column_stack([np.arange(15), np.arange(15)])
-        else:
-            gaussians2, correspondences = generator.generate_known_correspondences(
-                gaussians1, transform_params
-            )
-
-        # Create solver with CORRECT settings (disable broken epipolar term)
         solver = OptimalTransportSolver(
-            gaussians1=gaussians1,
-            gaussians2=gaussians2,
-            k1=K,
-            k2=K,
-            epsilon=0.01,
-            lambda_mean=1.0,
-            lambda_cov=1.0,
-            lambda_color=0.5,
-            lambda_epipolar=0.0,  # Disable broken epipolar constraint
-            device='cpu'
-        )
+            gaussians1=g1, gaussians2=g2, k1=K, k2=K,
+            epsilon=0.01, lambda_color=0.5, lambda_epipolar=1.0, device='cpu')
 
-        # Compute transport matrix
         with torch.no_grad():
-            F_dummy = torch.eye(3, dtype=torch.float32)
-            cost_matrix = solver.compute_cost_matrix_fundamental(F_dummy)
-            transport_matrix = solver.unbalanced_sinkhorn_algorithm(
-                cost_matrix)
-            transport_np = transport_matrix.cpu().numpy()
+            C = solver.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
+            T = solver.unbalanced_sinkhorn_algorithm(C)
+            T_np = T.cpu().numpy()
 
-        # Store for comparison
-        transport_matrices[scenario_name] = transport_np
+        transport_matrices[name] = T_np
+        # Stats and visualizations
+        visualizer.analyze_transport_statistics(T_np, name)
+        visualizer.visualize_transport_matrix(T_np, title=f'Transport Matrix - {name}', save_path=f'transport_matrix_{name}.png')
+        visualizer.visualize_correspondences_on_images(g1, g2, T_np, save_path=f'correspondences_{name}.png')
 
-        # Analyze statistics
-        stats = visualizer.analyze_transport_statistics(
-            transport_np, scenario_name)
+    # Compare all transport matrices in one figure
+    visualizer.compare_transport_matrices(transport_matrices, save_path='transport_matrices_comparison_epipolar.png')
 
-        # Visualize individual matrix
-        visualizer.visualize_transport_matrix(
-            transport_np,
-            title=f'Transport Matrix - {scenario_name.title()}',
-            save_path=f'transport_matrix_{scenario_name}.png'
-        )
-
-        # Visualize correspondences
-        visualizer.visualize_correspondences_on_images(
-            gaussians1, gaussians2, transport_np,
-            save_path=f'correspondences_{scenario_name}.png'
-        )
-
-    # Compare all matrices
-    visualizer.compare_transport_matrices(
-        transport_matrices,
-        save_path='transport_matrices_comparison.png'
-    )
-
-    print("\n🎉 Transport matrix analysis completed!")
+    print("\n🎉 Transport matrix analysis (epipolar) completed!")
     print(f"Check the {FIGURES_DIR} directory for generated visualizations.")
 
 
 def analyze_transport_ablations():
-    """Analyze transport matrices with different cost component ablations."""
-    print("\n=== Analyzing Transport Matrix Ablations ===\n")
+    """Ablations under one epipolar-consistent scenario (GT F + Sampson)."""
+    print("\n=== Analyzing Transport Matrix Ablations (Epipolar) ===\n")
 
-    # Create visualizer
     visualizer = TransportMatrixVisualizer(figures_dir=FIGURES_DIR)
-
-    # Create toy problem generator
     generator = ToyProblemGenerator(seed=42)
+    K = np.array([[800, 0, 400], [0, 800, 400], [0, 0, 1]], dtype=np.float32)
 
-    # Test a representative scenario (translation)
-    print("Testing ablations on translation scenario...")
-    gaussians1 = generator.generate_synthetic_gaussians(
-        n_gaussians=15, color_mode='gradient')
-    transform_params = TransformationParams(translation=np.array([0.3, 0.2]))
-    gaussians2, correspondences = generator.generate_known_correspondences(
-        gaussians1, transform_params
-    )
+    def R_yaw(rad: float) -> np.ndarray:
+        return np.array([[np.cos(rad), 0, np.sin(rad)], [0, 1, 0], [-np.sin(rad), 0, np.cos(rad)]], dtype=np.float32)
 
-    # Camera intrinsics
-    K = np.array([
-        [800, 0, 400],
-        [0, 800, 400],
-        [0, 0, 1]
-    ], dtype=np.float32)
+    R_wc = R_yaw(0.1); t_wc = np.array([0.25, 0.02, 0.05], dtype=np.float32)
+    g1, g2, corr, F_gt = generator.generate_epipolar_correspondences(n_gaussians=15, K=K, R_wc=R_wc, t_wc=t_wc)
 
-    # Test different cost component combinations
     ablation_configs = {
         'color_only': {'lambda_color': 1.0, 'lambda_epipolar': 0.0},
-        'epipolar_only': {'lambda_color': 0.0, 'lambda_epipolar': 1.0},
         'balanced': {'lambda_color': 0.5, 'lambda_epipolar': 1.0},
-        'color_heavy': {'lambda_color': 2.0, 'lambda_epipolar': 0.5},
-        'epipolar_heavy': {'lambda_color': 0.5, 'lambda_epipolar': 2.0},
+        'epi_only': {'lambda_color': 0.0, 'lambda_epipolar': 1.0},
     }
 
-    transport_matrices = {}
-    stats_results = {}
-
-    for config_name, weights in ablation_configs.items():
-        print(f"\n--- Testing {config_name} configuration ---")
-        print(
-            f"λ_color={weights['lambda_color']}, λ_epipolar={weights['lambda_epipolar']}")
-
-        # Create solver with specific weights
-        solver = OptimalTransportSolver(
-            gaussians1=gaussians1,
-            gaussians2=gaussians2,
-            k1=K, k2=K,
-            epsilon=0.01,
-            lambda_color=weights['lambda_color'],
-            lambda_epipolar=weights['lambda_epipolar'],
-            device='cpu'
-        )
-
-        # Compute transport matrix
+    for name, w in ablation_configs.items():
+        print(f"\n--- Testing {name} configuration ---")
+        solver = OptimalTransportSolver(gaussians1=g1, gaussians2=g2, k1=K, k2=K, epsilon=0.01,
+                                        lambda_color=w['lambda_color'], lambda_epipolar=w['lambda_epipolar'], device='cpu')
         with torch.no_grad():
-            F_dummy = torch.eye(3, dtype=torch.float32)
-            cost_matrix = solver.compute_cost_matrix_fundamental(F_dummy)
-            transport_matrix = solver.unbalanced_sinkhorn_algorithm(
-                cost_matrix)
-            transport_np = transport_matrix.cpu().numpy()
-
-        # Store for comparison
-        transport_matrices[config_name] = transport_np
-
-        # Analyze statistics
-        stats = visualizer.analyze_transport_statistics(
-            transport_np, f"Translation - {config_name}"
-        )
-        stats_results[config_name] = stats
-
-        # Visualize individual matrix
-        visualizer.visualize_transport_matrix(
-            transport_np,
-            title=f'Transport Matrix - {config_name.replace("_", " ").title()}',
-            save_path=f'transport_ablation_{config_name}.png'
-        )
-
-        # Note: No correspondence visualization for ablations since they're identical
-        # (same input images, only cost weights change)
-
-    # Compare all ablation matrices
-    visualizer.compare_transport_matrices(
-        transport_matrices,
-        save_path='transport_ablations_comparison.png'
-    )
-
-    # Create summary plot
-    create_ablation_summary_plot(stats_results)
-
-    print("\n🎉 Transport matrix ablation analysis completed!")
-    print(f"Check the {FIGURES_DIR} directory for ablation visualizations.")
+            C = solver.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
+            T = solver.unbalanced_sinkhorn_algorithm(C)
+            T_np = T.cpu().numpy()
+        visualizer.analyze_transport_statistics(T_np, f"Ablation - {name}")
+        visualizer.visualize_transport_matrix(T_np, title=f'Transport Matrix - {name}', save_path=f'transport_ablation_{name}.png')
 
 
 def create_ablation_summary_plot(stats_results: Dict):
@@ -298,18 +189,15 @@ def main():
     print("🔍 Transport Matrix Analysis for Oracle Study")
     print("=" * 60)
 
-    # Run scenario analysis (different transformations)
+    # Epipolar-consistent scenario analysis only
     analyze_transport_matrices()
 
-    # Run ablation analysis (different cost components)
+    # Ablations (epipolar)
     analyze_transport_ablations()
 
     print("\n" + "=" * 60)
     print("📊 Transport Matrix Analysis Summary:")
-    print("- Scenario analysis: Shows transport behavior under different transformations")
-    print("- Ablation analysis: Shows how cost components affect transport quality")
-    print("- Provides complete ground truth validation for transport matrices")
-    print("- Reveals that epipolar term contributes minimal diagonal concentration")
+    print("- Epipolar-consistent scenarios only (GT F + Sampson)")
 
     print(f"\n✅ Complete transport matrix analysis completed!")
     print(f"Check {FIGURES_DIR} directory for all visualizations.")

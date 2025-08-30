@@ -43,7 +43,7 @@ def test_oracle_with_optimal_transport():
     ], dtype=np.float32)
 
     try:
-        # Create solver (this will test if our Gaussians are compatible)
+        # Create solver (planar transform scenario → epipolar disabled)
         solver = OptimalTransportSolver(
             gaussians1=base_gaussians,
             gaussians2=gaussians2,
@@ -53,7 +53,7 @@ def test_oracle_with_optimal_transport():
             lambda_mean=1.0,
             lambda_cov=1.0,
             lambda_color=0.5,
-            lambda_epipolar=0.0,  # No epipolar constraint for this test
+            lambda_epipolar=0.0,
             device='cpu'
         )
 
@@ -61,11 +61,8 @@ def test_oracle_with_optimal_transport():
 
         # Test cost matrix computation
         with torch.no_grad():
-            # Create a dummy fundamental matrix for cost computation
+            # Use identity as placeholder (epipolar disabled)
             F_dummy = torch.eye(3, dtype=torch.float32, device='cpu')
-            F_dummy[0, 2] = 0.1  # Add some off-diagonal terms
-            F_dummy[1, 2] = 0.05
-
             cost_matrix = solver.compute_cost_matrix_fundamental(F_dummy)
             print(f"✓ Cost matrix computed: shape {cost_matrix.shape}")
 

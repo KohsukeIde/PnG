@@ -127,256 +127,74 @@ class OptimalTransportSolver:
     def unbalanced_sinkhorn_algorithm(
         self,
         cost_matrix: torch.Tensor,
-        rho: Optional[float] = None,
         epsilon: Optional[float] = None,
-        max_iter: int = 1000,
-        tol: float = 1e-6,
-        use_log_domain: bool = True,
-        epsilon_scaling: bool = True,
-        scaling_steps: int = 4,
-        scaling_factor: float = 0.25,  # eps_min = scaling_factor * eps_0
-        k_rho: float = 10.0,  # rho = k * epsilon
-        warmstart: bool = True,
-        early_stop: bool = True,
-        verbose: bool = False,
-        marginal_error_type: str = "linf"  # "linf", "l1", or "mean"
+        rho: Optional[float] = None,
+        max_iter: int = 200,
+        tol: float = 1e-6
     ) -> torch.Tensor:
-        """シーン適応型 Unbalanced Optimal Transport with ε-scaling.
+        """Simplified Unbalanced Optimal Transport with log-domain stability.
         
-        コスト行列の統計量に基づいて自動的にパラメータを調整し、
-        段階的にεを細化することで、粗い対応から精密な対応へと収束させる。
+        Uses fixed epsilon scaling (2 steps) and log-domain computation only.
+        Eliminates complex parameter tuning while maintaining numerical stability.
 
         Args:
             cost_matrix: Cost matrix of shape (K1, K2)
-            rho: KL regularization (None for auto)
-            epsilon: Entropy regularization (None for auto)
-            max_iter: Max iterations per epsilon level
+            epsilon: Entropy regularization (None for auto: 0.08 * median)
+            rho: KL regularization (None for auto: 10.0 * epsilon)
+            max_iter: Max iterations (fixed)
             tol: Convergence tolerance
-            use_log_domain: Use log-domain computation
-            epsilon_scaling: Enable multi-scale epsilon refinement
-            scaling_steps: Number of epsilon scaling steps
-            scaling_factor: eps_min = scaling_factor * eps_0
-            k_rho: rho = k_rho * epsilon
-            warmstart: Reuse dual variables across scales
-            early_stop: Enable early stopping based on quality metrics
-            verbose: Print progress
-            marginal_error_type: Type of marginal error ("linf", "l1", or "mean")
 
         Returns:
             Transport matrix of shape (K1, K2)
         """
         
-        # 1. コスト統計に基づく自動パラメータ設定
-        if epsilon is None:
-            params = self._compute_adaptive_parameters(
-                cost_matrix, epsilon, rho, k_rho, verbose
-            )
-            epsilon_init = params['epsilon']
-        else:
-            epsilon_init = epsilon
-        
-        # 2. ε-スケーリングの設定
-        if epsilon_scaling and scaling_steps > 1:
-            # 段階的にεを細化
-            epsilon_min = scaling_factor * epsilon_init
-            epsilons = torch.linspace(
-                epsilon_init, epsilon_min, scaling_steps
-            ).tolist()
-        else:
-            epsilons = [epsilon_init]
-        
-        # 3. 初期化
-        transport = None
-        dual_variables = {}  # 統一されたdual変数ストレージ
-        best_transport = None
-        best_metric = float('inf')
-        
-        # 4. 各εレベルでの最適化
-        for scale_idx, eps_current in enumerate(epsilons):
-            # 修正点2: ρをスケールごとに更新
-            if rho is None:
-                rho_val = k_rho * eps_current
-            else:
-                rho_val = rho
-                
-            if verbose:
-                print(f"\n--- Scale {scale_idx+1}/{len(epsilons)} ---")
-                print(f"epsilon = {eps_current:.4f}, rho = {rho_val:.4f}")
-                print(f"tau = {rho_val/(rho_val+eps_current):.4f}")
-            
-            # 現在のεでの最適化
-            transport, dual_vars, metrics = self._solve_single_scale(
-                cost_matrix=cost_matrix,
-                epsilon=eps_current,
-                rho=rho_val,
-                max_iter=max_iter,
-                tol=tol,
-                use_log_domain=use_log_domain,
-                initial_dual=dual_variables if warmstart else None,
-                verbose=verbose,
-                marginal_error_type=marginal_error_type
-            )
-            
-            # メトリクスの評価
-            quality_metrics = self._evaluate_transport_quality(
-                transport, cost_matrix, self.alpha1, self.alpha2, eps_current, rho_val
-            )
-            
-            if verbose:
-                self._print_quality_metrics(quality_metrics)
-            
-            # 早期停止の判定
-            if early_stop and scale_idx > 0:
-                # 前のスケールより悪化したら停止
-                current_metric = quality_metrics['total_cost']
-                if current_metric > best_metric * 1.05:  # 5%以上悪化
-                    if verbose:
-                        print("Early stopping: quality degraded")
-                    break
-            
-            # 最良の結果を保存
-            if quality_metrics['total_cost'] < best_metric:
-                best_metric = quality_metrics['total_cost']
-                best_transport = transport.clone()
-            
-            # 修正点4: dual変数を統一されたフォーマットで保存
-            if warmstart:
-                dual_variables = self._unify_dual_variables(dual_vars)
-        
-        return best_transport if best_transport is not None else transport
-
-    def _compute_adaptive_parameters(
-        self, 
-        cost_matrix: torch.Tensor,
-        epsilon: Optional[float],
-        rho: Optional[float],
-        k_rho: float,
-        verbose: bool
-    ) -> dict:
-        """コスト行列の統計量に基づいてパラメータを自動設定"""
-        
+        # 1. Simple parameter auto-setting
         with torch.no_grad():
-            # コスト統計
             c_median = torch.median(cost_matrix).item()
-            c_mean = cost_matrix.mean().item()
-            c_std = cost_matrix.std().item()
-            c_p95 = torch.quantile(cost_matrix.flatten(), 0.95).item()
-            
-            # εの自動設定（中央値の8%から開始）
             if epsilon is None:
-                epsilon = 0.08 * c_median
-                # 安定性のため最小値を保証
-                epsilon = max(epsilon, 0.001 * c_mean)
-            
-            # ρの自動設定
+                epsilon = max(0.08 * c_median, 1e-3)  # Fixed: 8% of median with minimum
             if rho is None:
-                rho = k_rho * epsilon
+                rho = 10.0 * epsilon  # Fixed ratio
         
-        if verbose:
-            print(f"Cost statistics: median={c_median:.3f}, mean={c_mean:.3f}, "
-                  f"std={c_std:.3f}, p95={c_p95:.3f}")
-            print(f"Auto parameters: epsilon={epsilon:.4f}, rho={rho:.4f}, "
-                  f"tau={rho/(rho+epsilon):.3f}")
+        # 2. Fixed epsilon scaling (2 steps only)
+        epsilons = [epsilon, 0.5 * epsilon]  # Simple 2-step scaling
         
-        return {
-            'epsilon': epsilon,
-            'rho': rho,
-            'c_median': c_median,
-            'c_mean': c_mean,
-            'c_std': c_std
-        }
+        # 3. Simple iteration with warmstart
+        transport = None
+        log_u, log_v = None, None
+        
+        for eps_current in epsilons:
+            rho_current = 10.0 * eps_current  # Always proportional
+            transport, log_u, log_v = self._sinkhorn_log_simple(
+                cost_matrix, eps_current, rho_current, max_iter, tol, log_u, log_v
+            )
+        
+        return transport
 
-    def _unify_dual_variables(self, dual_vars: dict) -> dict:
-        """dual変数を統一されたフォーマットに変換（log/標準モード両対応）"""
-        unified = {}
-        
-        # log-domain変数
-        if 'log_u' in dual_vars:
-            unified['log_u'] = dual_vars['log_u']
-            unified['log_v'] = dual_vars['log_v']
-            # 標準形式も計算して保存
-            unified['u'] = torch.exp(dual_vars['log_u'])
-            unified['v'] = torch.exp(dual_vars['log_v'])
-        
-        # 標準domain変数
-        elif 'u' in dual_vars:
-            unified['u'] = dual_vars['u']
-            unified['v'] = dual_vars['v']
-            # log形式も計算して保存
-            unified['log_u'] = torch.log(dual_vars['u'] + 1e-300)
-            unified['log_v'] = torch.log(dual_vars['v'] + 1e-300)
-        
-        # その他のメタデータ
-        unified['iterations'] = dual_vars.get('iterations', 0)
-        unified['final_error'] = dual_vars.get('final_error', float('inf'))
-        
-        return unified
-
-    def _solve_single_scale(
+    def _sinkhorn_log_simple(
         self,
         cost_matrix: torch.Tensor,
         epsilon: float,
         rho: float,
         max_iter: int,
         tol: float,
-        use_log_domain: bool,
-        initial_dual: Optional[dict] = None,
-        verbose: bool = False,
-        marginal_error_type: str = "linf"
-    ) -> Tuple[torch.Tensor, dict, dict]:
-        """単一のεレベルでの最適化を実行"""
+        log_u_init: Optional[torch.Tensor] = None,
+        log_v_init: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Simplified log-domain Sinkhorn with minimal overhead."""
         
-        # 質量（正規化なし）
-        eps_mass = 1e-16
+        # Masses with small epsilon for numerical stability
+        eps_mass = 1e-8  # Increased from 1e-16 for float32 stability
         alpha = self.alpha1 + eps_mass
         beta = self.alpha2 + eps_mass
-        
-        # τの計算
-        tau = rho / (rho + epsilon)
-        
-        if use_log_domain:
-            transport, dual_vars = self._sinkhorn_log_stabilized(
-                cost_matrix, alpha, beta, epsilon, tau,
-                max_iter, tol, initial_dual, verbose,
-                marginal_error_type
-            )
-        else:
-            transport, dual_vars = self._sinkhorn_standard_stabilized(
-                cost_matrix, alpha, beta, epsilon, tau,
-                max_iter, tol, initial_dual, verbose,
-                marginal_error_type
-            )
-        
-        # 収束メトリクス
-        metrics = {
-            'iterations': dual_vars.get('iterations', max_iter),
-            'final_error': dual_vars.get('final_error', float('inf'))
-        }
-        
-        return transport, dual_vars, metrics
-
-    def _sinkhorn_log_stabilized(
-        self,
-        cost_matrix: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        epsilon: float,
-        tau: float,
-        max_iter: int,
-        tol: float,
-        initial_dual: Optional[dict] = None,
-        verbose: bool = False,
-        marginal_error_type: str = "linf"
-    ) -> Tuple[torch.Tensor, dict]:
-        """安定化されたlog-domain Sinkhorn実装"""
         
         # Log kernel
         log_K = -cost_matrix / epsilon
         
-        # 双対変数の初期化（warmstart対応）
-        if initial_dual is not None and 'log_u' in initial_dual:
-            log_u = initial_dual['log_u'].clone()
-            log_v = initial_dual['log_v'].clone()
+        # Initialize dual variables (warmstart support)
+        if log_u_init is not None and log_v_init is not None:
+            log_u = log_u_init.clone()
+            log_v = log_v_init.clone()
         else:
             log_u = torch.zeros_like(alpha)
             log_v = torch.zeros_like(beta)
@@ -385,271 +203,50 @@ class OptimalTransportSolver:
         log_alpha = torch.log(alpha)
         log_beta = torch.log(beta)
         
-        # 安定化のための変数
+        # Tau parameter
+        tau = rho / (rho + epsilon)
+        
+        # Fixed stabilization frequency
         stabilize_freq = 20
-        
-        # 収束履歴
-        err_history = []
-        converged_iter = max_iter
-        
-        # 修正点3: break前の最新dual変数を保持
-        log_u_best = log_u.clone()
-        log_v_best = log_v.clone()
         
         for iteration in range(max_iter):
             # Update log(u)
             log_Kv = torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
-            log_u_new = tau * (log_alpha - log_Kv)
+            log_u = tau * (log_alpha - log_Kv)
             
             # Update log(v)
-            log_KTu = torch.logsumexp(log_K + log_u_new.unsqueeze(1), dim=0)
-            log_v_new = tau * (log_beta - log_KTu)
+            log_KTu = torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)
+            log_v = tau * (log_beta - log_KTu)
             
-            # 定期的な安定化
+            # Fixed stabilization every 20 iterations
             if iteration > 0 and iteration % stabilize_freq == 0:
-                # 修正点1: 再中心化で正しくlog_Kを更新
-                center = (log_u_new.mean() + log_v_new.mean()) / 2
-                log_u_new = log_u_new - center
-                log_v_new = log_v_new - center
-                log_K = log_K + 2 * center  # 修正: 2倍にする
+                center = (log_u.mean() + log_v.mean()) / 2
+                log_u = log_u - center
+                log_v = log_v - center
+                log_K = log_K + 2 * center  # Factor 2 from exp distribution
             
-            # 収束チェック（10イテレーションごと）
+            # Simple convergence check every 10 iterations
             if iteration % 10 == 0:
-                # Transport matrix
-                log_T = log_u_new.unsqueeze(1) + log_K + log_v_new.unsqueeze(0)
+                log_T = log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0)
                 T = torch.exp(log_T)
                 
-                # Marginal errors
+                # L∞ marginal error only
                 row_sums = T.sum(dim=1)
                 col_sums = T.sum(dim=0)
-                
-                # 修正点5: marginal errorの計算方法を選択可能に
-                if marginal_error_type == "linf":
-                    err_alpha = torch.abs(row_sums - alpha).max().item()
-                    err_beta = torch.abs(col_sums - beta).max().item()
-                    err = max(err_alpha, err_beta)
-                elif marginal_error_type == "l1":
-                    err_alpha = torch.abs(row_sums - alpha).sum().item()
-                    err_beta = torch.abs(col_sums - beta).sum().item()
-                    err = err_alpha + err_beta
-                else:  # mean
-                    err_alpha = torch.abs(row_sums - alpha).mean().item()
-                    err_beta = torch.abs(col_sums - beta).mean().item()
-                    err = (err_alpha + err_beta) / 2
-                
-                err_history.append(err)
+                err = max(
+                    torch.abs(row_sums - alpha).max().item(),
+                    torch.abs(col_sums - beta).max().item()
+                )
                 
                 if err < tol:
-                    converged_iter = iteration
-                    # 修正点3: 最新のdual変数を保存
-                    log_u_best = log_u_new.clone()
-                    log_v_best = log_v_new.clone()
-                    if verbose and iteration % 100 == 0:
-                        print(f"  Converged at iter {iteration}: error={err:.2e}")
                     break
-                
-                if verbose and iteration % 100 == 0:
-                    print(f"  Iter {iteration}: marginal error ({marginal_error_type})={err:.2e}")
-            
-            # 更新
-            log_u = log_u_new
-            log_v = log_v_new
-            
-            # 毎イテレーション最良値を更新
-            log_u_best = log_u.clone()
-            log_v_best = log_v.clone()
         
-        # 最終的な輸送行列（最良のdual変数を使用）
-        log_T = log_u_best.unsqueeze(1) + log_K + log_v_best.unsqueeze(0)
+        # Final transport matrix
+        log_T = log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0)
         transport = torch.exp(log_T)
-        transport = torch.nan_to_num(transport, nan=0.0, posinf=1e10, neginf=0.0)
+        transport = torch.nan_to_num(transport, nan=0.0, posinf=1e6, neginf=0.0)  # Reduced from 1e10
         
-        # 双対変数を返す（warmstart用）
-        dual_vars = {
-            'log_u': log_u_best,
-            'log_v': log_v_best,
-            'iterations': converged_iter,
-            'final_error': err_history[-1] if err_history else float('inf')
-        }
-        
-        return transport, dual_vars
-
-    def _sinkhorn_standard_stabilized(
-        self,
-        cost_matrix: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        epsilon: float,
-        tau: float,
-        max_iter: int,
-        tol: float,
-        initial_dual: Optional[dict] = None,
-        verbose: bool = False,
-        marginal_error_type: str = "linf"
-    ) -> Tuple[torch.Tensor, dict]:
-        """標準的なSinkhorn実装（fallback用）"""
-        
-        # Kernel
-        kernel = torch.exp(-cost_matrix / epsilon)
-        kernel = torch.nan_to_num(kernel, nan=1e-300, posinf=1.0, neginf=1e-300)
-        
-        # 双対変数の初期化（修正点4: 統一キー対応）
-        if initial_dual is not None:
-            if 'u' in initial_dual:
-                u = initial_dual['u'].clone()
-                v = initial_dual['v'].clone()
-            elif 'log_u' in initial_dual:
-                # log-domainから変換
-                u = torch.exp(initial_dual['log_u'])
-                v = torch.exp(initial_dual['log_v'])
-            else:
-                u = torch.ones_like(alpha)
-                v = torch.ones_like(beta)
-        else:
-            u = torch.ones_like(alpha)
-            v = torch.ones_like(beta)
-        
-        eps_stable = torch.finfo(kernel.dtype).eps
-        converged_iter = max_iter
-        
-        # 最良のdual変数を保持
-        u_best = u.clone()
-        v_best = v.clone()
-        
-        for iteration in range(max_iter):
-            # Update u
-            Kv = kernel @ v + eps_stable
-            u_new = (alpha / Kv).pow(tau)
-            u_new = torch.nan_to_num(u_new, nan=eps_stable, posinf=1e10, neginf=eps_stable)
-            
-            # Update v
-            KTu = kernel.t() @ u_new + eps_stable
-            v_new = (beta / KTu).pow(tau)
-            v_new = torch.nan_to_num(v_new, nan=eps_stable, posinf=1e10, neginf=eps_stable)
-            
-            # 収束チェック
-            if iteration % 10 == 0:
-                transport = u_new.unsqueeze(1) * kernel * v_new.unsqueeze(0)
-                row_sums = transport.sum(dim=1)
-                col_sums = transport.sum(dim=0)
-                
-                # 修正点5: marginal error計算方法
-                if marginal_error_type == "linf":
-                    err_alpha = torch.abs(row_sums - alpha).max().item()
-                    err_beta = torch.abs(col_sums - beta).max().item()
-                    err = max(err_alpha, err_beta)
-                elif marginal_error_type == "l1":
-                    err_alpha = torch.abs(row_sums - alpha).sum().item()
-                    err_beta = torch.abs(col_sums - beta).sum().item()
-                    err = err_alpha + err_beta
-                else:  # mean
-                    err_alpha = torch.abs(row_sums - alpha).mean().item()
-                    err_beta = torch.abs(col_sums - beta).mean().item()
-                    err = (err_alpha + err_beta) / 2
-                
-                if err < tol:
-                    converged_iter = iteration
-                    u_best = u_new.clone()
-                    v_best = v_new.clone()
-                    break
-            
-            u = u_new
-            v = v_new
-            u_best = u.clone()
-            v_best = v.clone()
-        
-        transport = u_best.unsqueeze(1) * kernel * v_best.unsqueeze(0)
-        transport = torch.nan_to_num(transport, nan=0.0, posinf=1e10, neginf=0.0)
-        
-        dual_vars = {
-            'u': u_best,
-            'v': v_best,
-            'iterations': converged_iter
-        }
-        
-        return transport, dual_vars
-
-    def _evaluate_transport_quality(
-        self,
-        transport: torch.Tensor,
-        cost_matrix: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-        epsilon: float,
-        rho: float
-    ) -> dict:
-        """輸送行列の品質メトリクスを計算（改善版）"""
-        
-        with torch.no_grad():
-            # 基本統計
-            metrics = {}
-            
-            # 1. Sparsity（1:1対応への近さ）
-            threshold = 1e-6
-            sparsity = (transport < threshold).float().mean().item()
-            metrics['sparsity'] = sparsity
-            
-            # 非ゼロ要素数
-            nnz = (transport > threshold).sum().item()
-            total_elements = transport.numel()
-            metrics['nnz_ratio'] = nnz / total_elements
-            
-            # 2. エントロピー（分散度）
-            T_normalized = transport / (transport.sum() + 1e-10)
-            entropy = -(T_normalized * torch.log(T_normalized + 1e-10)).sum().item()
-            metrics['entropy'] = entropy
-            
-            # 3. Marginal errors (L∞, L1, mean)
-            row_sums = transport.sum(dim=1)
-            col_sums = transport.sum(dim=0)
-            
-            err_rows = torch.abs(row_sums - alpha)
-            err_cols = torch.abs(col_sums - beta)
-            
-            metrics['marginal_error_linf'] = max(err_rows.max().item(), err_cols.max().item())
-            metrics['marginal_error_l1'] = err_rows.sum().item() + err_cols.sum().item()
-            metrics['marginal_error_mean'] = (err_rows.mean().item() + err_cols.mean().item()) / 2
-            
-            # 4. 輸送コスト
-            transport_cost = (transport * cost_matrix).sum().item()
-            metrics['transport_cost'] = transport_cost
-            
-            # 5. 最大輸送量（最も強い対応）
-            metrics['max_transport'] = transport.max().item()
-            
-            # 6. 有効な対応数（閾値以上の要素数）
-            effective_threshold = 0.01 * transport.max()
-            effective_matches = (transport > effective_threshold).sum().item()
-            metrics['effective_matches'] = effective_matches
-            
-            # 7. 総合コスト（目的関数値）
-            eps_stable = 1e-10
-            kl_rows = rho * (row_sums * torch.log(row_sums / (alpha + eps_stable) + eps_stable) 
-                            - row_sums + alpha).sum()
-            kl_cols = rho * (col_sums * torch.log(col_sums / (beta + eps_stable) + eps_stable) 
-                            - col_sums + beta).sum()
-            
-            # エントロピー項
-            entropy_term = -epsilon * (transport * torch.log(transport + eps_stable)).sum()
-            
-            total_cost = transport_cost + entropy_term + kl_rows + kl_cols
-            metrics['total_cost'] = total_cost.item()
-            
-            # 8. 対応の鋭さ（上位k個の輸送量が占める割合）
-            top_k = min(10, transport.numel())
-            top_values, _ = transport.flatten().topk(top_k)
-            metrics['top10_ratio'] = top_values.sum().item() / transport.sum().item()
-            
-            return metrics
-
-    def _print_quality_metrics(self, metrics: dict) -> None:
-        """品質メトリクスを整形して表示（拡張版）"""
-        print(f"  Sparsity: {metrics['sparsity']:.1%} | "
-              f"NNZ ratio: {metrics['nnz_ratio']:.1%} | "
-              f"Entropy: {metrics['entropy']:.2f} | "
-              f"Marginal err (L∞): {metrics['marginal_error_linf']:.2e} | "
-              f"Effective matches: {metrics['effective_matches']:.0f} | "
-              f"Top10 ratio: {metrics['top10_ratio']:.1%}")
+        return transport, log_u, log_v
 
     def _make_cov_matrices(self, scales: torch.Tensor,
                         rotations: torch.Tensor) -> torch.Tensor:
@@ -1041,12 +638,7 @@ class OptimalTransportSolver:
             # 基礎行列と損失の計算
             F = self._build_F_from_wc(R_wc, t_wc)
             cost_matrix = self.compute_cost_matrix_fundamental(F)
-            transport = self.unbalanced_sinkhorn_algorithm(
-                cost_matrix=cost_matrix,
-                epsilon_scaling=True,
-                scaling_steps=3,
-                verbose=False  # SE3では簡潔に
-            )
+            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
             loss = torch.sum(transport * cost_matrix)
             
             if iteration % 10 == 0:
@@ -1349,18 +941,10 @@ class OptimalTransportSolver:
             C = self.compute_cost_matrix_fundamental(F)
             T = self.unbalanced_sinkhorn_algorithm(
                 cost_matrix=C,
-                rho=sinkhorn_rho,
                 epsilon=sinkhorn_epsilon,
+                rho=sinkhorn_rho,
                 max_iter=sinkhorn_max_iter,
-                tol=sinkhorn_tol,
-                use_log_domain=use_log_domain,
-                epsilon_scaling=epsilon_scaling,
-                scaling_steps=scaling_steps,
-                scaling_factor=scaling_factor,
-                k_rho=k_rho,
-                warmstart=warmstart,
-                early_stop=early_stop,
-                verbose=sinkhorn_verbose
+                tol=sinkhorn_tol
             )
             loss = (T * C).sum()
 

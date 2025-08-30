@@ -23,6 +23,7 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.patches import ConnectionPatch
 # import seaborn as sns  # Using matplotlib only
 from typing import Tuple, Dict, Optional, List
 import cv2
@@ -119,7 +120,8 @@ class TransportMatrixVisualizer:
         transport_matrix: np.ndarray,
         threshold: float = 0.01,
         save_path: Optional[str] = None,
-        max_correspondences: int = 50
+        max_correspondences: int = 50,
+        selection: str = "row_argmax"  # "row_argmax" or "threshold_topk"
     ) -> None:
         """
         Visualize correspondences on synthetic images.
@@ -151,8 +153,13 @@ class TransportMatrixVisualizer:
             ax1.text(pos1[i, 0], pos1[i, 1], str(i), 
                     ha='center', va='center', fontsize=8, fontweight='bold')
         
-        ax1.set_xlim(-1.2, 1.2)
-        ax1.set_ylim(-1.2, 1.2)
+        # Dynamic limits for robustness across normalized/pixel coordinates
+        x1_min, y1_min = np.min(pos1, axis=0)
+        x1_max, y1_max = np.max(pos1, axis=0)
+        pad_x1 = 0.1 * max(1e-6, x1_max - x1_min)
+        pad_y1 = 0.1 * max(1e-6, y1_max - y1_min)
+        ax1.set_xlim(x1_min - pad_x1, x1_max + pad_x1)
+        ax1.set_ylim(y1_min - pad_y1, y1_max + pad_y1)
         ax1.set_aspect('equal')
         ax1.set_title('Source Gaussians (Image 1)')
         ax1.grid(True, alpha=0.3)
@@ -173,33 +180,51 @@ class TransportMatrixVisualizer:
             ax2.text(pos2[i, 0], pos2[i, 1], str(i), 
                     ha='center', va='center', fontsize=8, fontweight='bold')
         
-        ax2.set_xlim(-1.2, 1.2)
-        ax2.set_ylim(-1.2, 1.2)
+        x2_min, y2_min = np.min(pos2, axis=0)
+        x2_max, y2_max = np.max(pos2, axis=0)
+        pad_x2 = 0.1 * max(1e-6, x2_max - x2_min)
+        pad_y2 = 0.1 * max(1e-6, y2_max - y2_min)
+        ax2.set_xlim(x2_min - pad_x2, x2_max + pad_x2)
+        ax2.set_ylim(y2_min - pad_y2, y2_max + pad_y2)
         ax2.set_aspect('equal')
         ax2.set_title('Target Gaussians (Image 2)')
         ax2.grid(True, alpha=0.3)
         
-        # Draw correspondence lines
-        # Find high-transport correspondences
-        high_transport_indices = np.where(transport_matrix > threshold)
-        transport_values = transport_matrix[high_transport_indices]
-        
-        # Sort by transport value and take top correspondences
-        sorted_indices = np.argsort(transport_values)[::-1][:max_correspondences]
-        
-        for idx in sorted_indices:
-            i = high_transport_indices[0][idx]
-            j = high_transport_indices[1][idx]
-            transport_val = transport_values[idx]
-            
-            # Draw line between corresponding Gaussians
-            # We need to transform coordinates to figure coordinates
-            # This is a simplified version - in practice you'd need proper coordinate transformation
-            line_alpha = min(1.0, transport_val * 10)  # Scale alpha by transport value
-            
-            # For now, just print the correspondences
-            if idx < 10:  # Print top 10
-                print(f"Correspondence {i} -> {j}: transport = {transport_val:.4f}")
+        # Draw correspondence lines using ConnectionPatch between subplots
+        correspondences = []
+        if selection == "row_argmax":
+            # take best j per source i
+            best_j = np.argmax(transport_matrix, axis=1)
+            vals = transport_matrix[np.arange(transport_matrix.shape[0]), best_j]
+            order = np.argsort(vals)[::-1]
+            for idx in order[:max_correspondences]:
+                i = int(idx)
+                j = int(best_j[idx])
+                v = float(vals[idx])
+                if v >= threshold:
+                    correspondences.append((i, j, v))
+        else:
+            sel = np.where(transport_matrix > threshold)
+            vals = transport_matrix[sel]
+            order = np.argsort(vals)[::-1][:max_correspondences]
+            for k in order:
+                i = int(sel[0][k])
+                j = int(sel[1][k])
+                v = float(vals[k])
+                correspondences.append((i, j, v))
+
+        for rank, (i, j, v) in enumerate(correspondences):
+            p1 = (pos1[i, 0], pos1[i, 1])
+            p2 = (pos2[j, 0], pos2[j, 1])
+            lw = 1.0 + 4.0 * (v / (np.max(transport_matrix) + 1e-12))
+            alpha = min(1.0, 0.2 + 0.8 * (v / (np.max(transport_matrix) + 1e-12)))
+            con = ConnectionPatch(xyA=p2, coordsA=ax2.transData,
+                                  xyB=p1, coordsB=ax1.transData,
+                                  axesA=ax2, axesB=ax1,
+                                  color='cyan', linewidth=lw, alpha=alpha)
+            fig.add_artist(con)
+            if rank < 10:
+                print(f"Correspondence {i} -> {j}: transport = {v:.4f}")
         
         plt.tight_layout()
         
