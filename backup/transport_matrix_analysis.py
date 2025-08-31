@@ -53,18 +53,24 @@ def analyze_transport_matrices():
 
     for name, params in epi_scenarios.items():
         print(f"\n--- Testing {name} ---")
-        g1, g2, corr, F_gt = generator.generate_epipolar_correspondences_3dgs(
+        g1, g2, corr, F_gt = generator.generate_epipolar_correspondences(
             n_gaussians=15, K=K, R_wc=params['R_wc'], t_wc=params['t_wc']
         )
 
         # If color-change scenario: randomize g2 colors (geometry/F unchanged)
+        # and use epipolar-only weights to test robustness
         if 'color_change' in name:
             rng = np.random.RandomState(123)
             g2.rgb = rng.uniform(0, 1, size=g2.rgb.shape).astype(np.float32)
+            # Use epipolar-only weights for color change scenario
+            lambda_color, lambda_epipolar = 0.0, 1.0
+        else:
+            # Use balanced weights for normal scenarios
+            lambda_color, lambda_epipolar = 0.5, 1.0
 
         solver = OptimalTransportSolver(
             gaussians1=g1, gaussians2=g2, k1=K, k2=K,
-            epsilon=0.01, lambda_color=0.5, lambda_epipolar=1.0, device='cpu')
+            epsilon=0.01, lambda_color=lambda_color, lambda_epipolar=lambda_epipolar, device='cpu')
 
         with torch.no_grad():
             C = solver.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))

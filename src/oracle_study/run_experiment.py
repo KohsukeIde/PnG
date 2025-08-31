@@ -15,8 +15,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 def main():
     parser = argparse.ArgumentParser(description='Run oracle study experiments')
     parser.add_argument('experiment', choices=[
-        'transport_matrix_analysis',
-        'cost_function_analysis', 
+        'unified_analysis',  # Combined transport + cost analysis
         'toy_generator_validation',
         'integration_validation'
     ], help='Experiment to run')
@@ -24,11 +23,8 @@ def main():
     args = parser.parse_args()
     
     # Import and run the specified experiment
-    if args.experiment == 'transport_matrix_analysis':
-        from src.oracle_study.experiments.transport_matrix_analysis import main
-        main()
-    elif args.experiment == 'cost_function_analysis':
-        from src.oracle_study.experiments.cost_function_analysis import main
+    if args.experiment == 'unified_analysis':
+        from src.oracle_study.experiments.unified_analysis import main
         main()
     elif args.experiment == 'toy_generator_validation':
         from src.oracle_study.experiments.toy_generator_validation import main

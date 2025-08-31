@@ -140,16 +140,32 @@ class TransportMatrixVisualizer:
         # Plot first set of Gaussians
         pos1 = gaussians1.means
         colors1 = gaussians1.rgb
-        scales1 = gaussians1.scales
+        covs1 = gaussians1.covs
         
         for i in range(len(pos1)):
-            circle = plt.Circle(
+            # Use the covariance matrix to create proper ellipse
+            cov = covs1[i]
+            eigenvals, eigenvecs = np.linalg.eigh(cov)
+            # Sort eigenvalues and eigenvectors
+            idx = np.argsort(eigenvals)[::-1]
+            eigenvals = eigenvals[idx]
+            eigenvecs = eigenvecs[:, idx]
+            
+            # Ellipse parameters
+            width = 2 * np.sqrt(eigenvals[0]) * 3  # 3-sigma ellipse
+            height = 2 * np.sqrt(eigenvals[1]) * 3
+            angle = np.degrees(np.arctan2(eigenvecs[1, 0], eigenvecs[0, 0]))
+            
+            from matplotlib.patches import Ellipse
+            ellipse = Ellipse(
                 pos1[i], 
-                radius=np.mean(scales1[i]) * 3,  # Scale for visibility
+                width=width,
+                height=height,
+                angle=angle,
                 color=colors1[i], 
                 alpha=0.6
             )
-            ax1.add_patch(circle)
+            ax1.add_patch(ellipse)
             ax1.text(pos1[i, 0], pos1[i, 1], str(i), 
                     ha='center', va='center', fontsize=8, fontweight='bold')
         
@@ -167,16 +183,31 @@ class TransportMatrixVisualizer:
         # Plot second set of Gaussians
         pos2 = gaussians2.means
         colors2 = gaussians2.rgb
-        scales2 = gaussians2.scales
+        covs2 = gaussians2.covs
         
         for i in range(len(pos2)):
-            circle = plt.Circle(
+            # Use the covariance matrix to create proper ellipse
+            cov = covs2[i]
+            eigenvals, eigenvecs = np.linalg.eigh(cov)
+            # Sort eigenvalues and eigenvectors
+            idx = np.argsort(eigenvals)[::-1]
+            eigenvals = eigenvals[idx]
+            eigenvecs = eigenvecs[:, idx]
+            
+            # Ellipse parameters
+            width = 2 * np.sqrt(eigenvals[0]) * 3  # 3-sigma ellipse
+            height = 2 * np.sqrt(eigenvals[1]) * 3
+            angle = np.degrees(np.arctan2(eigenvecs[1, 0], eigenvecs[0, 0]))
+            
+            ellipse = Ellipse(
                 pos2[i], 
-                radius=np.mean(scales2[i]) * 3,  # Scale for visibility
+                width=width,
+                height=height,
+                angle=angle,
                 color=colors2[i], 
                 alpha=0.6
             )
-            ax2.add_patch(circle)
+            ax2.add_patch(ellipse)
             ax2.text(pos2[i, 0], pos2[i, 1], str(i), 
                     ha='center', va='center', fontsize=8, fontweight='bold')
         

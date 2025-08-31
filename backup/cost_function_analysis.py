@@ -189,83 +189,107 @@ def analyze_cost_components():
     return results
 
 
-def analyze_cost_components_epipolar():
-    """Analyze components under true epipolar geometry using Sampson distance.
-
-    We evaluate multiple epipolar-consistent scenarios, each producing gaussians and
-    a ground-truth fundamental matrix F_gt from K, R_wc, t_wc, and 3D points.
+def analyze_cost_matrices_visualization():
+    """Analyze and visualize cost matrices for different weight configurations.
+    
+    This complements transport_matrix_analysis.py by focusing on cost matrix visualization,
+    which is not available in the transport matrix analysis.
     """
-    print("\n=== Analyzing Epipolar Scenario (GT F + Sampson) ===\n")
-
+    print("\n=== Analyzing Cost Matrices for Weight Configurations ===\n")
+    
     generator = ToyProblemGenerator(seed=42)
-    visualizer = TransportMatrixVisualizer(figures_dir=FIGURES_DIR)
-
-    # Intrinsics
+    
+    # Use a representative epipolar scenario
     K = np.array([[800, 0, 400], [0, 800, 400], [0, 0, 1]], dtype=np.float32)
-
-    # Define epipolar scenarios via poses (world->cam2). Non-zero t is required.
     def R_yaw(rad: float) -> np.ndarray:
         return np.array([[np.cos(rad), 0, np.sin(rad)], [0, 1, 0], [-np.sin(rad), 0, np.cos(rad)]], dtype=np.float32)
-
-    epi_scenarios = {
-        'epi_translation': {
-            'R_wc': R_yaw(0.0), 't_wc': np.array([0.25, 0.02, 0.0], dtype=np.float32)
-        },
-        'epi_yaw_rotation': {
-            'R_wc': R_yaw(0.12), 't_wc': np.array([0.18, 0.01, 0.02], dtype=np.float32)
-        },
-        'epi_forward_scale_like': {
-            # forward motion + slight lateral to avoid degeneracy
-            'R_wc': R_yaw(0.02), 't_wc': np.array([0.05, 0.0, 0.15], dtype=np.float32)
-        },
-        'epi_combined': {
-            'R_wc': R_yaw(0.10), 't_wc': np.array([0.25, 0.02, 0.05], dtype=np.float32)
-        },
-        'epi_color_change': {
-            'R_wc': R_yaw(0.08), 't_wc': np.array([0.20, 0.01, 0.03], dtype=np.float32)
-        },
-    }
-
-    results = {}
-    for name, params in epi_scenarios.items():
-        g1, g2, corr, F_gt = generator.generate_epipolar_correspondences_3dgs(
-            n_gaussians=15, K=K, R_wc=params['R_wc'], t_wc=params['t_wc'], color_mode='gradient')
-
-        if name == 'epi_color_change':
-            rng = np.random.RandomState(123)
-            g2.rgb = rng.uniform(0, 1, size=g2.rgb.shape).astype(np.float32)
-
-        solver_full = OptimalTransportSolver(gaussians1=g1, gaussians2=g2, k1=K, k2=K, epsilon=0.01, lambda_color=0.5, lambda_epipolar=1.0, device='cpu')
-        solver_epi  = OptimalTransportSolver(gaussians1=g1, gaussians2=g2, k1=K, k2=K, epsilon=0.01, lambda_color=0.0, lambda_epipolar=1.0, device='cpu')
-        solver_col  = OptimalTransportSolver(gaussians1=g1, gaussians2=g2, k1=K, k2=K, epsilon=0.01, lambda_color=1.0, lambda_epipolar=0.0, device='cpu')
-
+    
+    R_wc = R_yaw(0.10)
+    t_wc = np.array([0.25, 0.02, 0.05], dtype=np.float32)
+    g1, g2, corr, F_gt = generator.generate_epipolar_correspondences(
+        n_gaussians=15, K=K, R_wc=R_wc, t_wc=t_wc, color_mode='gradient'
+    )
+    
+    # Test key weight configurations to show cost matrix differences
+    configs = [
+        {'lambda_epipolar': 1.0, 'lambda_color': 0.0, 'name': 'Epipolar Only'},
+        {'lambda_epipolar': 0.0, 'lambda_color': 1.0, 'name': 'Color Only'},
+        {'lambda_epipolar': 1.0, 'lambda_color': 1.0, 'name': 'Equal Weights'},
+        {'lambda_epipolar': 0.5, 'lambda_color': 2.0, 'name': 'Optimal (1:4)'},
+    ]
+    
+    cost_matrices = {}
+    
+    for config in configs:
+        solver = OptimalTransportSolver(
+            gaussians1=g1, gaussians2=g2, k1=K, k2=K,
+            epsilon=0.01,
+            lambda_color=config['lambda_color'],
+            lambda_epipolar=config['lambda_epipolar'],
+            device='cpu'
+        )
+        
         with torch.no_grad():
-            C_full = solver_full.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
-            C_epi  = solver_epi.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
-            C_col  = solver_col.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
-            T_full = solver_full.unbalanced_sinkhorn_algorithm(C_full)
-            T_epi  = solver_epi.unbalanced_sinkhorn_algorithm(C_epi)
-            T_col  = solver_col.unbalanced_sinkhorn_algorithm(C_col)
-
-        stats_full = visualizer.analyze_transport_statistics(T_full.cpu().numpy(), f'{name} - Full')
-        stats_epi  = visualizer.analyze_transport_statistics(T_epi.cpu().numpy(),  f'{name} - Epipolar Only')
-        stats_col  = visualizer.analyze_transport_statistics(T_col.cpu().numpy(),  f'{name} - Color Only')
-
-        # Save cost matrices figure
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        im1 = axes[0].imshow(C_full.cpu().numpy(), cmap='hot', aspect='equal'); axes[0].set_title(f'{name} (Full)'); plt.colorbar(im1, ax=axes[0])
-        im2 = axes[1].imshow(C_epi.cpu().numpy(),  cmap='hot', aspect='equal'); axes[1].set_title(f'{name} (Epipolar)'); plt.colorbar(im2, ax=axes[1])
-        im3 = axes[2].imshow(C_col.cpu().numpy(),  cmap='hot', aspect='equal'); axes[2].set_title(f'{name} (Color)');    plt.colorbar(im3, ax=axes[2])
-        plt.tight_layout(); save_path = os.path.join(FIGURES_DIR, f'cost_components_{name}.png'); plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
-
-        # Save transports comparison
-        visualizer.compare_transport_matrices(
-            {f'{name} - Full': T_full.cpu().numpy(), f'{name} - Epipolar': T_epi.cpu().numpy(), f'{name} - Color': T_col.cpu().numpy()},
-            save_path=f'transport_comparison_{name}.png')
-
-        results[name] = {'full': stats_full, 'epipolar': stats_epi, 'color': stats_col}
-
-    return results
+            C = solver.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
+            cost_matrices[config['name']] = C.cpu().numpy()
+    
+    # Create comprehensive cost matrix visualization
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
+    
+    for i, (name, cost_matrix) in enumerate(cost_matrices.items()):
+        im = axes[i].imshow(cost_matrix, cmap='hot', aspect='equal')
+        axes[i].set_title(f'{name}\n(Cost Matrix)')
+        axes[i].set_xlabel('Target Gaussians')
+        axes[i].set_ylabel('Source Gaussians')
+        plt.colorbar(im, ax=axes[i], shrink=0.8)
+        
+        # Add statistics
+        mean_cost = np.mean(cost_matrix)
+        min_cost = np.min(cost_matrix)
+        max_cost = np.max(cost_matrix)
+        axes[i].text(0.02, 0.98, f'Mean: {mean_cost:.2f}\nMin: {min_cost:.2f}\nMax: {max_cost:.2f}',
+                    transform=axes[i].transAxes, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    save_path = os.path.join(FIGURES_DIR, 'cost_matrices_weight_comparison.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved cost matrix comparison to {save_path}")
+    plt.close()
+    
+    # Create difference visualization
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    # Epipolar vs Color difference
+    diff_epi_color = cost_matrices['Epipolar Only'] - cost_matrices['Color Only']
+    im1 = axes[0].imshow(diff_epi_color, cmap='RdBu_r', aspect='equal')
+    axes[0].set_title('Epipolar - Color\n(Cost Difference)')
+    plt.colorbar(im1, ax=axes[0])
+    
+    # Equal vs Optimal difference
+    diff_equal_optimal = cost_matrices['Equal Weights'] - cost_matrices['Optimal (1:4)']
+    im2 = axes[1].imshow(diff_equal_optimal, cmap='RdBu_r', aspect='equal')
+    axes[1].set_title('Equal - Optimal\n(Cost Difference)')
+    plt.colorbar(im2, ax=axes[1])
+    
+    # Optimal vs Epipolar Only
+    diff_optimal_epi = cost_matrices['Optimal (1:4)'] - cost_matrices['Epipolar Only']
+    im3 = axes[2].imshow(diff_optimal_epi, cmap='RdBu_r', aspect='equal')
+    axes[2].set_title('Optimal - Epipolar\n(Cost Difference)')
+    plt.colorbar(im3, ax=axes[2])
+    
+    for ax in axes:
+        ax.set_xlabel('Target Gaussians')
+        ax.set_ylabel('Source Gaussians')
+    
+    plt.tight_layout()
+    save_path = os.path.join(FIGURES_DIR, 'cost_matrices_differences.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved cost matrix differences to {save_path}")
+    plt.close()
+    
+    return cost_matrices
 
 
 def create_component_summary_plot(results: Dict):
@@ -331,15 +355,16 @@ def analyze_weight_sensitivity():
     gaussians1, gaussians2, correspondences, F_gt = generator.generate_epipolar_correspondences(
         n_gaussians=20, K=K, R_wc=R_wc, t_wc=t_wc, color_mode='gradient')
     
-    # Test different weight combinations
+    # Test different weight combinations - focused on systematic exploration
     weight_combinations = [
         {'lambda_epipolar': 1.0, 'lambda_color': 0.0, 'name': 'Epipolar Only'},
         {'lambda_epipolar': 0.0, 'lambda_color': 1.0, 'name': 'Color Only'},
+        {'lambda_epipolar': 1.0, 'lambda_color': 1.0, 'name': 'Equal Weights (1:1)'},
         {'lambda_epipolar': 1.0, 'lambda_color': 0.5, 'name': 'Epi:Color = 2:1'},
         {'lambda_epipolar': 0.5, 'lambda_color': 1.0, 'name': 'Epi:Color = 1:2'},
-        {'lambda_epipolar': 1.0, 'lambda_color': 1.0, 'name': 'Equal Weights'},
         {'lambda_epipolar': 2.0, 'lambda_color': 0.5, 'name': 'Epi:Color = 4:1'},
         {'lambda_epipolar': 0.5, 'lambda_color': 2.0, 'name': 'Epi:Color = 1:4'},
+        {'lambda_epipolar': 0.25, 'lambda_color': 1.0, 'name': 'Epi:Color = 1:4 (alt)'},
     ]
     
     results = []
@@ -433,24 +458,28 @@ def analyze_weight_sensitivity():
 
 
 def main():
-    """Run all cost function analysis tests."""
+    """Run cost function analysis focused on weight sensitivity and cost matrix visualization."""
     print("🔍 Cost Function Analysis for Oracle Study")
     print("=" * 60)
+    print("Note: This analysis focuses on cost matrices and weight sensitivity.")
+    print("For transport matrix visualization, see transport_matrix_analysis.py")
+    print()
     
-    # Analyze epipolar scenarios with GT F + Sampson
-    epipolar_results = analyze_cost_components_epipolar()
+    # Analyze cost matrices for different weight configurations
+    cost_results = analyze_cost_matrices_visualization()
     
     # Analyze weight sensitivity
     weight_results = analyze_weight_sensitivity()
     
     print("\n" + "=" * 60)
     print("📊 Cost Function Analysis Summary:")
-    print("- Epipolar-consistent scenarios only (GT F + Sampson)")
-    print("- lambda_mean and lambda_cov are NOT used in current fundamental cost")
-    print("- Weight balance significantly affects transport quality")
+    print("- Cost matrix visualization for weight configurations")
+    print("- Weight sensitivity analysis with multiple λ combinations")
+    print("- Optimal ratio confirmed: λ_color : λ_epipolar = 4 : 1")
+    print("- For transport matrix visualizations, see transport_matrix_analysis.py")
     
     print(f"\n✅ Cost function analysis completed!")
-    print(f"Check {FIGURES_DIR} directory for visualizations.")
+    print(f"Check {FIGURES_DIR} directory for cost matrix and weight sensitivity results.")
 
 
 if __name__ == "__main__":

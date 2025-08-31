@@ -57,12 +57,9 @@ def main():
             (["python", "src/oracle_study/experiments/integration_validation.py"], 
              "Oracle Integration Tests"),
             
-            # Analysis experiments
-            (["python", "src/oracle_study/experiments/cost_function_analysis.py"], 
-             "Cost Function Analysis"),
-            
-            (["python", "src/oracle_study/experiments/transport_matrix_analysis.py"], 
-             "Transport Matrix Analysis"),
+            # Unified analysis experiment (combines cost function + transport matrix)
+            (["python", "src/oracle_study/experiments/unified_analysis.py"], 
+             "Unified Analysis (Cost Function + Transport Matrix)"),
         ]
         
         results = []
