@@ -338,21 +338,33 @@ class OptimalTransportSolver:
         # CHANGE 2: 以前は `/ (1+u1+u2)`
         epi_with_shape = dist_sq_sum + u1.view(-1,1) + u2.view(1,-1)    # (K1,K2)
 
-        # -------- ⑤ 色差（ --------
+        # -------- ⑤ 形状の類似度（共分散の近さ） --------
+        cov1_full = self._make_cov_matrices(self.scales1, self.rotations1)   # (K1,2,2)
+        cov2_full = self._make_cov_matrices(self.scales2, self.rotations2)   # (K2,2,2)
+        # Frobenius距離（ベクトル化後のL2）
+        cov_diff = cov1_full.unsqueeze(1) - cov2_full.unsqueeze(0)            # (K1,K2,2,2)
+        cov_dist = torch.linalg.norm(cov_diff, dim=(-2, -1))                  # (K1,K2)
+
+        # -------- ⑥ 色差 --------
         rgb_diff   = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)    # (K1,K2,3)
         color_dist = (rgb_diff ** 2).sum(2)                             # (K1,K2)
 
-        # -------- ⑥ 正規化 --------
+        # -------- ⑦ 正規化 --------
         with torch.no_grad():
             p95_epi   = torch.quantile(epi_with_shape, 0.95)
             p95_color = torch.quantile(color_dist,    0.95)
+            p95_cov   = torch.quantile(cov_dist,      0.95)
 
         epi_norm   = torch.clamp(epi_with_shape, max=p95_epi) / p95_epi
         color_norm = torch.clamp(color_dist,    max=p95_color) / p95_color
+        cov_norm   = torch.clamp(cov_dist,      max=p95_cov) / p95_cov
 
-        # -------- ⑦ コスト合成 --------
-        cost = ( self.lambda_epipolar * epi_norm
-            + self.lambda_color    * color_norm )
+        # -------- ⑧ コスト合成 --------
+        cost = (
+            self.lambda_epipolar * epi_norm
+            + self.lambda_color  * color_norm
+            + (self.lambda_cov   * cov_norm if self.lambda_cov > 0 else 0.0)
+        )
         
         cost = cost / cost.max().detach()  
 
@@ -427,24 +439,33 @@ class OptimalTransportSolver:
         uncertainty_factor = 1.0 + u1.view(-1, 1) + u2.view(1, -1)  # ブロードキャスト (K1,K2)
         sampson_with_shape = sampson / uncertainty_factor
         
-        # === 3. 色差分の計算 ===
+        # === 3. 形状の類似度（共分散の近さ） ===
+        cov1 = self._make_cov_matrices(self.scales1, self.rotations1)  # (K1,2,2)
+        cov2 = self._make_cov_matrices(self.scales2, self.rotations2)  # (K2,2,2)
+        cov_diff = cov1.unsqueeze(1) - cov2.unsqueeze(0)               # (K1,K2,2,2)
+        cov_dist = torch.linalg.norm(cov_diff, dim=(-2, -1))           # (K1,K2)
+
+        # === 4. 色差分の計算 ===
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = (color_diff ** 2).sum(dim=2)  # (K1,K2)
         
-        # === 4. 正規化と最終コスト計算 ===
-        # 4.1 95パーセンタイルでの正規化（外れ値の影響を抑制）
+        # === 5. 正規化と最終コスト計算 ===
+        # 5.1 95パーセンタイルでの正規化（外れ値の影響を抑制）
         with torch.no_grad():
             p95_sampson = torch.quantile(sampson_with_shape, 0.95)
             p95_color = torch.quantile(d_color, 0.95)
+            p95_cov   = torch.quantile(cov_dist, 0.95)
         
-        # 4.2 正規化と重み付け
+        # 5.2 正規化と重み付け
         sampson_norm = torch.clamp(sampson_with_shape, max=p95_sampson) / p95_sampson
         color_norm = torch.clamp(d_color, max=p95_color) / p95_color
+        cov_norm   = torch.clamp(cov_dist, max=p95_cov) / p95_cov
         
-        # 4.3 最終コスト行列の計算
+        # 5.3 最終コスト行列の計算
         cost = (
             self.lambda_epipolar * sampson_norm + 
-            self.lambda_color * color_norm
+            self.lambda_color * color_norm +
+            (self.lambda_cov * cov_norm if self.lambda_cov > 0 else 0.0)
         )
         
         return cost

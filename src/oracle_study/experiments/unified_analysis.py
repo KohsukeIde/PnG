@@ -20,13 +20,17 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 
-# Create experiment-specific figure directories
+# Create experiment-specific figure directories for each epipolar mode
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ORACLE_DIR = os.path.dirname(SCRIPT_DIR)  # src/oracle_study
-TRANSPORT_FIGURES_DIR = os.path.join(ORACLE_DIR, "results", "transport_matrix_analysis", "figures")
-COST_FIGURES_DIR = os.path.join(ORACLE_DIR, "results", "cost_function_analysis", "figures")
-os.makedirs(TRANSPORT_FIGURES_DIR, exist_ok=True)
-os.makedirs(COST_FIGURES_DIR, exist_ok=True)
+
+def get_mode_directories(epipolar_mode: str) -> Tuple[str, str]:
+    """Get transport and cost figures directories for a specific epipolar mode."""
+    transport_dir = os.path.join(ORACLE_DIR, "results", epipolar_mode, "transport_matrix_analysis", "figures")
+    cost_dir = os.path.join(ORACLE_DIR, "results", epipolar_mode, "cost_function_analysis", "figures")
+    os.makedirs(transport_dir, exist_ok=True)
+    os.makedirs(cost_dir, exist_ok=True)
+    return transport_dir, cost_dir
 
 
 def get_standard_scenarios():
@@ -63,11 +67,17 @@ def get_scenario_specific_weights(scenario_name: str) -> Tuple[float, float]:
         return 0.8, 0.2
 
 
-def analyze_transport_matrices():
-    """Analyze transport matrices under epipolar-consistent scenarios."""
+def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5):
+    """Analyze transport matrices under epipolar-consistent scenarios.
+
+    Args:
+        epipolar_mode: 'sed' | 'sampson' | 'hybrid'
+        hybrid_alpha: alpha for hybrid mode (0..1)
+    """
     print("=== Transport Matrix Analysis ===\n")
 
-    visualizer = TransportMatrixVisualizer(figures_dir=TRANSPORT_FIGURES_DIR)
+    transport_figures_dir, _ = get_mode_directories(epipolar_mode)
+    visualizer = TransportMatrixVisualizer(figures_dir=transport_figures_dir)
     generator = ToyProblemGenerator(seed=42)
 
     # Intrinsics
@@ -91,10 +101,15 @@ def analyze_transport_matrices():
 
         solver = OptimalTransportSolver(
             gaussians1=g1, gaussians2=g2, k1=K, k2=K,
-            epsilon=0.01, lambda_color=lambda_color, lambda_epipolar=lambda_epipolar, device='cpu')
+            epsilon=0.01,
+            lambda_color=lambda_color,
+            lambda_epipolar=lambda_epipolar,
+            epipolar_mode=epipolar_mode,
+            hybrid_alpha=hybrid_alpha,
+            device='cpu')
 
         with torch.no_grad():
-            C = solver.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
+            C = solver.compute_cost_matrix(torch.from_numpy(F_gt))
             T = solver.unbalanced_sinkhorn_algorithm(C)
             T_np = T.cpu().numpy()
 
@@ -109,12 +124,12 @@ def analyze_transport_matrices():
     visualizer.compare_transport_matrices(transport_matrices, save_path='transport_matrices_comparison_epipolar.png')
 
     print(f"\n🎉 Transport matrix analysis completed!")
-    print(f"Results saved to: {TRANSPORT_FIGURES_DIR}")
+    print(f"Results saved to: {transport_figures_dir}")
     
     return transport_matrices
 
 
-def analyze_cost_functions():
+def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5):
     """Analyze cost function weight sensitivity and cost matrix properties.
     
     This function focuses on:
@@ -124,12 +139,13 @@ def analyze_cost_functions():
     
     Note: Transport matrix visualizations are handled in analyze_transport_matrices()
     """
-    print("\n=== Cost Function Analysis ===\n")
-    print("Analyzing cost matrices and weight sensitivity...")
+    print(f"\n=== Cost Function Analysis ({epipolar_mode}) ===\n")
+    print(f"Analyzing cost matrices and weight sensitivity for {epipolar_mode} mode...")
     print("(Transport matrix visualizations are handled separately)\n")
 
     # Create visualizer for cost function analysis
-    cost_visualizer = TransportMatrixVisualizer(figures_dir=COST_FIGURES_DIR)
+    _, cost_figures_dir = get_mode_directories(epipolar_mode)
+    cost_visualizer = TransportMatrixVisualizer(figures_dir=cost_figures_dir)
     generator = ToyProblemGenerator(seed=42)
     K = np.array([[800, 0, 400], [0, 800, 400], [0, 0, 1]], dtype=np.float32)
 
@@ -151,10 +167,14 @@ def analyze_cost_functions():
         
         solver = OptimalTransportSolver(
             gaussians1=g1, gaussians2=g2, k1=K, k2=K, epsilon=0.01,
-            lambda_color=weights['lambda_color'], lambda_epipolar=weights['lambda_epipolar'], device='cpu')
+            lambda_color=weights['lambda_color'],
+            lambda_epipolar=weights['lambda_epipolar'],
+            epipolar_mode=epipolar_mode,
+            hybrid_alpha=hybrid_alpha,
+            device='cpu')
         
         with torch.no_grad():
-            C = solver.compute_cost_matrix_fundamental(torch.from_numpy(F_gt))
+            C = solver.compute_cost_matrix(torch.from_numpy(F_gt))
             T = solver.unbalanced_sinkhorn_algorithm(C)
             T_np = T.cpu().numpy()
             C_np = C.cpu().numpy()
@@ -182,8 +202,8 @@ def analyze_cost_functions():
     analyze_cost_matrices_visualization(cost_matrices, cost_visualizer)
     create_weight_sensitivity_summary(stats_results, cost_visualizer)
 
-    print(f"\n🎉 Cost function analysis completed!")
-    print(f"Results saved to: {COST_FIGURES_DIR}")
+    print(f"\n🎉 Cost function analysis ({epipolar_mode}) completed!")
+    print(f"Results saved to: {cost_figures_dir}")
     
     return stats_results
 
@@ -211,7 +231,7 @@ def analyze_cost_matrices_visualization(cost_matrices: Dict[str, np.ndarray], vi
         axes[i].set_visible(False)
     
     plt.tight_layout()
-    save_path = os.path.join(COST_FIGURES_DIR, 'cost_matrices_weight_comparison.png')
+    save_path = os.path.join(visualizer.figures_dir, 'cost_matrices_weight_comparison.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Saved cost matrix comparison to {save_path}")
     plt.close()
@@ -266,7 +286,7 @@ def analyze_cost_matrices_visualization(cost_matrices: Dict[str, np.ndarray], vi
                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
             
             plt.tight_layout()
-            save_path = os.path.join(COST_FIGURES_DIR, 'cost_matrices_differences.png')
+            save_path = os.path.join(visualizer.figures_dir, 'cost_matrices_differences.png')
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Saved cost matrix differences to {save_path} ({n_comparisons} comparisons)")
             plt.close()
@@ -334,41 +354,115 @@ def create_weight_sensitivity_summary(stats_results: Dict, visualizer):
                      xytext=(5, 5), textcoords='offset points', fontsize=8)
     
     plt.tight_layout()
-    save_path = os.path.join(COST_FIGURES_DIR, 'weight_sensitivity_analysis.png')
+    save_path = os.path.join(visualizer.figures_dir, 'weight_sensitivity_analysis.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Saved weight sensitivity analysis to {save_path}")
     plt.close()
 
 
+def run_all_modes():
+    """Run unified analysis for all epipolar modes (sed, sampson, hybrid)."""
+    modes = [
+        {'mode': 'sed', 'alpha': 0.5},
+        {'mode': 'sampson', 'alpha': 0.5}, 
+        {'mode': 'hybrid', 'alpha': 0.5}
+    ]
+    
+    all_results = {}
+    
+    print("🔍 Unified Oracle Study Analysis - All Modes")
+    print("=" * 60)
+    print("Running analysis for all epipolar modes: sed, sampson, hybrid")
+    print("Results will be saved to mode-specific directories")
+    print("=" * 60)
+    
+    for config in modes:
+        mode = config['mode']
+        alpha = config['alpha']
+        
+        print(f"\n{'='*20} ANALYZING MODE: {mode.upper()} {'='*20}")
+        
+        # Run transport matrix analysis for this mode
+        transport_results = analyze_transport_matrices(epipolar_mode=mode, hybrid_alpha=alpha)
+        
+        # Run cost function analysis for this mode  
+        cost_results = analyze_cost_functions(epipolar_mode=mode, hybrid_alpha=alpha)
+        
+        all_results[mode] = {
+            'transport': transport_results,
+            'cost': cost_results,
+            'config': config
+        }
+        
+        print(f"\n✅ Mode {mode} completed successfully!")
+    
+    # Overall summary
+    print("\n" + "=" * 60)
+    print("📊 Overall Analysis Summary:")
+    
+    for mode, results in all_results.items():
+        transport_dir, cost_dir = get_mode_directories(mode)
+        print(f"\n{mode.upper()} Mode:")
+        print(f"  - Transport matrix analysis: {transport_dir}")
+        print(f"  - Cost function analysis: {cost_dir}")
+        print(f"  - Analyzed {len(results['transport'])} transport scenarios")
+        print(f"  - Evaluated {len(results['cost'])} weight configurations")
+        
+        # Find best configuration for this mode
+        best_config = max(results['cost'].keys(), key=lambda k: results['cost'][k]['diagonal_concentration'])
+        best_score = results['cost'][best_config]['diagonal_concentration']
+        print(f"  - Best weight config: {best_config} (diagonal concentration: {best_score:.3f})")
+    
+    print(f"\n🎉 All modes analysis completed successfully!")
+    print("Check the mode-specific directories for all visualizations.")
+    
+    return all_results
+
+
 def main():
     """Run unified analysis combining transport matrix and cost function analysis."""
-    print("🔍 Unified Oracle Study Analysis")
-    print("=" * 60)
-    print("This script combines transport matrix analysis and cost function analysis")
-    print("with proper output separation into respective directories.")
-    print("=" * 60)
-
-    # 1. Transport Matrix Analysis
-    transport_results = analyze_transport_matrices()
-
-    # 2. Cost Function Analysis  
-    cost_results = analyze_cost_functions()
-
-    # 3. Summary
-    print("\n" + "=" * 60)
-    print("📊 Unified Analysis Summary:")
-    print(f"- Transport matrix analysis (visualization): {TRANSPORT_FIGURES_DIR}")
-    print(f"- Cost function analysis (matrices & weights): {COST_FIGURES_DIR}")
-    print(f"- Analyzed {len(transport_results)} transport scenarios")
-    print(f"- Evaluated {len(cost_results)} weight configurations")
+    import argparse
+    parser = argparse.ArgumentParser(description='Unified Oracle Study Analysis', add_help=True)
+    parser.add_argument('--epipolar-mode', choices=['sed', 'sampson', 'hybrid', 'all'], default='all', 
+                        help='Epipolar cost mode (use "all" to run all modes)')
+    parser.add_argument('--hybrid-alpha', type=float, default=0.5, help='Alpha for hybrid mode (0..1)')
+    # Allow being called via run_experiment.py where positional 'unified_analysis' may remain in argv
+    args, _unknown = parser.parse_known_args()
     
-    # Find best configuration
-    best_config = max(cost_results.keys(), key=lambda k: cost_results[k]['diagonal_concentration'])
-    best_score = cost_results[best_config]['diagonal_concentration']
-    print(f"- Best weight configuration: {best_config} (diagonal concentration: {best_score:.3f})")
+    if args.epipolar_mode == 'all':
+        # Run analysis for all modes
+        run_all_modes()
+    else:
+        # Run analysis for single mode (legacy behavior)
+        print("🔍 Unified Oracle Study Analysis")
+        print("=" * 60)
+        print("This script combines transport matrix analysis and cost function analysis")
+        print("with proper output separation into respective directories.")
+        print("=" * 60)
 
-    print(f"\n✅ Unified analysis completed successfully!")
-    print("Check the respective directories for all visualizations.")
+        # 1. Transport Matrix Analysis
+        transport_results = analyze_transport_matrices(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha)
+
+        # 2. Cost Function Analysis  
+        cost_results = analyze_cost_functions(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha)
+
+        # 3. Summary
+        transport_dir, cost_dir = get_mode_directories(args.epipolar_mode)
+        print("\n" + "=" * 60)
+        print("📊 Unified Analysis Summary:")
+        print(f"- Transport matrix analysis (visualization): {transport_dir}")
+        print(f"- Cost function analysis (matrices & weights): {cost_dir}")
+        print(f"- Epipolar mode: {args.epipolar_mode} (hybrid_alpha={args.hybrid_alpha:.2f})")
+        print(f"- Analyzed {len(transport_results)} transport scenarios")
+        print(f"- Evaluated {len(cost_results)} weight configurations")
+        
+        # Find best configuration
+        best_config = max(cost_results.keys(), key=lambda k: cost_results[k]['diagonal_concentration'])
+        best_score = cost_results[best_config]['diagonal_concentration']
+        print(f"- Best weight configuration: {best_config} (diagonal concentration: {best_score:.3f})")
+
+        print(f"\n✅ Unified analysis completed successfully!")
+        print("Check the respective directories for all visualizations.")
 
 
 if __name__ == "__main__":
