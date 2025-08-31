@@ -30,6 +30,8 @@ class OptimalTransportSolver:
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
         lambda_epipolar: float = 1.0,
+        epipolar_mode: str = "sed",  # one of {"sed", "sampson", "hybrid"}
+        hybrid_alpha: float = 0.5,    # when epipolar_mode == "hybrid": alpha in [0,1]
         device: Optional[torch.device] = None,
     ):
         """Initialize the OptimalTransportSolver.
@@ -71,6 +73,13 @@ class OptimalTransportSolver:
         self.lambda_cov = lambda_cov
         self.lambda_color = lambda_color
         self.lambda_epipolar = lambda_epipolar
+        # Epipolar cost selection
+        self.epipolar_mode = epipolar_mode.lower()
+        if self.epipolar_mode not in {"sed", "sampson", "hybrid"}:
+            raise ValueError(f"Invalid epipolar_mode: {epipolar_mode}. Choose from 'sed', 'sampson', 'hybrid'.")
+        self.hybrid_alpha = float(hybrid_alpha)
+        if not (0.0 <= self.hybrid_alpha <= 1.0):
+            raise ValueError("hybrid_alpha must be in [0, 1].")
 
         # Convert Gaussian parameters to torch tensors
         self._prepare_gaussians()
@@ -259,6 +268,23 @@ class OptimalTransportSolver:
         scale_mat = torch.stack([torch.diag(s**2) for s in scales])
         return rot @ scale_mat @ rot.transpose(1, 2)   # (K,2,2)
     
+    def compute_cost_matrix(self, F: torch.Tensor) -> torch.Tensor:
+        """Dispatch to selected epipolar cost.
+
+        Modes:
+        - "sed":     Symmetric epipolar distance (+ shape) + color
+        - "sampson": Sampson distance (+ shape) + color
+        - "hybrid":  alpha * Sampson + (1-alpha) * SED (same lambda weights)
+        """
+        if self.epipolar_mode == "sed":
+            return self.compute_cost_matrix_fundamental(F)
+        elif self.epipolar_mode == "sampson":
+            return self.compute_cost_matrix_fundamental_sampson(F)
+        else:
+            c_samp = self.compute_cost_matrix_fundamental_sampson(F)
+            c_sed = self.compute_cost_matrix_fundamental(F)
+            return self.hybrid_alpha * c_samp + (1.0 - self.hybrid_alpha) * c_sed
+
 
     def compute_cost_matrix_fundamental(self, F: torch.Tensor) -> torch.Tensor:
         """
@@ -637,7 +663,7 @@ class OptimalTransportSolver:
 
             # 基礎行列と損失の計算
             F = self._build_F_from_wc(R_wc, t_wc)
-            cost_matrix = self.compute_cost_matrix_fundamental(F)
+            cost_matrix = self.compute_cost_matrix(F)
             transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
             loss = torch.sum(transport * cost_matrix)
             
@@ -938,7 +964,7 @@ class OptimalTransportSolver:
             
             # Fundamental matrix → Cost → Transport → Loss
             F = self._build_F_from_wc(R_wc, t_hat)
-            C = self.compute_cost_matrix_fundamental(F)
+            C = self.compute_cost_matrix(F)
             T = self.unbalanced_sinkhorn_algorithm(
                 cost_matrix=C,
                 epsilon=sinkhorn_epsilon,
@@ -1132,5 +1158,3 @@ class OptimalTransportSolver:
         print(f"Final quaternion norm: {q_final_normalized.norm().item():.6f}")
         print(f"Final R_wc det: {torch.linalg.det(self.R_wc).item():.6f}")
         return loss_history
-
-

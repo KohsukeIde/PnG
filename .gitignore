@@ -34,6 +34,8 @@ utils/rodrigues_numerical_comparison.png
 perspective_n_gaussian.pdf
 overview.tex
 /.kiro/*
+/AGENTS.md
 
 # Oracle study results (experimental data and figures)
 src/oracle_study/results/*
+
