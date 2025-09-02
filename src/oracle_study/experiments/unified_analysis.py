@@ -67,7 +67,7 @@ def get_scenario_specific_weights(scenario_name: str) -> Tuple[float, float]:
         return 0.8, 0.2
 
 
-def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5):
+def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5, lambda_cov: float = 0.3):
     """Analyze transport matrices under epipolar-consistent scenarios.
 
     Args:
@@ -104,6 +104,7 @@ def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: floa
             epsilon=0.01,
             lambda_color=lambda_color,
             lambda_epipolar=lambda_epipolar,
+            lambda_cov=lambda_cov,
             epipolar_mode=epipolar_mode,
             hybrid_alpha=hybrid_alpha,
             device='cpu')
@@ -129,7 +130,7 @@ def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: floa
     return transport_matrices
 
 
-def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5):
+def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5, lambda_cov: float = 0.3):
     """Analyze cost function weight sensitivity and cost matrix properties.
     
     This function focuses on:
@@ -169,6 +170,7 @@ def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 
             gaussians1=g1, gaussians2=g2, k1=K, k2=K, epsilon=0.01,
             lambda_color=weights['lambda_color'],
             lambda_epipolar=weights['lambda_epipolar'],
+            lambda_cov=lambda_cov,
             epipolar_mode=epipolar_mode,
             hybrid_alpha=hybrid_alpha,
             device='cpu')
@@ -426,6 +428,7 @@ def main():
     parser.add_argument('--epipolar-mode', choices=['sed', 'sampson', 'hybrid', 'all'], default='all', 
                         help='Epipolar cost mode (use "all" to run all modes)')
     parser.add_argument('--hybrid-alpha', type=float, default=0.5, help='Alpha for hybrid mode (0..1)')
+    parser.add_argument('--lambda-cov', type=float, default=0.3, help='Weight for covariance (Bures) term')
     # Allow being called via run_experiment.py where positional 'unified_analysis' may remain in argv
     args, _unknown = parser.parse_known_args()
     
@@ -441,10 +444,10 @@ def main():
         print("=" * 60)
 
         # 1. Transport Matrix Analysis
-        transport_results = analyze_transport_matrices(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha)
+        transport_results = analyze_transport_matrices(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha, lambda_cov=args.lambda_cov)
 
         # 2. Cost Function Analysis  
-        cost_results = analyze_cost_functions(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha)
+        cost_results = analyze_cost_functions(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha, lambda_cov=args.lambda_cov)
 
         # 3. Summary
         transport_dir, cost_dir = get_mode_directories(args.epipolar_mode)
@@ -453,6 +456,7 @@ def main():
         print(f"- Transport matrix analysis (visualization): {transport_dir}")
         print(f"- Cost function analysis (matrices & weights): {cost_dir}")
         print(f"- Epipolar mode: {args.epipolar_mode} (hybrid_alpha={args.hybrid_alpha:.2f})")
+        print(f"- Lambda cov (Bures): {args.lambda_cov:.3f}")
         print(f"- Analyzed {len(transport_results)} transport scenarios")
         print(f"- Evaluated {len(cost_results)} weight configurations")
         

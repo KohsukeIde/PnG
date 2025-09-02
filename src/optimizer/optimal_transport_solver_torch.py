@@ -50,7 +50,7 @@ class OptimalTransportSolver:
         self.gaussians1 = copy.deepcopy(gaussians1)
         self.gaussians2 = copy.deepcopy(gaussians2)
 
-        if device is None:
+        if device is ざNone:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
@@ -268,6 +268,67 @@ class OptimalTransportSolver:
         scale_mat = torch.stack([torch.diag(s**2) for s in scales])
         return rot @ scale_mat @ rot.transpose(1, 2)   # (K,2,2)
     
+    def _matrix_sqrt_spd2x2(self, matrices: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Batch square-root for 2x2 SPD matrices with symmetrization and jitter."""
+        # Ensure symmetric
+        matrices = 0.5 * (matrices + matrices.transpose(-2, -1))
+        # Add small jitter for numerical stability
+        eye = torch.eye(2, device=matrices.device, dtype=matrices.dtype)
+        matrices = matrices + eps * eye
+        # Flatten batch dims
+        batch_shape = matrices.shape[:-2]
+        mats2 = matrices.reshape(-1, 2, 2)
+        # EVD
+        evals, evecs = torch.linalg.eigh(mats2)
+        evals = torch.clamp(evals, min=eps).sqrt()
+        sqrt_diag = torch.diag_embed(evals)
+        sqrt_mats = evecs @ sqrt_diag @ evecs.transpose(-2, -1)
+        return sqrt_mats.reshape(*batch_shape, 2, 2)
+
+    def _bures_wasserstein_cov_dist(self, cov1: torch.Tensor, cov2: torch.Tensor) -> torch.Tensor:
+        """Pairwise Bures (W2^2) distance between 2x2 SPD covariances.
+
+        Args:
+            cov1: (K1,2,2)
+            cov2: (K2,2,2)
+        Returns:
+            (K1,K2) matrix with d_Bures^2(cov1[i], cov2[j])
+        """
+        # Precompute sqrt of cov1
+        sqrt1 = self._matrix_sqrt_spd2x2(cov1)                  # (K1,2,2)
+        # Broadcast to pairwise
+        cov1_exp = cov1.unsqueeze(1)                             # (K1,1,2,2)
+        cov2_exp = cov2.unsqueeze(0)                             # (1,K2,2,2)
+        sqrt1_exp = sqrt1.unsqueeze(1)                           # (K1,1,2,2)
+        # Intermediate and its sqrt
+        inter = sqrt1_exp @ cov2_exp @ sqrt1_exp                 # (K1,K2,2,2)
+        sqrt_inter = self._matrix_sqrt_spd2x2(inter)             # (K1,K2,2,2)
+        # Trace of A + B - 2*sqrt(sqrt(A) B sqrt(A))
+        diff = cov1_exp + cov2_exp - 2.0 * sqrt_inter
+        # Enforce symmetry before diagonal extraction
+        diff = 0.5 * (diff + diff.transpose(-2, -1))
+        tr = torch.diagonal(diff, dim1=-2, dim2=-1).sum(-1)
+        tr = torch.clamp(tr, min=0.0)
+        return tr  # (K1,K2)
+
+    def _median_offdiag(self, M: torch.Tensor) -> torch.Tensor:
+        """Median of off-diagonal elements if square; else median of all elements."""
+        k1, k2 = M.shape
+        if k1 == k2 and k1 > 1:
+            mask = ~torch.eye(k1, dtype=torch.bool, device=M.device)
+            vals = M[mask]
+        else:
+            vals = M.reshape(-1)
+        return vals.median()
+
+    def _huber_normalize(self, M: torch.Tensor, k: Optional[torch.Tensor] = None, eps: float = 1e-6) -> torch.Tensor:
+        """Huber-like normalization: x / (x + k), with k from off-diagonal median by default."""
+        if k is None:
+            with torch.no_grad():
+                k = self._median_offdiag(torch.nan_to_num(M.detach(), nan=0.0, posinf=1e6, neginf=0.0))
+        k = torch.clamp(k, min=eps)
+        return M / (M + k)
+
     def compute_cost_matrix(self, F: torch.Tensor) -> torch.Tensor:
         """Dispatch to selected epipolar cost.
 
@@ -338,26 +399,20 @@ class OptimalTransportSolver:
         # CHANGE 2: 以前は `/ (1+u1+u2)`
         epi_with_shape = dist_sq_sum + u1.view(-1,1) + u2.view(1,-1)    # (K1,K2)
 
-        # -------- ⑤ 形状の類似度（共分散の近さ） --------
+        # -------- ⑤ 形状の類似度（Bures/Wasserstein距離） --------
         cov1_full = self._make_cov_matrices(self.scales1, self.rotations1)   # (K1,2,2)
         cov2_full = self._make_cov_matrices(self.scales2, self.rotations2)   # (K2,2,2)
-        # Frobenius距離（ベクトル化後のL2）
-        cov_diff = cov1_full.unsqueeze(1) - cov2_full.unsqueeze(0)            # (K1,K2,2,2)
-        cov_dist = torch.linalg.norm(cov_diff, dim=(-2, -1))                  # (K1,K2)
+        cov_dist = self._bures_wasserstein_cov_dist(cov1_full, cov2_full)    # (K1,K2)
 
         # -------- ⑥ 色差 --------
         rgb_diff   = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)    # (K1,K2,3)
         color_dist = (rgb_diff ** 2).sum(2)                             # (K1,K2)
 
         # -------- ⑦ 正規化 --------
-        with torch.no_grad():
-            p95_epi   = torch.quantile(epi_with_shape, 0.95)
-            p95_color = torch.quantile(color_dist,    0.95)
-            p95_cov   = torch.quantile(cov_dist,      0.95)
-
-        epi_norm   = torch.clamp(epi_with_shape, max=p95_epi) / p95_epi
-        color_norm = torch.clamp(color_dist,    max=p95_color) / p95_color
-        cov_norm   = torch.clamp(cov_dist,      max=p95_cov) / p95_cov
+        # Huber型正規化（kは非対角median）
+        epi_norm   = self._huber_normalize(epi_with_shape)
+        color_norm = self._huber_normalize(color_dist)
+        cov_norm   = self._huber_normalize(cov_dist)
 
         # -------- ⑧ コスト合成 --------
         cost = (
@@ -365,8 +420,6 @@ class OptimalTransportSolver:
             + self.lambda_color  * color_norm
             + (self.lambda_cov   * cov_norm if self.lambda_cov > 0 else 0.0)
         )
-        
-        cost = cost / cost.max().detach()  
 
         return cost
 
@@ -439,29 +492,21 @@ class OptimalTransportSolver:
         uncertainty_factor = 1.0 + u1.view(-1, 1) + u2.view(1, -1)  # ブロードキャスト (K1,K2)
         sampson_with_shape = sampson / uncertainty_factor
         
-        # === 3. 形状の類似度（共分散の近さ） ===
+        # === 3. 形状の類似度（Bures/Wasserstein距離） ===
         cov1 = self._make_cov_matrices(self.scales1, self.rotations1)  # (K1,2,2)
         cov2 = self._make_cov_matrices(self.scales2, self.rotations2)  # (K2,2,2)
-        cov_diff = cov1.unsqueeze(1) - cov2.unsqueeze(0)               # (K1,K2,2,2)
-        cov_dist = torch.linalg.norm(cov_diff, dim=(-2, -1))           # (K1,K2)
+        cov_dist = self._bures_wasserstein_cov_dist(cov1, cov2)        # (K1,K2)
 
         # === 4. 色差分の計算 ===
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = (color_diff ** 2).sum(dim=2)  # (K1,K2)
         
-        # === 5. 正規化と最終コスト計算 ===
-        # 5.1 95パーセンタイルでの正規化（外れ値の影響を抑制）
-        with torch.no_grad():
-            p95_sampson = torch.quantile(sampson_with_shape, 0.95)
-            p95_color = torch.quantile(d_color, 0.95)
-            p95_cov   = torch.quantile(cov_dist, 0.95)
+        # === 5. Huber型正規化と最終コスト計算 ===
+        sampson_norm = self._huber_normalize(sampson_with_shape)
+        color_norm   = self._huber_normalize(d_color)
+        cov_norm     = self._huber_normalize(cov_dist)
         
-        # 5.2 正規化と重み付け
-        sampson_norm = torch.clamp(sampson_with_shape, max=p95_sampson) / p95_sampson
-        color_norm = torch.clamp(d_color, max=p95_color) / p95_color
-        cov_norm   = torch.clamp(cov_dist, max=p95_cov) / p95_cov
-        
-        # 5.3 最終コスト行列の計算
+        # 最終コスト行列の計算
         cost = (
             self.lambda_epipolar * sampson_norm + 
             self.lambda_color * color_norm +
@@ -470,150 +515,7 @@ class OptimalTransportSolver:
         
         return cost
 
-    def compute_cost_matrix_fundamental_original(self, f: torch.Tensor) -> torch.Tensor:
-        """Compute the cost matrix between two sets of 2D Gaussians using a Fundamental Matrix.
-
-        This replaces the Homography-based distance with an epipolar distance.
-        Also includes color difference and covariance difference terms.
-
-        Args:
-            f (torch.Tensor): The Fundamental matrix (3x3).
-
-        Returns:
-            torch.Tensor: Cost matrix of shape (K1, K2).
-        """
-        # 1) 画像1,2 それぞれのGaussians数
-        k1 = self.means1.shape[0]
-        k2 = self.means2.shape[0]
-
-        # 2) 平均点を同次座標化 (x,y,1)
-        ones1 = torch.ones((k1, 1), dtype=torch.float32, device=self.device)
-        p1_homo = torch.cat([self.means1, ones1], dim=1)  # (K1,3)
-
-        ones2 = torch.ones((k2, 1), dtype=torch.float32, device=self.device)
-        p2_homo = torch.cat([self.means2, ones2], dim=1)  # (K2,3)
-
-        # 3) p2_j に対応するエピポーラ線を画像1上で計算: l1[j] = F * p2[j]
-        #    p1_i に対応するエピポーラ線を画像2上で計算: l2[i] = F^T * p1[i]
-        #    (shape: l1 -> (K2,3), l2 -> (K1,3))
-        l1 = (f @ p2_homo.T).T  # (K2,3)
-        l2 = (f.t() @ p1_homo.T).T  # (K1,3)
-
-        # 4) p1[i] と l1[j] の距離をペアごとに計算
-        #    l1[j] = (a_j, b_j, c_j), p1[i] = (x_i, y_i, 1)
-        #    dist_12(i,j) = | p1[i]·l1[j] | / sqrt(a_j^2 + b_j^2)
-        #
-        #   - numerator_12(i,j) = | p1[i]·l1[j] |
-        #   - denominator_12(j) = sqrt(a_j^2 + b_j^2)
-        #   → shape はそれぞれ (K1,K2), (K2,) になり
-        #     dist_12 = numerator_12 / denom_12(ブロードキャスト)
-        numerator_12 = torch.abs(p1_homo @ l1.T)    # => (K1, K2)
-        denom_12 = torch.sqrt(l1[:, 0] ** 2 + l1[:, 1] ** 2 + 1e-12)  # (K2,)
-        denom_12 = denom_12.view(1, -1)  # (1,K2) for broadcast
-        dist_12 = numerator_12 / denom_12  # (K1,K2)
-
-        # 5) p2[j] と l2[i] の距離をペアごとに計算
-        #    l2[i] = (a_i, b_i, c_i), p2[j] = (x_j, y_j, 1)
-        #    dist_21(i,j) = | p2[j]·l2[i] | / sqrt(a_i^2 + b_i^2)
-        #
-        #   - numerator_21(i,j) = | p2[j]·l2[i] |
-        #   - denominator_21(i)  = sqrt(a_i^2 + b_i^2)
-        #   → shape はそれぞれ (K2,K1) (K1,) となるのを転置して (K1,K2) など
-        numerator_21 = torch.abs(p2_homo @ l2.T)    # => (K2, K1)
-        numerator_21 = numerator_21.T              # => (K1, K2)
-        denom_21 = torch.sqrt(l2[:, 0] ** 2 + l2[:, 1] ** 2 + 1e-12)  # (K1,)
-        denom_21 = denom_21.view(-1, 1)            # (K1,1)
-        dist_21 = numerator_21 / denom_21          # (K1,K2)
-
-        # 6) 対称エピポーラ距離を合計
-        #    epipolar_dist(i,j) = dist_12(i,j) + dist_21(i,j)
-        epipolar_dist = dist_12 + dist_21
-
-        # 7) カラー差分 (RGB) を計算
-        #    color_diff(i,j) = sum_k ( rgb1[i][k] - rgb2[j][k] )^2
-        color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
-        d_color = torch.sum(color_diff ** 2, dim=2)  # (K1,K2)
-        
-        # 8) 共分散制約の計算
-        #    R,tから予測される共分散の変換を計算し、実際の共分散との差を求める
-        
-        # 8.2) 共分散差分を初期化（すべてのペアに対して）
-        cov_diff = torch.zeros((k1, k2), device=self.device)
-        
-        # 8.3) 各ガウシアンペアの共分散差分を計算
-        for i in range(k1):
-            # 画像1のガウシアンの共分散行列を取得
-            scale1 = self.scales1[i]
-            rotation1 = self.rotations1[i]
-            
-            # 回転行列の計算
-            cos_r = torch.cos(rotation1)
-            sin_r = torch.sin(rotation1)
-            R_2d = torch.tensor([
-                [cos_r, -sin_r],
-                [sin_r, cos_r]
-            ], device=self.device)
-            
-            # スケール行列
-            S_diag = torch.diag(scale1.pow(2))
-            
-            # 共分散行列: R * S * R^T
-            cov1 = R_2d @ S_diag @ R_2d.t()
-            
-            # エピポーラ線ベクトルを計算（F * x1）
-            p1 = p1_homo[i]  # (3,)
-            epipolar_lines = f @ p1  # (3,)：画像2上のエピポーラ線
-            
-            # エピポーラ線の方向ベクトル [normalized(-b, a)]
-            line_dir = torch.tensor([-epipolar_lines[1], epipolar_lines[0]], 
-                                device=self.device)
-            line_dir = line_dir / (torch.norm(line_dir) + 1e-10)  # 正規化
-            
-            # R,tに基づく共分散の変換（エピポーラ線方向に伸長）
-            # 奥行きの不確かさがエピポーラ線方向の不確かさとして現れる
-            scale_factor = 2.0  # エピポーラ線方向の伸長係数（調整可能）
-            line_outer = torch.outer(line_dir, line_dir)
-            transform = torch.eye(2, device=self.device) + (scale_factor - 1.0) * line_outer
-            
-            # 変換された共分散行列
-            transformed_cov1 = transform @ cov1 @ transform.t()
-            
-            for j in range(k2):
-                # 画像2のガウシアンの共分散行列を取得
-                scale2 = self.scales2[j]
-                rotation2 = self.rotations2[j]
-                
-                cos_r2 = torch.cos(rotation2)
-                sin_r2 = torch.sin(rotation2)
-                R_2d2 = torch.tensor([
-                    [cos_r2, -sin_r2],
-                    [sin_r2, cos_r2]
-                ], device=self.device)
-                
-                S_diag2 = torch.diag(scale2.pow(2))
-                cov2 = R_2d2 @ S_diag2 @ R_2d2.t()
-                
-                # 共分散の差をフロベニウスノルムで計算
-                diff = torch.norm(transformed_cov1 - cov2, 'fro')
-                cov_diff[i, j] = diff
-        
-        # 9) 各コスト要素の正規化
-        with torch.no_grad():
-            p95_epipolar = torch.quantile(epipolar_dist, 0.95)
-            p95_color = torch.quantile(d_color, 0.95)
-            p95_cov = torch.quantile(cov_diff, 0.95)
-
-        epipolar_dist = torch.clamp(epipolar_dist, max=p95_epipolar) / p95_epipolar
-        d_color = torch.clamp(d_color, max=p95_color) / p95_color
-        cov_diff = torch.clamp(cov_diff, max=p95_cov) / p95_cov
-
-        cost_matrix = (
-            self.lambda_epipolar * epipolar_dist + 
-            self.lambda_color * d_color + 
-            self.lambda_cov * cov_diff
-        )
-
-        return cost_matrix
+    # (Legacy) compute_cost_matrix_fundamental_original removed: Frobenius-based covariance term deprecated.
 
 
 
