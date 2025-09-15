@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from src.primitive.twod_gaussians import TwoDGaussians
+from src.primitive.twod_gaussians_rs import TwoDGaussians
 
 
 class SingleImageGaussianMixtureEM:
@@ -33,43 +33,47 @@ class SingleImageGaussianMixtureEM:
         #     raise ValueError("Input image must be a 3-channel color image")
 
     def initialize_gaussians(
-        self, n_gaussians: int, alpha_0: float = 0.4
+        self, n_gaussians: int
     ) -> TwoDGaussians:
-        """Initialize Gaussians with naive settings.
+        """Initialize Gaussians with proper settings.
 
         Args:
             n_gaussians (int): Number of Gaussians to initialize.
-            alpha_0 (float, optional): Initial alpha value. Defaults to 0.4.
 
         Returns:
             TwoDGaussians: Initialized Gaussians.
         """
         height, width = self.image.shape[:2]
+        eps = 1e-12
 
-        # Initialize positions randomly
-        means = np.random.rand(n_gaussians, 2) * [height, width]
+        # Initialize positions randomly (y, x) order to match coordinate system
+        means = np.column_stack([
+            np.random.uniform(0, height, size=n_gaussians),
+            np.random.uniform(0, width, size=n_gaussians),
+        ]).astype(np.float64)
 
-        # Initialize rotation angles randomly
-        # rotation_angles = np.random.uniform(0, 2*np.pi, n_gaussians)
+        # Initialize covariances with proper variance units (px^2)
+        sigma0 = (0.1 * min(height, width)) ** 2
+        covs = np.tile(np.eye(2) * sigma0, (n_gaussians, 1, 1)).astype(np.float64)
 
-        # Initialize scales with constant for now
-        # scale_const = np.sqrt(min(height, width)/10)
-        # scale_x = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
-        # scale_y = np.full(n_gaussians, scale_const) #[n_gaussian, 1]
+        # Initialize RGB values from the image as intensities
+        rgb = np.array([self.image[int(y), int(x)] for y, x in means], dtype=np.float64)
+        rgb = np.maximum(rgb, eps)  # Avoid zeros - keep as intensities (no normalization)
 
-        # Initialize covariances with constant for now
-        cov_const = np.sqrt(height * width) / 10  # adjustable constant
-        covs = np.array([np.eye(2) * cov_const for _ in range(n_gaussians)])
-        # covs = np.array([TwoDGaussians.params_to_cov(angle, sx, sy) for angle, sx, sy in zip(rotation_angles, scale_x, scale_y)])
-
-        # Initialize RGB values from the image
-        rgb = np.array([self.image[int(y), int(x)] for y, x in means])
-        # Initialize alpha values
-        alpha = np.full(n_gaussians, alpha_0)
-        return TwoDGaussians(means, covs, rgb, alpha)
+        # Initialize mixing coefficients (uniform distribution)
+        alpha = np.full(n_gaussians, 1.0 / n_gaussians, dtype=np.float64)
+        
+        # Initialize rotations (zero rotation)
+        rotations = np.zeros(n_gaussians, dtype=np.float64)
+        
+        # Initialize scales from covariance matrices
+        eigenvalues, _ = np.linalg.eigh(covs)
+        scales = np.sqrt(eigenvalues)  # Convert to standard deviations
+        
+        return TwoDGaussians(means, covs, rgb, alpha, rotations, scales)
 
     def gaussian_pdf(
-        self, mean: np.ndarray, cov: np.ndarray, height: int, width: int
+        self, mean: np.ndarray, cov: np.ndarray, height: int, width: int, normalize_per_k: bool = False
     ) -> np.ndarray:
         """Compute the Gaussian PDF for multiple points and multiple Gaussians.
 
@@ -78,230 +82,221 @@ class SingleImageGaussianMixtureEM:
             cov (np.ndarray): Covariance matrices, shape (K, 2, 2)
             height (int): Height of the image
             width (int): Width of the image
+            normalize_per_k (bool): Whether to normalize each Gaussian on discrete grid (for Multinomial)
 
         Returns:
             np.ndarray: Gaussian PDF values, shape (height, width, K)
         """
-        k = mean.shape[0]
-        cov_inv = np.linalg.pinv(cov)  # (K, 2, 2)
-        cov_inv += np.eye(2)[None, :, :] * 1e-6
+        eps = 1e-12
+        
+        # Create grid coordinates
+        y, x = np.mgrid[0:height, 0:width]
+        xy = np.stack([y, x], axis=-1).astype(np.float64)  # (H, W, 2)
 
-        cov_det = np.linalg.det(cov)  # (K,)
+        K = mean.shape[0]
+        
+        # Regularize covariance matrices before inversion
+        cov_reg = cov + eps * np.eye(2)[None, :, :]  # (K, 2, 2)
+        inv = np.linalg.inv(cov_reg)  # (K, 2, 2)
+        det = np.clip(np.linalg.det(cov_reg), eps, None)  # (K,)
 
-        n = np.zeros((height, width, k))
-        for i in range(height):
-            for j in range(width):
-                # xy = np.array([[j, i]])  # Note: x corresponds to j, y to i
-                # xy_m = xy - mean[:, None, :]  # (K, 1, 2)
+        # Compute Mahalanobis distance: (x-μ)^T Σ^{-1} (x-μ)
+        diff = xy[:, :, None, :] - mean[None, None, :, :]  # (H, W, K, 2)
+        maha = np.einsum('hwki,kij,hwkj->hwk', diff, inv, diff)  # (H, W, K)
 
-                # print(f"xy shape: {xy.shape}")
-                # print(f"xy_m shape: {xy_m.shape}")
-                # print(f"cov_inv shape: {cov_inv.shape}")
+        # 2D Gaussian PDF with continuous normalization constant
+        phi = np.exp(-0.5 * maha) / (2.0 * np.pi * np.sqrt(det))[None, None, :]  # (H, W, K)
 
-                # temp1 = np.matmul(xy_m, cov_inv)  # (K, 1, 2)
-                # print(f"temp1 shape: {temp1.shape}")
+        # Optional discrete normalization for Multinomial model (disabled for Poisson)
+        if normalize_per_k:
+            Z = phi.sum(axis=(0, 1), keepdims=True) + eps
+            phi = phi / Z
 
-                # temp2 = np.array([[[j], [i]]]) - mean[:, :, None]  # (K, 2, 1)
-                # print(f"temp2 shape: {temp2.shape}")
+        return phi
 
-                # maha = np.matmul(temp1, temp2)[:, 0, 0]  # (K,)
-                # print(f"maha shape: {maha.shape}")
+    def e_step(self, gaussians: TwoDGaussians, k_chunk_size: int = 256) -> np.ndarray:
+        """Compute the responsibilities (gamma) for each pixel, each color channel, and each Gaussian.
+        
+        Args:
+            gaussians: The current Gaussian mixture model
+            k_chunk_size: Process K Gaussians in chunks to save memory
+        
+        Returns:
+            np.ndarray: Responsibilities, shape (height, width, K, 3)
+        """
+        H, W = self.image.shape[:2]
+        K = gaussians.k
+        eps = 1e-12
 
-                n[i, j, :] = (
-                    1.0
-                    / np.sqrt(2 * np.pi * cov_det)
-                    * np.exp(
-                        -0.5
-                        * np.matmul(
-                            np.matmul(np.array([[i, j]]) - mean[:, None, :], cov_inv),
-                            np.array([[[i], [j]]]) - mean[:, :, None],
-                        )[:, 0, 0]
-                    )
-                )
-        return n
+        # For large K, use chunked processing to save memory
+        if K > k_chunk_size:
+            return self._e_step_chunked(gaussians, k_chunk_size)
 
-    def e_step(self, gaussians: TwoDGaussians) -> np.ndarray:
-        """Compute the responsibilities (gamma) for each pixel and each Gaussian."""
-        os.makedirs("debug_output", exist_ok=True)
-        height, width = self.image.shape[:2]
+        # Standard processing for small K
+        # Spatial distribution φ_k(x,y) = continuous 2D Gaussian (no discrete normalization)
+        phi = self.gaussian_pdf(gaussians.means, gaussians.covs, H, W, normalize_per_k=False)  # (H, W, K)
 
-        image_pixels = self.image.reshape(-1, 3)
+        # Color intensities ρ_{k,i} (non-negative, no normalization constraint)
+        rho = np.clip(gaussians.rgb, eps, None)  # (K, 3)
 
-        with open("debug_output/e_step_debug.txt", "w") as f:
-            f.write(f"Image shape: {self.image.shape}\n")
-            f.write(f"Gaussians: {gaussians}\n\n")
-            f.write(f"Image pixels shape: {image_pixels.shape}\n\n")
+        # Log responsibilities: log α + log φ + log ρ
+        log_alpha = np.log(np.clip(gaussians.alpha, eps, None))  # (K,)
+        log_phi = np.log(np.clip(phi, eps, None))  # (H, W, K)
+        log_rho = np.log(rho)  # (K, 3)
 
-            # spatial probabilities: N(x,y|μ_k,Σ_k)
-            n = self.gaussian_pdf(gaussians.means, gaussians.covs, height, width)
-            f.write(f"n shape: {n.shape}\n")
-            f.write(f"n min: {n.min()}, max: {n.max()}, mean: {n.mean()}\n\n")
+        # Broadcast and combine: (H, W, K, 3)
+        log_r = (log_alpha[None, None, :, None] + 
+                 log_phi[:, :, :, None] + 
+                 log_rho[None, None, :, :])  # (H, W, K, 3)
 
-            # color probabilities: ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
-            color_prob = np.prod(
-                gaussians.rgb[None, None, :, :] ** self.image[:, :, None, :], axis=3
-            )
-            f.write(f"color_prob shape: {color_prob.shape}\n")
-            f.write(
-                f"color_prob min: {color_prob.min()}, max: {color_prob.max()}, mean: {color_prob.mean()}\n\n"
-            )
+        # Normalize over k using log-sum-exp for numerical stability
+        max_log_r = np.max(log_r, axis=2, keepdims=True)  # (H, W, 1, 3)
+        exp_r = np.exp(log_r - max_log_r)  # (H, W, K, 3)
+        gamma = exp_r / (np.sum(exp_r, axis=2, keepdims=True) + eps)  # (H, W, K, 3)
 
-            # concatenated probabilities: α_k N(x,y|μ_k,Σ_k) ∏_{i ∈ {r,g,b}} c_{k,i}^{I_{x,y,i}}
-            responsibilities = gaussians.alpha[None, None, :] * n * color_prob
-            f.write(f"responsibilities shape: {responsibilities.shape}\n")
-            f.write(
-                f"responsibilities min: {responsibilities.min()}, max: {responsibilities.max()}, mean: {responsibilities.mean()}\n\n"
-            )
+        return gamma
 
-            # Normalize: γ_{x,y,k} = (concatenated probability) / (sum of concatenated probabilities over all k)
-            sum_reciprocal = np.reciprocal(
-                np.sum(responsibilities, axis=-1, keepdims=True)
-            )
-            responsibilities = responsibilities * sum_reciprocal
+    def _e_step_chunked(self, gaussians: TwoDGaussians, k_chunk_size: int) -> np.ndarray:
+        """Memory-efficient E-step for large K using chunked processing with stable log-sum-exp."""
+        H, W = self.image.shape[:2]
+        K = gaussians.k
+        eps = 1e-12
+        
+        # Running max and sum for stable log-sum-exp accumulation
+        m = np.full((H, W, 3), -np.inf, dtype=np.float32)
+        s = np.zeros((H, W, 3), dtype=np.float32)
 
-        assert isinstance(responsibilities, np.ndarray)
-        return responsibilities
+        # ---------- 1st pass: accumulate denominator ----------
+        for k_start in range(0, K, k_chunk_size):
+            k_end = min(k_start + k_chunk_size, K)
+            phi = self.gaussian_pdf(gaussians.means[k_start:k_end],
+                                    gaussians.covs[k_start:k_end],
+                                    H, W, normalize_per_k=False).astype(np.float32)
+            rho = np.clip(gaussians.rgb[k_start:k_end], eps, None).astype(np.float32)
+            log_alpha = np.log(np.clip(gaussians.alpha[k_start:k_end], eps, None)).astype(np.float32)
+            
+            log_r = (log_alpha[None, None, :, None]
+                     + np.log(np.clip(phi, eps, None))[:, :, :, None]
+                     + np.log(rho)[None, None, :, :])                            # (H,W,kc,3)
+
+            chunk_max = np.max(log_r, axis=2)                                    # (H,W,3)
+            new_m = np.maximum(m, chunk_max)                                     # (H,W,3)
+            # Base change: s_new = s*exp(m-new_m) + sum(exp(log_r - new_m))
+            s = s * np.exp(m - new_m) + np.sum(np.exp(log_r - new_m[:, :, None, :]), axis=2)
+            m = new_m
+
+        log_denom = m[:, :, None, :] + np.log(s[:, :, None, :] + eps)            # (H,W,1,3)
+
+        # ---------- 2nd pass: output gamma ----------
+        gamma = np.zeros((H, W, K, 3), dtype=np.float32)
+        for k_start in range(0, K, k_chunk_size):
+            k_end = min(k_start + k_chunk_size, K)
+            phi = self.gaussian_pdf(gaussians.means[k_start:k_end],
+                                    gaussians.covs[k_start:k_end],
+                                    H, W, normalize_per_k=False).astype(np.float32)
+            rho = np.clip(gaussians.rgb[k_start:k_end], eps, None).astype(np.float32)
+            log_alpha = np.log(np.clip(gaussians.alpha[k_start:k_end], eps, None)).astype(np.float32)
+            
+            log_r = (log_alpha[None, None, :, None]
+                     + np.log(np.clip(phi, eps, None))[:, :, :, None]
+                     + np.log(rho)[None, None, :, :])                            # (H,W,kc,3)
+            gamma[:, :, k_start:k_end, :] = np.exp(log_r - log_denom)
+        
+        return gamma.astype(np.float64)
+
+    def _sum_Sk_chunked(self, gaussians: TwoDGaussians, H: int, W: int, k_chunk_size: int = 256) -> np.ndarray:
+        """Compute S_k = sum of phi_k values in chunked manner to save memory."""
+        S_k = np.zeros(gaussians.k, dtype=np.float64)
+        for k_start in range(0, gaussians.k, k_chunk_size):
+            k_end = min(k_start + k_chunk_size, gaussians.k)
+            phi = self.gaussian_pdf(gaussians.means[k_start:k_end],
+                                    gaussians.covs[k_start:k_end],
+                                    H, W, normalize_per_k=False)      # (H,W,kc)
+            S_k[k_start:k_end] = phi.sum(axis=(0, 1))
+        return S_k
 
     def m_step(self, gamma: np.ndarray, gaussians: TwoDGaussians) -> TwoDGaussians:
-        """Update the parameters of the Gaussian mixture model.
+        """Update the parameters of the Poisson rate model.
 
         Args:
-            gamma (ndarray): Responsibilities, shape (height, width, K).
+            gamma (ndarray): Responsibilities, shape (height, width, K, 3).
             gaussians (TwoDGaussians): Current Gaussian mixture model.
 
         Returns:
             TwoDGaussians: Updated Gaussian mixture model.
         """
-        height, width = self.image.shape[:2]
-        k = gaussians.k
-        # Compute sum of responsibilities for each Gaussian
-        n_k = np.sum(gamma, axis=(0, 1))
-        n_k = np.maximum(n_k, 1e-10)  # avoid division by zero
-        n_k_reciprocal = np.reciprocal(n_k)
+        H, W = self.image.shape[:2]
+        K = gaussians.k
+        eps = 1e-12
 
-        # processing Gaussians with low responsibility
-        responsibility_threshold = 1e-6
-        small_responsibility_indices = np.where(n_k < responsibility_threshold)[0]
+        # Expected counts: n_hat = I * gamma
+        I = np.clip(self.image, 0.0, None)  # (H, W, 3) - no upper clipping for Poisson
+        n_hat = I[:, :, None, :] * gamma  # (H, W, K, 3)
+        
+        # Compute N_ki and N_k
+        N_ki = n_hat.sum(axis=(0, 1))  # (K, 3)
+        N_k = N_ki.sum(axis=1) + eps  # (K,)
+        N_total = N_k.sum() + eps
 
-        # randomly initialize gaussian with small responsibility
-        if len(small_responsibility_indices) > 0:
-            print(
-                f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities"
-            )
-            for idx in small_responsibility_indices:
-                # assign random means and covariances
-                gaussians.means[idx] = np.random.rand(2) * [height, width]
-                gaussians.covs[idx] = np.eye(2) * min(height, width) / 10
-                gaussians.rgb[idx] = self.image[
-                    int(gaussians.means[idx, 0]), int(gaussians.means[idx, 1])
-                ]
-            # recompute responsibility
-            gamma = self.e_step(gaussians)
+        # Compute S_k for Poisson rate model using chunked computation
+        S_k = self._sum_Sk_chunked(gaussians, H, W, k_chunk_size=256) + eps  # (K,) - discrete sum of continuous Gaussian
 
-            n_k = np.sum(gamma, axis=(0, 1))
-        n_k = np.maximum(n_k, 1e-10)  # avoid division by zero
-        n_k_reciprocal = np.reciprocal(n_k)
-        # print(f"nk min: {n_k.min()}, max: {n_k.max()}, mean: {n_k.mean()}")
-        # small_nk_count = np.sum(n_k < 1e-6)
-        # print(f"Number of Gaussians with nk < 1e-6: {small_nk_count}")
+        # Update mixing coefficients: α_k = N_k / N_total (sum = 1)
+        new_alpha = N_k / N_total
+        new_alpha = np.maximum(new_alpha, eps)
+        new_alpha /= new_alpha.sum()  # Ensure normalization
 
-        # Create meshgrid for x and y coordinates
-        y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-        xy = np.stack([y, x], axis=-1)  # shape: (height, width, 2)
+        # Update color intensities: ρ_{k,i} = N_{k,i} / (α_k * S_k)
+        new_colors = N_ki / (new_alpha[:, None] * S_k[:, None])  # (K, 3) - no normalization constraint
 
-        # Update means
-        # μ_k' = Σ_{x,y} γ_{x,y,k} * (x,y) / Σ_{x,y} γ_{x,y,k}
-        new_means = np.sum(gamma[:, :, :, None] * xy[:, :, None, :], axis=(0, 1))
-        new_means = new_means * n_k_reciprocal[:, None]
+        # Spatial weights (sum over color channels)
+        w_xyk = n_hat.sum(axis=3)  # (H, W, K)
 
-        # new_means = np.zeros((k, 2))
-        # for i in range(k):
-        #     for y in range(height):
-        #         for x in range(width):
-        #             new_means[i] = new_means[i] +gamma[y, x, i] * np.array(
-        #                 [x, y]
-        #             )
-        # new_means = new_means * n_k_reciprocal[:, None]
+        # Create coordinate grid
+        y, x = np.mgrid[0:H, 0:W]
+        xy = np.stack([y, x], axis=-1).astype(np.float64)  # (H, W, 2)
 
-        # Update covariances
-        # Σ_k' = Σ_{x,y} γ_{x,y,k} * ((x,y) - μ_k')((x,y) - μ_k')^T / Σ_{x,y} γ_{x,y,k}
-        diff = xy[:, :, None, :] - new_means[None, None, :, :]
-        new_covs = np.einsum("ijkl,ijkm,ijk->klm", diff, diff, gamma)
-        new_covs = new_covs * n_k_reciprocal[:, None, None]
+        # Update means: μ_k = Σ_{x,y,i} n̂_{x,y,i,k} * (x,y) / N_k
+        new_means = (w_xyk[..., None] * xy[:, :, None, :]).sum(axis=(0, 1)) / N_k[:, None]  # (K, 2)
 
-        # new_covs = np.zeros((k, 2, 2))
-        # for i in range(k):
-        #     for y in range(height):
-        #         for x in range(width):
-        #             diff = np.array([x, y]) - new_means[i]
-        #             new_covs[i] = new_covs[i] + gamma[y, x, i] * np.outer(
-        #                 diff, diff
-        #             )
-        # new_covs = new_covs * n_k_reciprocal[:, None, None]
-
-        # Apply constraints to covariance matrices
-        # params = [TwoDGaussians.cov_to_params(cov) for cov in new_covs]
-        # new_rotation_angles, new_scale_x, new_scale_y = zip(*params)
+        # Update covariances: Σ_k = Σ_{x,y,i} n̂_{x,y,i,k} * (x,y-μ_k)(x,y-μ_k)^T / N_k
+        diff = xy[:, :, None, :] - new_means[None, None, :, :]  # (H, W, K, 2)
+        new_covs = np.einsum('hwk,hwki,hwkj->kij', w_xyk, diff, diff) / N_k[:, None, None]  # (K, 2, 2)
 
         # Ensure covariance matrices are positive definite
-        for i in tqdm(range(k), desc="Updating covariances"):
-            new_covs[i] = self.ensure_positive_definite(new_covs[i])
+        for k in range(K):
+            new_covs[k] = self.ensure_positive_definite(new_covs[k])
 
-        # Update mixing coefficients (alpha)
-        # α_k' = Σ_{x,y,i} I_{x,y,i} * γ_{x,y,k} / Σ_{x,y,i} I_{x,y,i}
-        pixel_sum = np.sum(self.image)
-        pixel_sum_reciprocal = np.reciprocal(pixel_sum)
-        new_alpha = np.sum(
-            np.sum(self.image[:, :, :, None] * gamma[:, :, None, :], axis=2),
-            axis=(0, 1),
-        )
-        # alphaのtotalは1になる？？？
-        new_alpha = new_alpha * pixel_sum_reciprocal
+        # Handle Gaussians with very low responsibility
+        responsibility_threshold = 1e-6
+        small_responsibility_indices = np.where(N_k < responsibility_threshold)[0]
 
-        # new_alpha = np.sum(gamma, axis=(0, 1)) / (height * width)
+        if len(small_responsibility_indices) > 0:
+            print(f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities")
+            for idx in small_responsibility_indices:
+                # Reinitialize with proper variance units (px^2)
+                new_means[idx] = np.random.uniform([0, 0], [H, W])
+                sigma0 = (0.1 * min(H, W)) ** 2
+                new_covs[idx] = np.eye(2) * sigma0
+                # Sample color from image at new position
+                y_pos, x_pos = int(new_means[idx, 0]), int(new_means[idx, 1])
+                y_pos = np.clip(y_pos, 0, H-1)
+                x_pos = np.clip(x_pos, 0, W-1)
+                sampled_color = self.image[y_pos, x_pos]
+                new_colors[idx] = np.maximum(sampled_color, eps)  # No normalization - keep as intensities
 
-        # pixel_sum = np.sum(self.image)
-        # pixel_sum_reciprocal = np.reciprocal(pixel_sum)
-        # new_alpha = np.zeros(k)
-        # for i in range(k):
-        #     for y in range(height):
-        #         for x in range(width):
-        #             new_alpha[i] = (
-        #                 new_alpha[i]
-        #                 + np.sum(self.image[y, x]) * gamma[y, x, i]
-        #             )
-        # new_alpha = new_alpha * pixel_sum_reciprocal
+        # Update rotations and scales from the new covariance matrices
+        new_rotations = np.zeros(K, dtype=np.float64)
+        new_scales = np.zeros((K, 2), dtype=np.float64)
+        
+        for k in range(K):
+            eigenvalues, eigenvectors = np.linalg.eigh(new_covs[k])
+            # Rotation angle from the first eigenvector
+            new_rotations[k] = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+            # Scales are the square roots of eigenvalues
+            new_scales[k] = np.sqrt(np.maximum(eigenvalues, 1e-12))
 
-        # Update colors
-        # c_k' = Σ_{x,y} γ_{x,y,k} * I_{x,y} / Σ_{x,y} γ_{x,y,k}
-        new_colors = np.sum(
-            self.image[:, :, None, :] * gamma[:, :, :, None], axis=(0, 1)
-        )
-        # new_colors = new_colors * n_k_reciprocal[:, None]
-
-        # new colors must stay in range between 0 and 255?)
-        new_colors = new_colors * 255
-        max_value = np.max(new_colors)
-        if max_value > 255:
-            new_colors = (new_colors / max_value) * 255
-
-        # new_colors = np.zeros((k, 3))
-        # for i in range(k):
-        #     for y in range(height):
-        #         for x in range(width):
-        #             new_colors[i] = (
-        #                 new_colors[i] + gamma[y, x, i] * self.image[y, x]
-        #             )
-        # new_colors = new_colors * n_k_reciprocal[:, None]
-        print("############################################################")
-        print(f"New means min-max: {np.min(new_means)}, {np.max(new_means)}")
-        print(f"New covs min-max: {np.min(new_covs)}, {np.max(new_covs)}")
-        print(f"New colors min-max: {np.min(new_colors)}, {np.max(new_colors)}")
-        print(f"New alpha min-max: {np.min(new_alpha)}, {np.max(new_alpha)}")
-        self.print_covariance_stats(new_covs)
-        print("############################################################")
-
-        return TwoDGaussians(new_means, new_covs, new_colors, new_alpha)
+        return TwoDGaussians(new_means, new_covs, new_colors, new_alpha, new_rotations, new_scales)
 
     def ensure_positive_definite(
         self, cov: np.ndarray, min_eigenvalue: float = 1e-6
@@ -315,13 +310,17 @@ class SingleImageGaussianMixtureEM:
         Returns:
             np.ndarray: The adjusted positive definite covariance matrix.
         """
-        try:
-            np.linalg.cholesky(cov)
-            return cov
-        except np.linalg.LinAlgError:
-            eigenvalues, eigenvectors = np.linalg.eigh(cov)
-            eigenvalues = np.maximum(eigenvalues, min_eigenvalue)
-            return np.ndarray(eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T)
+        # Symmetrize the matrix first
+        cov = 0.5 * (cov + cov.T)
+        
+        # Eigendecomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        
+        # Clip eigenvalues to ensure positive definiteness
+        eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
+        
+        # Reconstruct the matrix
+        return (eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T).astype(cov.dtype)
 
     def check_positive_definite(self, cov: np.ndarray) -> bool:
         """Check if the covariance matrix is positive definite.
@@ -353,3 +352,26 @@ class SingleImageGaussianMixtureEM:
         print(
             f"Positive definite covariances: {np.sum([self.check_positive_definite(cov) for cov in new_covs])}/{len(new_covs)}"
         )
+
+    def poisson_nll(self, gaussians: TwoDGaussians, eps: float = 1e-12) -> float:
+        """Compute Poisson negative log-likelihood for convergence monitoring.
+        
+        Args:
+            gaussians: Current Gaussian mixture model
+            eps: Small constant for numerical stability
+            
+        Returns:
+            float: Negative log-likelihood value (should decrease monotonically in EM)
+        """
+        from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
+        
+        # Get Poisson rates λ = Σ_k α_k ρ_k φ_k(x,y)
+        rasterizer = Vanilla2DRasterizer(self.image.shape[0], self.image.shape[1])
+        rates = rasterizer.render_rates(gaussians)  # (H, W, 3)
+        
+        # Observed intensities
+        I = np.clip(self.image, 0.0, None)
+        
+        # Poisson NLL = Σ(λ - I*log(λ)) + constants
+        nll = (rates - I * np.log(rates + eps)).sum()
+        return float(nll)
