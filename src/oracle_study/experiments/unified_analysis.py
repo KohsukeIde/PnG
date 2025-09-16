@@ -8,7 +8,7 @@ into a single comprehensive experiment with proper output separation.
 
 from src.optimizer.optimal_transport_solver_torch import OptimalTransportSolver
 from src.oracle_study.core import ToyProblemGenerator, TransformationParams, TransportMatrixVisualizer
-from typing import Tuple, Dict, Optional, List
+from typing import Tuple, Dict, Optional, List, Any
 import matplotlib.pyplot as plt
 import torch
 import numpy as np
@@ -33,18 +33,11 @@ def get_mode_directories(epipolar_mode: str) -> Tuple[str, str]:
     return transport_dir, cost_dir
 
 
-def get_standard_scenarios():
-    """Get standard epipolar scenarios used across all analyses."""
-    def R_yaw(rad: float) -> np.ndarray:
-        return np.array([[np.cos(rad), 0, np.sin(rad)], [0, 1, 0], [-np.sin(rad), 0, np.cos(rad)]], dtype=np.float32)
-
-    return {
-        'epi_translation': { 'R_wc': R_yaw(0.0),  't_wc': np.array([0.25, 0.02, 0.0], dtype=np.float32) },
-        'epi_yaw_rotation': { 'R_wc': R_yaw(0.12), 't_wc': np.array([0.18, 0.01, 0.02], dtype=np.float32) },
-        'epi_forward_scale_like': { 'R_wc': R_yaw(0.02), 't_wc': np.array([0.05, 0.0, 0.15], dtype=np.float32) },
-        'epi_combined': { 'R_wc': R_yaw(0.10), 't_wc': np.array([0.25, 0.02, 0.05], dtype=np.float32) },
-        'epi_color_change': { 'R_wc': R_yaw(0.08), 't_wc': np.array([0.20, 0.01, 0.03], dtype=np.float32) },
-    }
+def get_scenario_directory(epipolar_mode: str) -> str:
+    """Directory for scenario overview visualizations."""
+    scenario_dir = os.path.join(ORACLE_DIR, "results", epipolar_mode, "scenario_overview", "figures")
+    os.makedirs(scenario_dir, exist_ok=True)
+    return scenario_dir
 
 
 def get_weight_configurations():
@@ -67,7 +60,17 @@ def get_scenario_specific_weights(scenario_name: str) -> Tuple[float, float]:
         return 0.8, 0.2
 
 
-def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5, lambda_cov: float = 0.3):
+def analyze_transport_matrices(
+    epipolar_mode: str = 'hybrid',
+    hybrid_alpha: float = 0.5,
+    lambda_cov: float = 0.3,
+    sigma_epipolar: float = 1.0,
+    sigma_color: float = 1.0,
+    sigma_cov: float = 1.0,
+    noise_model: str = 'gaussian',
+    huber_delta: float = 1.0,
+    cauchy_c: float = 1.0,
+):
     """Analyze transport matrices under epipolar-consistent scenarios.
 
     Args:
@@ -82,7 +85,7 @@ def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: floa
 
     # Intrinsics
     K = np.array([[800, 0, 400], [0, 800, 400], [0, 0, 1]], dtype=np.float32)
-    scenarios = get_standard_scenarios()
+    scenarios = ToyProblemGenerator.get_epipolar_standard_scenarios()
     transport_matrices = {}
 
     for name, params in scenarios.items():
@@ -107,6 +110,12 @@ def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: floa
             lambda_cov=lambda_cov,
             epipolar_mode=epipolar_mode,
             hybrid_alpha=hybrid_alpha,
+            sigma_epipolar=sigma_epipolar,
+            sigma_color=sigma_color,
+            sigma_cov=sigma_cov,
+            noise_model=noise_model,
+            huber_delta=huber_delta,
+            cauchy_c=cauchy_c,
             device='cpu')
 
         with torch.no_grad():
@@ -130,7 +139,17 @@ def analyze_transport_matrices(epipolar_mode: str = 'hybrid', hybrid_alpha: floa
     return transport_matrices
 
 
-def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 0.5, lambda_cov: float = 0.3):
+def analyze_cost_functions(
+    epipolar_mode: str = 'hybrid',
+    hybrid_alpha: float = 0.5,
+    lambda_cov: float = 0.3,
+    sigma_epipolar: float = 1.0,
+    sigma_color: float = 1.0,
+    sigma_cov: float = 1.0,
+    noise_model: str = 'gaussian',
+    huber_delta: float = 1.0,
+    cauchy_c: float = 1.0,
+):
     """Analyze cost function weight sensitivity and cost matrix properties.
     
     This function focuses on:
@@ -173,6 +192,12 @@ def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 
             lambda_cov=lambda_cov,
             epipolar_mode=epipolar_mode,
             hybrid_alpha=hybrid_alpha,
+            sigma_epipolar=sigma_epipolar,
+            sigma_color=sigma_color,
+            sigma_cov=sigma_cov,
+            noise_model=noise_model,
+            huber_delta=huber_delta,
+            cauchy_c=cauchy_c,
             device='cpu')
         
         with torch.no_grad():
@@ -208,6 +233,58 @@ def analyze_cost_functions(epipolar_mode: str = 'hybrid', hybrid_alpha: float = 
     print(f"Results saved to: {cost_figures_dir}")
     
     return stats_results
+
+
+def visualize_comprehensive_scenarios(
+    epipolar_mode: str = 'hybrid',
+    seed: int = 42,
+) -> None:
+    """Visualize all predefined epipolar scenarios (baseline + extensions)."""
+
+    scenario_dir = get_scenario_directory(epipolar_mode)
+    visualizer = TransportMatrixVisualizer(figures_dir=scenario_dir)
+    generator = ToyProblemGenerator(seed=seed)
+
+    standard = ToyProblemGenerator.get_epipolar_standard_scenarios()
+    all_scenarios, _subset = ToyProblemGenerator.get_epipolar_comprehensive_suite()
+    combined: Dict[str, Dict[str, Any]] = {}
+    combined.update(standard)
+    combined.update(all_scenarios)
+
+    K = np.array([[800, 0, 400], [0, 800, 400], [0, 0, 1]], dtype=np.float32)
+    seed_stream = np.random.RandomState(seed)
+
+    print("=== Scenario Overview Visualization ===")
+    print(f"Saving visualizations to: {scenario_dir}")
+
+    for name, params in combined.items():
+        g1, g2, _corr, _F = generator.generate_epipolar_correspondences(
+            n_gaussians=15,
+            K=K,
+            R_wc=params['R_wc'],
+            t_wc=params['t_wc'],
+        )
+
+        local_seed = int(seed_stream.randint(0, 2 ** 31 - 1))
+        g1_vis, g2_vis = generator.apply_epipolar_scenario_effects(
+            g1, g2, params, seed=local_seed
+        )
+
+        if 'color_change' in name:
+            color_rng = np.random.RandomState(local_seed ^ 0xABCDEF)
+            g2_vis.rgb = color_rng.uniform(0.0, 1.0, size=g2_vis.rgb.shape).astype(np.float32)
+
+        # Use identity transport to highlight one-to-one correspondences
+        identity_transport = np.eye(len(g1_vis.means), dtype=np.float32)
+        visualizer.visualize_correspondences_on_images(
+            g1_vis,
+            g2_vis,
+            identity_transport,
+            threshold=0.0,
+            save_path=f"{name}_overview.png",
+        )
+
+    print("Completed scenario overview visualization.\n")
 
 
 def analyze_cost_matrices_visualization(cost_matrices: Dict[str, np.ndarray], visualizer):
@@ -362,7 +439,16 @@ def create_weight_sensitivity_summary(stats_results: Dict, visualizer):
     plt.close()
 
 
-def run_all_modes():
+def run_all_modes(
+    lambda_cov: float = 0.3,
+    sigma_epipolar: float = 400.0,
+    sigma_color: float = 0.5,
+    sigma_cov: float = 8.0,
+    noise_model: str = 'gaussian',
+    huber_delta: float = 1.0,
+    cauchy_c: float = 1.0,
+    visualize: bool = False,
+):
     """Run unified analysis for all epipolar modes (sed, sampson, hybrid)."""
     modes = [
         {'mode': 'sed', 'alpha': 0.5},
@@ -385,11 +471,34 @@ def run_all_modes():
         print(f"\n{'='*20} ANALYZING MODE: {mode.upper()} {'='*20}")
         
         # Run transport matrix analysis for this mode
-        transport_results = analyze_transport_matrices(epipolar_mode=mode, hybrid_alpha=alpha)
+        transport_results = analyze_transport_matrices(
+            epipolar_mode=mode,
+            hybrid_alpha=alpha,
+            lambda_cov=lambda_cov,
+            sigma_epipolar=sigma_epipolar,
+            sigma_color=sigma_color,
+            sigma_cov=sigma_cov,
+            noise_model=noise_model,
+            huber_delta=huber_delta,
+            cauchy_c=cauchy_c,
+        )
         
         # Run cost function analysis for this mode  
-        cost_results = analyze_cost_functions(epipolar_mode=mode, hybrid_alpha=alpha)
-        
+        cost_results = analyze_cost_functions(
+            epipolar_mode=mode,
+            hybrid_alpha=alpha,
+            lambda_cov=lambda_cov,
+            sigma_epipolar=sigma_epipolar,
+            sigma_color=sigma_color,
+            sigma_cov=sigma_cov,
+            noise_model=noise_model,
+            huber_delta=huber_delta,
+            cauchy_c=cauchy_c,
+        )
+
+        if visualize:
+            visualize_comprehensive_scenarios(epipolar_mode=mode)
+
         all_results[mode] = {
             'transport': transport_results,
             'cost': cost_results,
@@ -429,12 +538,30 @@ def main():
                         help='Epipolar cost mode (use "all" to run all modes)')
     parser.add_argument('--hybrid-alpha', type=float, default=0.5, help='Alpha for hybrid mode (0..1)')
     parser.add_argument('--lambda-cov', type=float, default=0.3, help='Weight for covariance (Bures) term')
+    # Recommended defaults from oracle study medians (K≈800)
+    parser.add_argument('--sigma-epipolar', type=float, default=400.0, help='Noise scale for epipolar term (NLL)')
+    parser.add_argument('--sigma-color', type=float, default=0.5, help='Noise scale for color term (NLL)')
+    parser.add_argument('--sigma-cov', type=float, default=8.0, help='Noise scale for covariance term (NLL)')
+    parser.add_argument('--noise-model', choices=['gaussian','cauchy','huber'], default='gaussian', help='Robust noise model for NLL conversion')
+    parser.add_argument('--huber-delta', type=float, default=1.0, help='Huber delta (if noise-model=huber)')
+    parser.add_argument('--cauchy-c', type=float, default=1.0, help='Cauchy scale c (if noise-model=cauchy)')
+    parser.add_argument('--visualize-scenarios', action='store_true',
+                        help='Generate overview plots for all predefined scenarios')
     # Allow being called via run_experiment.py where positional 'unified_analysis' may remain in argv
     args, _unknown = parser.parse_known_args()
     
     if args.epipolar_mode == 'all':
         # Run analysis for all modes
-        run_all_modes()
+        run_all_modes(
+            lambda_cov=args.lambda_cov,
+            sigma_epipolar=args.sigma_epipolar,
+            sigma_color=args.sigma_color,
+            sigma_cov=args.sigma_cov,
+            noise_model=args.noise_model,
+            huber_delta=args.huber_delta,
+            cauchy_c=args.cauchy_c,
+            visualize=args.visualize_scenarios,
+        )
     else:
         # Run analysis for single mode (legacy behavior)
         print("🔍 Unified Oracle Study Analysis")
@@ -444,10 +571,30 @@ def main():
         print("=" * 60)
 
         # 1. Transport Matrix Analysis
-        transport_results = analyze_transport_matrices(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha, lambda_cov=args.lambda_cov)
+        transport_results = analyze_transport_matrices(
+            epipolar_mode=args.epipolar_mode,
+            hybrid_alpha=args.hybrid_alpha,
+            lambda_cov=args.lambda_cov,
+            sigma_epipolar=args.sigma_epipolar,
+            sigma_color=args.sigma_color,
+            sigma_cov=args.sigma_cov,
+            noise_model=args.noise_model,
+            huber_delta=args.huber_delta,
+            cauchy_c=args.cauchy_c,
+        )
 
         # 2. Cost Function Analysis  
-        cost_results = analyze_cost_functions(epipolar_mode=args.epipolar_mode, hybrid_alpha=args.hybrid_alpha, lambda_cov=args.lambda_cov)
+        cost_results = analyze_cost_functions(
+            epipolar_mode=args.epipolar_mode,
+            hybrid_alpha=args.hybrid_alpha,
+            lambda_cov=args.lambda_cov,
+            sigma_epipolar=args.sigma_epipolar,
+            sigma_color=args.sigma_color,
+            sigma_cov=args.sigma_cov,
+            noise_model=args.noise_model,
+            huber_delta=args.huber_delta,
+            cauchy_c=args.cauchy_c,
+        )
 
         # 3. Summary
         transport_dir, cost_dir = get_mode_directories(args.epipolar_mode)
@@ -457,6 +604,7 @@ def main():
         print(f"- Cost function analysis (matrices & weights): {cost_dir}")
         print(f"- Epipolar mode: {args.epipolar_mode} (hybrid_alpha={args.hybrid_alpha:.2f})")
         print(f"- Lambda cov (Bures): {args.lambda_cov:.3f}")
+        print(f"- Noise model: {args.noise_model}; sigmas: epi={args.sigma_epipolar:.3f}, color={args.sigma_color:.3f}, cov={args.sigma_cov:.3f}")
         print(f"- Analyzed {len(transport_results)} transport scenarios")
         print(f"- Evaluated {len(cost_results)} weight configurations")
         
@@ -464,6 +612,9 @@ def main():
         best_config = max(cost_results.keys(), key=lambda k: cost_results[k]['diagonal_concentration'])
         best_score = cost_results[best_config]['diagonal_concentration']
         print(f"- Best weight configuration: {best_config} (diagonal concentration: {best_score:.3f})")
+
+        if args.visualize_scenarios:
+            visualize_comprehensive_scenarios(epipolar_mode=args.epipolar_mode)
 
         print(f"\n✅ Unified analysis completed successfully!")
         print("Check the respective directories for all visualizations.")
