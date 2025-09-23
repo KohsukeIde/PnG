@@ -12,7 +12,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 EXPERIMENT_NAME = "toy_generator_test"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ORACLE_DIR = os.path.dirname(SCRIPT_DIR)
-FIGURES_DIR = os.path.join(ORACLE_DIR, "experiments", EXPERIMENT_NAME, "figures")
+RESULTS_BASE = os.path.join(ORACLE_DIR, "results", EXPERIMENT_NAME)
+FIGURES_DIR = os.path.join(RESULTS_BASE, "figures")
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
 import numpy as np

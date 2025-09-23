@@ -1,13 +1,13 @@
 """
 Oracle Study Module
 
-This module provides tools and experiments for validating the optimal transport solver
-using synthetic data with known ground truth correspondences.
+This module provides tools and experiments for validating matching and camera-pose
+estimation with synthetic data and ground-truth correspondences.
 
 Key Components:
-- core: Core utilities (ToyProblemGenerator, TransportMatrixVisualizer)
-- experiments: Analysis scripts for validation
-- results: Generated experimental results and visualizations
+- core: Shared utilities (ToyProblemGenerator, TransportMatrixVisualizer)
+- matching: Oracle-study experiments for correspondence estimation
+- camera_pose: Oracle-study experiments for pose estimation (upcoming)
 """
 
 from .core import ToyProblemGenerator, TransformationParams, NoiseParams, TransportMatrixVisualizer
