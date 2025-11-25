@@ -17,7 +17,7 @@ from src.primitive.camera import Quaternion
 from utils.optimizers.SAM import SAM
 
 class OptimalTransportSolver:
-    """Optimal Transport Solver for 2D Gaussians with Homography Optimization."""
+    """Optimal Transport Solver for 2D Gaussians"""
 
     def __init__(
         self,
@@ -30,6 +30,15 @@ class OptimalTransportSolver:
         lambda_cov: float = 0.3,
         lambda_color: float = 1.0,
         lambda_epipolar: float = 1.0,
+        # Noise-scale parameters for NLL interpretation
+        sigma_epipolar: float = 1.0,
+        sigma_color: float = 1.0,
+        sigma_cov: float = 1.0,
+        noise_model: str = "gaussian",  # one of {"gaussian", "cauchy", "huber"}
+        huber_delta: float = 1.0,       # used if noise_model == "huber"
+        cauchy_c: float = 1.0,          # used if noise_model == "cauchy"
+        lambda_cheirality: float = 0.0,
+        cheirality_topk: Optional[int] = 3,
         epipolar_mode: str = "sed",  # one of {"sed", "sampson", "hybrid"}
         hybrid_alpha: float = 0.5,    # when epipolar_mode == "hybrid": alpha in [0,1]
         device: Optional[torch.device] = None,
@@ -50,7 +59,7 @@ class OptimalTransportSolver:
         self.gaussians1 = copy.deepcopy(gaussians1)
         self.gaussians2 = copy.deepcopy(gaussians2)
 
-        if device is ざNone:
+        if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
@@ -64,6 +73,8 @@ class OptimalTransportSolver:
             if k2 is not None
             else None
         )
+        self.k1_inv = torch.linalg.inv(self.k1) if self.k1 is not None else None
+        self.k2_inv = torch.linalg.inv(self.k2) if self.k2 is not None else None
         self.h: Optional[torch.Tensor] = None
         # Added for Fundamental Matrix
         self.f: Optional[torch.Tensor] = None
@@ -73,6 +84,17 @@ class OptimalTransportSolver:
         self.lambda_cov = lambda_cov
         self.lambda_color = lambda_color
         self.lambda_epipolar = lambda_epipolar
+        self.lambda_cheirality = float(lambda_cheirality)
+        self.cheirality_topk = cheirality_topk
+        # NLL parameters
+        self.sigma_epipolar = float(sigma_epipolar)
+        self.sigma_color = float(sigma_color)
+        self.sigma_cov = float(sigma_cov)
+        self.noise_model = noise_model.lower()
+        if self.noise_model not in {"gaussian", "cauchy", "huber"}:
+            raise ValueError("noise_model must be one of {'gaussian','cauchy','huber'}")
+        self.huber_delta = float(huber_delta)
+        self.cauchy_c = float(cauchy_c)
         # Epipolar cost selection
         self.epipolar_mode = epipolar_mode.lower()
         if self.epipolar_mode not in {"sed", "sampson", "hybrid"}:
@@ -124,12 +146,12 @@ class OptimalTransportSolver:
 
     def _build_F_from_wc(self, R_wc: torch.Tensor, t_wc: torch.Tensor) -> torch.Tensor:
         """R_wc, t_wc から F を構築。Lieクラスのskew_symmetricを使用。"""
+        if self.k1_inv is None or self.k2_inv is None:
+            raise ValueError("Camera intrinsics must be provided to build the fundamental matrix.")
         tx = self.lie.skew_symmetric(t_wc)
         E = tx @ R_wc
-        K1_inv = torch.inverse(self.k1)
-        K2_inv = torch.inverse(self.k2)
-        K2_inv_T = K2_inv.transpose(0,1)
-        F = K2_inv_T @ E @ K1_inv
+        K2_inv_T = self.k2_inv.transpose(0, 1)
+        F = K2_inv_T @ E @ self.k1_inv
         assert not torch.isnan(F).any(), "NaN in fundamental matrix"
         return F
 
@@ -217,7 +239,9 @@ class OptimalTransportSolver:
         
         # Fixed stabilization frequency
         stabilize_freq = 20
-        
+        log_u_prev: Optional[torch.Tensor] = None
+        log_v_prev: Optional[torch.Tensor] = None
+
         for iteration in range(max_iter):
             # Update log(u)
             log_Kv = torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
@@ -229,32 +253,25 @@ class OptimalTransportSolver:
             
             # Fixed stabilization every 20 iterations
             if iteration > 0 and iteration % stabilize_freq == 0:
-                center = (log_u.mean() + log_v.mean()) / 2
-                log_u = log_u - center
-                log_v = log_v - center
-                log_K = log_K + 2 * center  # Factor 2 from exp distribution
+                offset = log_u.mean()
+                log_u = log_u - offset
+                log_v = log_v + offset
             
             # Simple convergence check every 10 iterations
             if iteration % 10 == 0:
-                log_T = log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0)
-                T = torch.exp(log_T)
-                
-                # L∞ marginal error only
-                row_sums = T.sum(dim=1)
-                col_sums = T.sum(dim=0)
-                err = max(
-                    torch.abs(row_sums - alpha).max().item(),
-                    torch.abs(col_sums - beta).max().item()
-                )
-                
-                if err < tol:
-                    break
-        
+                if log_u_prev is not None and log_v_prev is not None:
+                    max_du = (log_u - log_u_prev).abs().max()
+                    max_dv = (log_v - log_v_prev).abs().max()
+                    if torch.max(max_du, max_dv).item() < tol:
+                        break
+                log_u_prev = log_u.clone().detach()
+                log_v_prev = log_v.clone().detach()
+
         # Final transport matrix
         log_T = log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0)
         transport = torch.exp(log_T)
-        transport = torch.nan_to_num(transport, nan=0.0, posinf=1e6, neginf=0.0)  # Reduced from 1e10
-        
+        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
+
         return transport, log_u, log_v
 
     def _make_cov_matrices(self, scales: torch.Tensor,
@@ -265,7 +282,7 @@ class OptimalTransportSolver:
             [torch.stack([cos_r, -sin_r], 1),
             torch.stack([sin_r,  cos_r], 1)],
             2)                                   # (K,2,2)
-        scale_mat = torch.stack([torch.diag(s**2) for s in scales])
+        scale_mat = torch.diag_embed(scales * scales)
         return rot @ scale_mat @ rot.transpose(1, 2)   # (K,2,2)
     
     def _matrix_sqrt_spd2x2(self, matrices: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -311,23 +328,86 @@ class OptimalTransportSolver:
         tr = torch.clamp(tr, min=0.0)
         return tr  # (K1,K2)
 
-    def _median_offdiag(self, M: torch.Tensor) -> torch.Tensor:
-        """Median of off-diagonal elements if square; else median of all elements."""
-        k1, k2 = M.shape
-        if k1 == k2 and k1 > 1:
-            mask = ~torch.eye(k1, dtype=torch.bool, device=M.device)
-            vals = M[mask]
-        else:
-            vals = M.reshape(-1)
-        return vals.median()
+    def _nll_from_squared(self, sq: torch.Tensor, sigma: float, *, model: Optional[str] = None) -> torch.Tensor:
+        """Convert squared residuals into a negative log-likelihood-like penalty.
 
-    def _huber_normalize(self, M: torch.Tensor, k: Optional[torch.Tensor] = None, eps: float = 1e-6) -> torch.Tensor:
-        """Huber-like normalization: x / (x + k), with k from off-diagonal median by default."""
-        if k is None:
-            with torch.no_grad():
-                k = self._median_offdiag(torch.nan_to_num(M.detach(), nan=0.0, posinf=1e6, neginf=0.0))
-        k = torch.clamp(k, min=eps)
-        return M / (M + k)
+        - gaussian: rho(s) = s / (sigma^2)
+        - cauchy:  rho(s) = c^2 * log(1 + s / (c^2 * sigma^2))
+        - huber:   residual r = sqrt(s); rho(r) as Huber with delta; scale by sigma
+        """
+        eps = 1e-12
+        model = (model or self.noise_model).lower()
+        if model == "gaussian":
+            return sq / (sigma * sigma + eps)
+        if model == "cauchy":
+            c2 = self.cauchy_c * self.cauchy_c + eps
+            return c2 * torch.log1p(sq / (c2 * (sigma * sigma + eps)))
+        # huber
+        r = torch.sqrt(torch.clamp(sq, min=0.0)) / (sigma + eps)
+        delta = self.huber_delta
+        mask = r <= delta
+        quad = 0.5 * (r * r)
+        lin = delta * (r - 0.5 * delta)
+        return torch.where(mask, quad, lin)
+
+    def _cheirality_loss(
+        self,
+        R_wc: torch.Tensor,
+        t_wc: torch.Tensor,
+        transport: torch.Tensor,
+        topk: Optional[int] = 3,
+    ) -> torch.Tensor:
+        if self.k1_inv is None or self.k2_inv is None:
+            return torch.tensor(0.0, device=self.device)
+
+        T = transport
+        if T.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        if topk is not None and topk > 0:
+            k = min(topk, T.size(1))
+            idx = torch.topk(T, k=k, dim=1).indices
+            rows = torch.arange(T.size(0), device=self.device).unsqueeze(1).expand_as(idx)
+            pairs = torch.stack([rows.reshape(-1), idx.reshape(-1)], dim=1)
+        else:
+            pairs = torch.nonzero(T > 0, as_tuple=False)
+
+        if pairs.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        ones1 = torch.ones(self.means1.size(0), 1, device=self.device)
+        ones2 = torch.ones(self.means2.size(0), 1, device=self.device)
+        x1 = torch.cat([self.means1, ones1], dim=1)
+        x2 = torch.cat([self.means2, ones2], dim=1)
+
+        x1n = (self.k1_inv @ x1.T).T
+        x2n = (self.k2_inv @ x2.T).T
+
+        x1p = x1n[pairs[:, 0]]
+        x2p = x2n[pairs[:, 1]]
+
+        I = torch.eye(3, device=self.device, dtype=torch.float32)
+        P1 = torch.cat([I, torch.zeros(3, 1, device=self.device)], dim=1)
+        P2 = torch.cat([R_wc, t_wc.view(3, 1)], dim=1)
+
+        num_pairs = x1p.size(0)
+        A = torch.zeros(num_pairs, 4, 4, device=self.device)
+        A[:, 0, :] = x1p[:, 0:1] * P1[2, :] - P1[0, :]
+        A[:, 1, :] = x1p[:, 1:2] * P1[2, :] - P1[1, :]
+        A[:, 2, :] = x2p[:, 0:1] * P2[2, :] - P2[0, :]
+        A[:, 3, :] = x2p[:, 1:2] * P2[2, :] - P2[1, :]
+
+        _, _, Vh = torch.linalg.svd(A)
+        X_h = Vh[:, -1, :]
+        X = X_h[:, :3] / (X_h[:, 3:4] + 1e-12)
+
+        Z1 = X[:, 2]
+        X_cam2 = (R_wc @ X.T + t_wc.view(3, 1)).T
+        Z2 = X_cam2[:, 2]
+
+        weights = T[pairs[:, 0], pairs[:, 1]].detach()
+        loss = (torch.nn.functional.relu(-Z1) + torch.nn.functional.relu(-Z2)) * weights
+        return loss.mean()
 
     def compute_cost_matrix(self, F: torch.Tensor) -> torch.Tensor:
         """Dispatch to selected epipolar cost.
@@ -368,57 +448,58 @@ class OptimalTransportSolver:
         l2 = (F.T @ p1_h.T).T            # image-2 上 (K1,3)
 
         n1 = l1[:, :2]                              # (K2,2)
-        n1_norm = n1.norm(dim=1, keepdim=True) + 1e-12
+        eps = 1e-9
+        n1_norm = n1.norm(dim=1, keepdim=True) + eps
         n1_unit = n1 / n1_norm
 
         n2 = l2[:, :2]                              # (K1,2)
-        n2_norm = n2.norm(dim=1, keepdim=True) + 1e-12
+        n2_norm = n2.norm(dim=1, keepdim=True) + eps
         n2_unit = n2 / n2_norm
 
         # -------- ③ 点⇔線  "符号付き" 距離 --------
         #     d_12(i,j):  p1_i → ℓ1_j
         #     d_21(i,j):  p2_j → ℓ2_i
         # ※ abs を外して「符号付き」にしても結果は d^2 なので同じですが、そのまま再利用します
-        dist_12 = torch.abs(p1_h @ l1.T) / n1_norm.T      # (K1,K2)
-        dist_21 = torch.abs(p2_h @ l2.T).T / n2_norm      # (K1,K2)
+        num_12 = p1_h @ l1.T                                           # (K1,K2)
+        num_21 = (p2_h @ l2.T).T                                       # (K1,K2)
 
         # -------- ④ "距離²＋分散" へ置換 --------
-        # CHANGE 1:  割り算 → 2乗して足し算
-        dist_sq_sum = dist_12.pow(2) + dist_21.pow(2)     # d_12² + d_21²  (K1,K2)
+        dist_sq_sum = (
+            (num_12 ** 2) / (n1_norm.T ** 2)
+            + (num_21 ** 2) / (n2_norm ** 2)
+        )
 
-        #   共分散由来の分散 u = nᵀ Σ n         （計算方法はそのまま再利用）
         cov1 = self._make_cov_matrices(self.scales1, self.rotations1)   # (K1,2,2)
         cov2 = self._make_cov_matrices(self.scales2, self.rotations2)   # (K2,2,2)
 
-        v1 = torch.bmm(cov1, n2_unit.unsqueeze(-1)).squeeze(-1)         # (K1,2)
-        u1 = (v1 * n2_unit).sum(1)                                      # (K1,)
+        cov1_exp = cov1.unsqueeze(1).expand(-1, k2, -1, -1)             # (K1,K2,2,2)
+        cov2_exp = cov2.unsqueeze(0).expand(k1, -1, -1, -1)             # (K1,K2,2,2)
+        n1_exp = n1_unit.unsqueeze(0).expand(k1, -1, -1)                # (K1,K2,2)
+        n2_exp = n2_unit.unsqueeze(1).expand(-1, k2, -1)                # (K1,K2,2)
 
-        v2 = torch.bmm(cov2, n1_unit.unsqueeze(-1)).squeeze(-1)         # (K2,2)
-        u2 = (v2 * n1_unit).sum(1)                                      # (K2,)
+        u1 = torch.einsum('...i,...ij,...j->...', n1_exp, cov1_exp, n1_exp)
+        u2 = torch.einsum('...i,...ij,...j->...', n2_exp, cov2_exp, n2_exp)
 
-        # CHANGE 2: 以前は `/ (1+u1+u2)`
-        epi_with_shape = dist_sq_sum + u1.view(-1,1) + u2.view(1,-1)    # (K1,K2)
+        epi_with_shape = dist_sq_sum + u1 + u2                          # (K1,K2)
 
         # -------- ⑤ 形状の類似度（Bures/Wasserstein距離） --------
-        cov1_full = self._make_cov_matrices(self.scales1, self.rotations1)   # (K1,2,2)
-        cov2_full = self._make_cov_matrices(self.scales2, self.rotations2)   # (K2,2,2)
-        cov_dist = self._bures_wasserstein_cov_dist(cov1_full, cov2_full)    # (K1,K2)
+        cov_dist = self._bures_wasserstein_cov_dist(cov1, cov2)    # (K1,K2)
 
         # -------- ⑥ 色差 --------
         rgb_diff   = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)    # (K1,K2,3)
         color_dist = (rgb_diff ** 2).sum(2)                             # (K1,K2)
 
         # -------- ⑦ 正規化 --------
-        # Huber型正規化（kは非対角median）
-        epi_norm   = self._huber_normalize(epi_with_shape)
-        color_norm = self._huber_normalize(color_dist)
-        cov_norm   = self._huber_normalize(cov_dist)
+        # Negative log-likelihood style penalties with noise scales
+        epi_nll   = self._nll_from_squared(epi_with_shape, self.sigma_epipolar)
+        color_nll = self._nll_from_squared(color_dist,   self.sigma_color)
+        cov_nll   = self._nll_from_squared(cov_dist,     self.sigma_cov)
 
         # -------- ⑧ コスト合成 --------
         cost = (
-            self.lambda_epipolar * epi_norm
-            + self.lambda_color  * color_norm
-            + (self.lambda_cov   * cov_norm if self.lambda_cov > 0 else 0.0)
+            self.lambda_epipolar * epi_nll
+            + self.lambda_color  * color_nll
+            + (self.lambda_cov   * cov_nll if self.lambda_cov > 0 else 0.0)
         )
 
         return cost
@@ -456,10 +537,11 @@ class OptimalTransportSolver:
         num = num.T ** 2      # (K1,K2)
         
         # サンプソン距離の分母: (F·p1)_xy^2 + (F^T·p2)_xy^2
-        denom = (Fp1[:2]**2).sum(0).view(-1, 1) + (FTp2[:2]**2).sum(0).view(1, -1)
+        eps = 1e-9
+        denom = (Fp1[:2]**2).sum(0).view(-1, 1) + (FTp2[:2]**2).sum(0).view(1, -1) 
         
         # サンプソン距離計算
-        sampson = num / (denom + 1e-12)  # (K1,K2)
+        sampson = num / (denom + eps)  # (K1,K2)
         
         # === 2. ガウス分布の形状を考慮 ===
         # 2.1 共分散行列の作成
@@ -470,47 +552,39 @@ class OptimalTransportSolver:
         # 2.2 エピポーラ線の法線ベクトル計算（正規化）
         # ℓ = (a,b,c) の法線は n = (a,b)/||(a,b)||
         n1 = Fp1[:2].T  # 画像2上のエピポーラ線の法線方向 (K1,2)
-        n1 = n1 / (n1.norm(dim=1, keepdim=True) + 1e-12)
-        
+        n1 = n1 / (n1.norm(dim=1, keepdim=True) + eps)
+
         n2 = FTp2[:2].T  # 画像1上のエピポーラ線の法線方向 (K2,2)
-        n2 = n2 / (n2.norm(dim=1, keepdim=True) + 1e-12)
+        n2 = n2 / (n2.norm(dim=1, keepdim=True) + eps)
         
-        # 2.3 共分散行列とエピポーラ線法線の積 (n^T·Σ·n)
-        def shape_uncertainty(covs, normals):
-            """共分散行列と法線ベクトルからエピポーラ線方向の不確かさを計算"""
-            # covs: (K,2,2), normals: (K,2) -> returns: (K,)
-            v = torch.bmm(covs, normals.unsqueeze(-1)).squeeze(-1)  # (K,2)
-            return (v * normals).sum(dim=1)  # (K,) n^T·Σ·n を各ガウスごとに計算
+        cov1_exp = cov1.unsqueeze(1).expand(-1, k2, -1, -1)  # (K1,K2,2,2)
+        cov2_exp = cov2.unsqueeze(0).expand(k1, -1, -1, -1)  # (K1,K2,2,2)
+        n2_exp = n2.unsqueeze(0).expand(k1, -1, -1)          # (K1,K2,2)
+        n1_exp = n1.unsqueeze(1).expand(-1, k2, -1)          # (K1,K2,2)
         
-        # 各ガウスのエピポーラ線方向への不確かさ
-        u1 = shape_uncertainty(cov1, n2)  # 画像1のガウスの不確かさ (K1,)
-        u2 = shape_uncertainty(cov2, n1)  # 画像2のガウスの不確かさ (K2,)
+        u1 = torch.einsum('...i,...ij,...j->...', n2_exp, cov1_exp, n2_exp)
+        u2 = torch.einsum('...i,...ij,...j->...', n1_exp, cov2_exp, n1_exp)
         
-        # 2.4 サンプソン距離を不確かさで割引（形状を考慮した分布版サンプソン距離）
-        # 不確かさが大きいほど（エピポーラ線に垂直な方向に広いガウスほど）、
-        # サンプソン距離を小さく評価する
-        uncertainty_factor = 1.0 + u1.view(-1, 1) + u2.view(1, -1)  # ブロードキャスト (K1,K2)
-        sampson_with_shape = sampson / uncertainty_factor
+        # uncertainty_factor = 1.0 + u1 + u2
+        uncertainty_factor = 1.0 # DEBUG: Disable shape uncertainty
+        sampson_with_shape = sampson / (uncertainty_factor + 1e-12)
         
         # === 3. 形状の類似度（Bures/Wasserstein距離） ===
-        cov1 = self._make_cov_matrices(self.scales1, self.rotations1)  # (K1,2,2)
-        cov2 = self._make_cov_matrices(self.scales2, self.rotations2)  # (K2,2,2)
         cov_dist = self._bures_wasserstein_cov_dist(cov1, cov2)        # (K1,K2)
 
         # === 4. 色差分の計算 ===
         color_diff = self.rgb1.unsqueeze(1) - self.rgb2.unsqueeze(0)  # (K1,K2,3)
         d_color = (color_diff ** 2).sum(dim=2)  # (K1,K2)
         
-        # === 5. Huber型正規化と最終コスト計算 ===
-        sampson_norm = self._huber_normalize(sampson_with_shape)
-        color_norm   = self._huber_normalize(d_color)
-        cov_norm     = self._huber_normalize(cov_dist)
-        
-        # 最終コスト行列の計算
+        # === 5. NLL化と最終コスト計算 ===
+        sampson_nll = self._nll_from_squared(sampson_with_shape, self.sigma_epipolar)
+        color_nll   = self._nll_from_squared(d_color,            self.sigma_color)
+        cov_nll     = self._nll_from_squared(cov_dist,           self.sigma_cov)
+
         cost = (
-            self.lambda_epipolar * sampson_norm + 
-            self.lambda_color * color_norm +
-            (self.lambda_cov * cov_norm if self.lambda_cov > 0 else 0.0)
+            self.lambda_epipolar * sampson_nll + 
+            self.lambda_color * color_nll +
+            (self.lambda_cov * cov_nll if self.lambda_cov > 0 else 0.0)
         )
         
         return cost
@@ -540,7 +614,8 @@ class OptimalTransportSolver:
     def optimize_with_SE3(self, max_iter=1000, tol=1e-6,
                         save_diagnostics=True, diagnostics_dir=None,
                         rot_lr=5e-3, trans_lr=5e-4, momentum=0.9,
-                        grad_clip=0.1, seed=None):
+                        grad_clip=0.1, seed=None,
+                        differentiable_transport=True):
         """Optimize camera pose using Lie algebra SE(3) representation with separate rotation/translation."""
         # -------------------------  出力ディレクトリ  ---------------------- #
         transport_dir = os.path.join("results", "transport_SE3")
@@ -587,8 +662,16 @@ class OptimalTransportSolver:
             # 基礎行列と損失の計算
             F = self._build_F_from_wc(R_wc, t_wc)
             cost_matrix = self.compute_cost_matrix(F)
-            transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
+            
+            # Differentiable transport context
+            context = torch.enable_grad() if differentiable_transport else torch.no_grad()
+            with context:
+                transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
+                if not differentiable_transport:
+                    transport = transport.detach()
             loss = torch.sum(transport * cost_matrix)
+            if self.lambda_cheirality > 0.0:
+                loss = loss + self.lambda_cheirality * self._cheirality_loss(R_wc, t_wc, transport.detach(), self.cheirality_topk)
             
             if iteration % 10 == 0:
                 print(f"\nIteration {iteration} - Before backward:")
@@ -733,6 +816,8 @@ class OptimalTransportSolver:
                 param_history=param_history,
                 grad_history=grad_history
             )
+        
+        return loss_history
 
 
 
@@ -758,7 +843,8 @@ class OptimalTransportSolver:
         k_rho: float = 10.0,
         warmstart: bool = True,
         early_stop: bool = True,
-        sinkhorn_verbose: bool = False
+        sinkhorn_verbose: bool = False,
+        differentiable_transport: bool = True
     ):
         """
         Camera-2 の姿勢 (R_wc, t̂_wc) を
@@ -793,6 +879,7 @@ class OptimalTransportSolver:
             warmstart: スケール間で双対変数を再利用
             early_stop: 品質劣化時の早期停止
             sinkhorn_verbose: Sinkhorn進捗表示
+            differentiable_transport: Sinkhornの勾配を計算するかどうか
             
         Returns:
             loss_history: 損失値の履歴
@@ -847,7 +934,7 @@ class OptimalTransportSolver:
         
         # 毎ステップでスケジューラを呼ぶ場合の減衰率
         # 「max_iterステップで0.25倍」になるように調整
-        gamma = 0.999 ** (1 / max_iter)
+        gamma = (0.25) ** (1.0 / max_iter)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
         # -------------------- ログ・診断用変数 -------------------- #
@@ -888,14 +975,22 @@ class OptimalTransportSolver:
             # Fundamental matrix → Cost → Transport → Loss
             F = self._build_F_from_wc(R_wc, t_hat)
             C = self.compute_cost_matrix(F)
-            T = self.unbalanced_sinkhorn_algorithm(
-                cost_matrix=C,
-                epsilon=sinkhorn_epsilon,
-                rho=sinkhorn_rho,
-                max_iter=sinkhorn_max_iter,
-                tol=sinkhorn_tol
-            )
+            
+            # Differentiable transport context
+            context = torch.enable_grad() if differentiable_transport else torch.no_grad()
+            with context:
+                T = self.unbalanced_sinkhorn_algorithm(
+                    cost_matrix=C if differentiable_transport else C.detach(),
+                    epsilon=sinkhorn_epsilon,
+                    rho=sinkhorn_rho,
+                    max_iter=sinkhorn_max_iter,
+                    tol=sinkhorn_tol
+                )
+                if not differentiable_transport:
+                    T = T.detach()
             loss = (T * C).sum()
+            if self.lambda_cheirality > 0.0:
+                loss = loss + self.lambda_cheirality * self._cheirality_loss(R_wc, t_hat, T.detach(), self.cheirality_topk)
 
             loss.backward()
 
@@ -1006,7 +1101,7 @@ class OptimalTransportSolver:
             if q_final[0] < 0:
                 q_final = -q_final
                 # 符号修正をtheta_paramにも反映（再学習時の一貫性のため）
-                self.theta_param.copy_(manifold.pack_point((q_final, t_final)))
+                self.theta_param.copy_(manifold.pack_point(q_final, t_final))
             
             # 最終回転行列と並進ベクトル
             q_final_normalized = q_final / q_final.norm()  # 最終的な数値安定性を確保
@@ -1077,7 +1172,8 @@ class OptimalTransportSolver:
                 E_history=E_history
             )
 
-        print(f"[Geoopt-S³×S²] finished after {it+1} iterations, final loss = {curr_loss:.6f}")
+        final_loss = loss_history[-1] if loss_history else float('nan')
+        print(f"[Geoopt-S³×S²] finished after {it+1} iterations, final loss = {final_loss:.6f}")
         print(f"Final quaternion norm: {q_final_normalized.norm().item():.6f}")
         print(f"Final R_wc det: {torch.linalg.det(self.R_wc).item():.6f}")
         return loss_history

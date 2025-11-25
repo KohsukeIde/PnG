@@ -311,7 +311,7 @@ cost = lambda_epi * (epipolar_dist² / σ_epi²) + lambda_color * (color_dist² 
 
 | Performance Tier | Diagonal Concentration | Configurations | Status |
 |------------------|----------------------|---------------|--------|
-| **World Record** | **99.93%** | Hybrid+Optuna | 🥇 Optuna-Optimized |
+| **best so far** | **99.93%** | Hybrid+Optuna | 🥇 Optuna-Optimized |
 | **Exceptional** | **99.03%** | Hybrid+Balanced | 🏅 New State-of-Art |
 | **Outstanding** | **98.8%** | SED+Optimal | 🏆 Excellent |
 | **Excellent** | **96.6%** | Sampson+Balanced | ✅ Very Good |
@@ -481,7 +481,7 @@ cost = lambda_epi * (epipolar_dist² / σ_epi²) + lambda_color * (color_dist² 
 
 The Matching Oracle Study represents a **major breakthrough** in Gaussian correspondence matching for 3D reconstruction. Through systematic implementation of revolutionary NLL-based cost functions and Optuna-driven optimization, combined with validation of multiple epipolar constraint methods, we have:
 
-- **Achieved world record performance** (99.93% diagonal concentration with Optuna optimization)
+- **Achieved high performance** (99.93% diagonal concentration with Optuna optimization)
 - **Established new state-of-the-art** (99.03% with Hybrid+Balanced configuration)
 - **Revolutionized cost function design** with physical NLL interpretation (+8.6% performance gains)
 - **Automated hyperparameter optimization** using Optuna across 50+ trials achieving 99.93%
