@@ -1,11 +1,12 @@
 import os
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
 from src.primitive.twod_gaussians_rs import TwoDGaussians
+from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
 
 
 class SingleImageGaussianMixtureEM:
@@ -33,43 +34,70 @@ class SingleImageGaussianMixtureEM:
         #     raise ValueError("Input image must be a 3-channel color image")
 
     def initialize_gaussians(
-        self, n_gaussians: int
+        self, n_gaussians: int, mode: str = "grid", seed: int = 0
     ) -> TwoDGaussians:
-        """Initialize Gaussians with proper settings.
+        """Initialize Gaussians with a deterministic, image-covering layout.
 
         Args:
             n_gaussians (int): Number of Gaussians to initialize.
+            mode (str): Initialization mode. Currently supports {"grid", "random"}.
+            seed (int): RNG seed used for reproducibility in non-grid paths.
 
         Returns:
             TwoDGaussians: Initialized Gaussians.
         """
         height, width = self.image.shape[:2]
         eps = 1e-12
+        rng = np.random.default_rng(seed)
 
-        # Initialize positions randomly (y, x) order to match coordinate system
-        means = np.column_stack([
-            np.random.uniform(0, height, size=n_gaussians),
-            np.random.uniform(0, width, size=n_gaussians),
-        ]).astype(np.float64)
+        if mode == "grid":
+            n_side = int(np.ceil(np.sqrt(n_gaussians)))
+            ys = np.linspace(0.5, height - 0.5, n_side)
+            xs = np.linspace(0.5, width - 0.5, n_side)
+            Y, X = np.meshgrid(ys, xs, indexing="ij")
+            means = np.stack([Y.ravel(), X.ravel()], axis=1)
+            if means.shape[0] > n_gaussians:
+                means = means[:n_gaussians]
+            elif means.shape[0] < n_gaussians:
+                pad = n_gaussians - means.shape[0]
+                means = np.concatenate([means, means[:pad]], axis=0)
+        else:
+            means = np.column_stack(
+                [
+                    rng.uniform(0, height, size=n_gaussians),
+                    rng.uniform(0, width, size=n_gaussians),
+                ]
+            ).astype(np.float64)
 
-        # Initialize covariances with proper variance units (px^2)
-        sigma0 = (0.1 * min(height, width)) ** 2
-        covs = np.tile(np.eye(2) * sigma0, (n_gaussians, 1, 1)).astype(np.float64)
+        # Covariance: start from cell-sized diagonal
+        cell_h = height / np.sqrt(n_gaussians)
+        cell_w = width / np.sqrt(n_gaussians)
+        # 少し広めにとり、初期レンダの暗さを避ける
+        sigma_y = (0.5 * cell_h) ** 2
+        sigma_x = (0.5 * cell_w) ** 2
+        covs = np.tile(np.diag([sigma_y, sigma_x]), (n_gaussians, 1, 1)).astype(
+            np.float64
+        )
 
-        # Initialize RGB values from the image as intensities
-        rgb = np.array([self.image[int(y), int(x)] for y, x in means], dtype=np.float64)
-        rgb = np.maximum(rgb, eps)  # Avoid zeros - keep as intensities (no normalization)
+        # Colors: local patch mean around each grid point
+        rgb = []
+        patch = int(max(cell_h, cell_w) // 2)
+        for y, x in means:
+            yy0 = int(np.clip(y - patch, 0, height - 1))
+            yy1 = int(np.clip(y + patch, 0, height))
+            xx0 = int(np.clip(x - patch, 0, width - 1))
+            xx1 = int(np.clip(x + patch, 0, width))
+            patch_img = self.image[yy0:yy1, xx0:xx1]
+            if patch_img.size == 0:
+                rgb.append(self.image[int(np.clip(y, 0, height - 1)), int(np.clip(x, 0, width - 1))])
+            else:
+                rgb.append(patch_img.mean(axis=(0, 1)))
+        rgb = np.maximum(np.array(rgb, dtype=np.float64), eps)
 
-        # Initialize mixing coefficients (uniform distribution)
         alpha = np.full(n_gaussians, 1.0 / n_gaussians, dtype=np.float64)
-        
-        # Initialize rotations (zero rotation)
         rotations = np.zeros(n_gaussians, dtype=np.float64)
-        
-        # Initialize scales from covariance matrices
         eigenvalues, _ = np.linalg.eigh(covs)
-        scales = np.sqrt(eigenvalues)  # Convert to standard deviations
-        
+        scales = np.sqrt(np.maximum(eigenvalues, eps))
         return TwoDGaussians(means, covs, rgb, alpha, rotations, scales)
 
     def gaussian_pdf(
@@ -241,10 +269,12 @@ class SingleImageGaussianMixtureEM:
         # Compute S_k for Poisson rate model using chunked computation
         S_k = self._sum_Sk_chunked(gaussians, H, W, k_chunk_size=256) + eps  # (K,) - discrete sum of continuous Gaussian
 
-        # Update mixing coefficients: α_k = N_k / N_total (sum = 1)
+        # Update mixing coefficients (MLE, simple normalization)
         new_alpha = N_k / N_total
-        new_alpha = np.maximum(new_alpha, eps)
-        new_alpha /= new_alpha.sum()  # Ensure normalization
+        new_alpha = np.clip(new_alpha, eps, None)
+        new_alpha /= new_alpha.sum()
+        alpha_thresh = 1e-4
+        dead = new_alpha < alpha_thresh  # mark for potential reinit
 
         # Update color intensities: ρ_{k,i} = N_{k,i} / (α_k * S_k)
         new_colors = N_ki / (new_alpha[:, None] * S_k[:, None])  # (K, 3) - no normalization constraint
@@ -267,39 +297,88 @@ class SingleImageGaussianMixtureEM:
         for k in range(K):
             new_covs[k] = self.ensure_positive_definite(new_covs[k])
 
-        # Handle Gaussians with very low responsibility
+        # Handle Gaussians with very low responsibility using residual-based reinit
         responsibility_threshold = 1e-6
-        small_responsibility_indices = np.where(N_k < responsibility_threshold)[0]
-
+        small_responsibility_indices = np.where((N_k < responsibility_threshold) | dead)[0]
         if len(small_responsibility_indices) > 0:
-            print(f"Resetting {len(small_responsibility_indices)} Gaussians with small responsibilities")
-            for idx in small_responsibility_indices:
-                # Reinitialize with proper variance units (px^2)
-                new_means[idx] = np.random.uniform([0, 0], [H, W])
-                sigma0 = (0.1 * min(H, W)) ** 2
-                new_covs[idx] = np.eye(2) * sigma0
-                # Sample color from image at new position
-                y_pos, x_pos = int(new_means[idx, 0]), int(new_means[idx, 1])
-                y_pos = np.clip(y_pos, 0, H-1)
-                x_pos = np.clip(x_pos, 0, W-1)
-                sampled_color = self.image[y_pos, x_pos]
-                new_colors[idx] = np.maximum(sampled_color, eps)  # No normalization - keep as intensities
+            rasterizer = Vanilla2DRasterizer(H, W)
+            # build rotations/scales consistent with current covs for rendering
+            tmp_rot = np.zeros(K, dtype=np.float64)
+            tmp_scales = np.zeros((K, 2), dtype=np.float64)
+            for k in range(K):
+                ev, evec = np.linalg.eigh(new_covs[k])
+                tmp_rot[k] = np.arctan2(evec[1, 0], evec[0, 0])
+                tmp_scales[k] = np.sqrt(np.clip(ev, 1e-6, None))
+            tmp_gauss = TwoDGaussians(
+                new_means.copy(),
+                new_covs.copy(),
+                new_colors.copy(),
+                new_alpha.copy(),
+                tmp_rot,
+                tmp_scales,
+            )
+            rates = rasterizer.render_rates(tmp_gauss)
+            res = (np.clip(self.image, 0.0, None) - rates).sum(axis=2)
+            flat_idx = np.argsort(res.ravel())[::-1]
+            ys, xs = np.unravel_index(flat_idx, res.shape)
+            boost_alpha = float(new_alpha.mean() * 2.0)
+            for j, idx in enumerate(small_responsibility_indices):
+                if j >= len(flat_idx):
+                    break
+                y0, x0 = ys[j], xs[j]
+                new_means[idx] = np.array([y0, x0], dtype=np.float64)
+                sigma0 = (0.05 * min(H, W)) ** 2
+                new_covs[idx] = np.array([[sigma0, 0.0], [0.0, sigma0]], dtype=np.float64)
+                sampled_color = self.image[int(y0), int(x0)]
+                new_colors[idx] = np.maximum(sampled_color, eps)
+                # give a bit more mass so reinit components can compete in next E-step
+                new_alpha[idx] = boost_alpha
+            # redistribute alpha: keep alive ratios, spread dead_mass evenly
+            orig_alpha = new_alpha.copy()
+            dead_mass = float(orig_alpha[small_responsibility_indices].sum())
+            if dead_mass < eps:
+                dead_mass = eps * len(small_responsibility_indices)
+            alive_mask = np.ones(K, dtype=bool)
+            alive_mask[small_responsibility_indices] = False
+            alive_mass = float(orig_alpha[alive_mask].sum())
+            if alive_mass <= eps:
+                new_alpha[:] = 1.0 / K
+            else:
+                new_alpha[alive_mask] = orig_alpha[alive_mask] * max(
+                    1.0 - dead_mass, eps
+                ) / max(alive_mass, eps)
+                new_alpha[small_responsibility_indices] = dead_mass / len(
+                    small_responsibility_indices
+                )
+                new_alpha = np.maximum(new_alpha, eps)
+                new_alpha /= new_alpha.sum()
 
         # Update rotations and scales from the new covariance matrices
         new_rotations = np.zeros(K, dtype=np.float64)
         new_scales = np.zeros((K, 2), dtype=np.float64)
         
+        max_eig = (0.5 * max(H, W)) ** 2
         for k in range(K):
+            new_covs[k] = self.ensure_positive_definite(
+                new_covs[k], min_eigenvalue=1e-3, max_eigenvalue=max_eig
+            )
             eigenvalues, eigenvectors = np.linalg.eigh(new_covs[k])
-            # Rotation angle from the first eigenvector
             new_rotations[k] = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
-            # Scales are the square roots of eigenvalues
-            new_scales[k] = np.sqrt(np.maximum(eigenvalues, 1e-12))
+            new_scales[k] = np.sqrt(np.clip(eigenvalues, 1e-6, None))
+
+        # Clamp means inside image bounds to avoid OOB Gaussians downstream
+        new_means[:, 0] = np.clip(new_means[:, 0], 0, H - 1)
+        new_means[:, 1] = np.clip(new_means[:, 1], 0, W - 1)
+
+        return TwoDGaussians(new_means, new_covs, new_colors, new_alpha, new_rotations, new_scales)
 
         return TwoDGaussians(new_means, new_covs, new_colors, new_alpha, new_rotations, new_scales)
 
     def ensure_positive_definite(
-        self, cov: np.ndarray, min_eigenvalue: float = 1e-6
+        self,
+        cov: np.ndarray,
+        min_eigenvalue: float = 1e-3,
+        max_eigenvalue: Optional[float] = None,
     ) -> np.ndarray:
         """Ensure the covariance matrix is positive definite.
 
@@ -317,7 +396,10 @@ class SingleImageGaussianMixtureEM:
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         
         # Clip eigenvalues to ensure positive definiteness
-        eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
+        if max_eigenvalue is None:
+            eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
+        else:
+            eigenvalues = np.clip(eigenvalues, min_eigenvalue, max_eigenvalue)
         
         # Reconstruct the matrix
         return (eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T).astype(cov.dtype)
