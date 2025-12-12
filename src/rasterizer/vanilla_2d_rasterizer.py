@@ -32,7 +32,7 @@ class Vanilla2DRasterizer:
         Returns:
             np.ndarray: rate image with shape [height, width, 3]
         """
-        H, W = self.height, sef.width
+        H, W = self.height, self.width
         xy = (np.mgrid[0:H, 0:W].astype(np.float64)
               .reshape(2, -1).T)  # (H*W, 2)
         rates = np.zeros((H * W, 3), np.float64)
