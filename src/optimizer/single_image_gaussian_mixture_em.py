@@ -10,31 +10,102 @@ from src.rasterizer.vanilla_2d_rasterizer import Vanilla2DRasterizer
 
 
 class SingleImageGaussianMixtureEM:
-    """conduct Gaussian Mixture Model optimization on a single image using the EM algorithm."""
+    """conduct Gaussian Mixture Model optimization on a single image using the EM algorithm.
 
-    def __init__(self, image_path: str) -> None:
+    Supports an optional mask: pixels outside mask are treated as missing (ignored), not zeros.
+    """
+
+    def __init__(
+        self,
+        image_path: str,
+        mask_path: Optional[str] = None,
+        mask: Optional[np.ndarray] = None,
+        mask_threshold: float = 0.5,
+    ) -> None:
         """Initialize the SingleImageGaussianMixtureEM with an image file.
 
         Args:
-            image_path (str): Path to the input image file.
+            image_path: Path to the input image file.
+            mask_path: Optional path to mask image (same H,W).
+            mask: Optional mask array (H,W) or (H,W,1). If provided, overrides mask_path.
+            mask_threshold: Threshold to binarize mask.
 
         Raises:
             FileNotFoundError: If the specified image file does not exist.
             ValueError: If the image cannot be opened or processed.
         """
+        alpha_mask = None
         try:
             with Image.open(image_path) as img:
-                self.image = np.array(img).astype(float) / 255.0
+                if img.mode == "RGBA":
+                    rgb, a = img.convert("RGBA").split()[:3], img.convert("RGBA").split()[3]
+                    img_rgb = Image.merge("RGB", rgb)
+                    self.image = np.asarray(img_rgb, dtype=np.float64) / 255.0
+                    alpha_arr = np.asarray(a, dtype=np.float64) / 255.0
+                    alpha_mask = alpha_arr
+                else:
+                    img = img.convert("RGB")
+                    self.image = np.asarray(img, dtype=np.float64) / 255.0
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Image file not found: {image_path}") from e
         except Exception as e:
             raise ValueError(f"Error processing image: {str(e)}") from e
 
-        # if self.image.ndim != 3 or self.image.shape[2] != 3:
-        #     raise ValueError("Input image must be a 3-channel color image")
+        self.mask_threshold = float(mask_threshold)
+        self.mask: Optional[np.ndarray] = None           # (H,W) float {0,1}
+        self.valid_pixels: Optional[np.ndarray] = None   # (N,2) y,x
+        self._rng: np.random.Generator = np.random.default_rng(0)
+
+        # Prefer explicit mask arg; otherwise use alpha channel if present
+        if mask is not None:
+            self.set_mask(mask, threshold=self.mask_threshold)
+        elif alpha_mask is not None:
+            self.set_mask(alpha_mask, threshold=self.mask_threshold)
+        elif mask_path is not None:
+            try:
+                m = np.array(Image.open(mask_path)).astype(np.float64)
+                if m.max() > 1.0:
+                    m = m / 255.0
+                self.set_mask(m, threshold=self.mask_threshold)
+            except Exception as e:
+                raise ValueError(f"Error processing mask: {str(e)}") from e
+
+    # -------------------------
+    # Mask utilities
+    # -------------------------
+    def set_mask(self, mask: Optional[np.ndarray], threshold: float = 0.5) -> None:
+        """Set or clear mask. mask>threshold treated as valid, others ignored."""
+        if mask is None:
+            self.mask = None
+            self.valid_pixels = None
+            return
+        m = np.asarray(mask)
+        if m.ndim == 3:
+            m = m[..., 0]
+        m = m.astype(np.float64)
+        if m.max() > 1.0:
+            m = m / 255.0
+        H, W = self.image.shape[:2]
+        if m.shape[0] != H or m.shape[1] != W:
+            raise ValueError(f"Mask shape {m.shape} does not match image shape {(H, W)}")
+        mb = (m > float(threshold)).astype(np.float64)
+        vp = np.argwhere(mb > 0.5)  # (N,2)
+        if vp.size == 0:
+            self.mask = None
+            self.valid_pixels = None
+            return
+        self.mask = mb
+        self.valid_pixels = vp
+
+    def _mask_weights(self) -> Optional[np.ndarray]:
+        return self.mask
 
     def initialize_gaussians(
-        self, n_gaussians: int, mode: str = "grid", seed: int = 0
+        self,
+        n_gaussians: int,
+        mode: str = "grid",
+        seed: int = 0,
+        mask: Optional[np.ndarray] = None,
     ) -> TwoDGaussians:
         """Initialize Gaussians with a deterministic, image-covering layout.
 
@@ -42,36 +113,88 @@ class SingleImageGaussianMixtureEM:
             n_gaussians (int): Number of Gaussians to initialize.
             mode (str): Initialization mode. Currently supports {"grid", "random"}.
             seed (int): RNG seed used for reproducibility in non-grid paths.
+            mask (Optional[np.ndarray]): Optional mask overriding current mask for init.
 
         Returns:
             TwoDGaussians: Initialized Gaussians.
         """
+        if mask is not None:
+            self.set_mask(mask, threshold=self.mask_threshold)
+
         height, width = self.image.shape[:2]
         eps = 1e-12
         rng = np.random.default_rng(seed)
+        self._rng = rng
 
-        if mode == "grid":
-            n_side = int(np.ceil(np.sqrt(n_gaussians)))
-            ys = np.linspace(0.5, height - 0.5, n_side)
-            xs = np.linspace(0.5, width - 0.5, n_side)
-            Y, X = np.meshgrid(ys, xs, indexing="ij")
-            means = np.stack([Y.ravel(), X.ravel()], axis=1)
-            if means.shape[0] > n_gaussians:
-                means = means[:n_gaussians]
-            elif means.shape[0] < n_gaussians:
-                pad = n_gaussians - means.shape[0]
-                means = np.concatenate([means, means[:pad]], axis=0)
+        mask_w = self._mask_weights()
+        vp = self.valid_pixels
+
+        if mask_w is not None and vp is not None:
+            # prefer in-mask means
+            y_min, x_min = vp.min(axis=0)
+            y_max, x_max = vp.max(axis=0)
+            bbox_h = int(y_max - y_min + 1)
+            bbox_w = int(x_max - x_min + 1)
+            bbox_area = float(max(bbox_h * bbox_w, 1))
+            fill_ratio = float(vp.shape[0]) / bbox_area
+            if fill_ratio < 0.15:
+                vp_sorted = vp[np.lexsort((vp[:, 1], vp[:, 0]))]
+                idx = np.linspace(0, vp_sorted.shape[0] - 1, n_gaussians, dtype=int)
+                means = vp_sorted[idx].astype(np.float64)
+            else:
+                n_side = int(np.ceil(np.sqrt(n_gaussians / max(fill_ratio, 1e-6))))
+                n_side = max(n_side, 1)
+                ys = np.linspace(y_min + 0.5, y_max - 0.5, n_side)
+                xs = np.linspace(x_min + 0.5, x_max - 0.5, n_side)
+                Yg, Xg = np.meshgrid(ys, xs, indexing="ij")
+                grid = np.stack([Yg.ravel(), Xg.ravel()], axis=1)
+                yi = np.clip(grid[:, 0].astype(int), 0, height - 1)
+                xi = np.clip(grid[:, 1].astype(int), 0, width - 1)
+                keep = mask_w[yi, xi] > 0.5
+                means = grid[keep]
+                if means.shape[0] >= n_gaussians:
+                    means = means[:n_gaussians]
+                else:
+                    pad = n_gaussians - means.shape[0]
+                    vp_sorted = vp[np.lexsort((vp[:, 1], vp[:, 0]))]
+                    if vp_sorted.shape[0] == 1:
+                        extra = np.repeat(vp_sorted.astype(np.float64), pad, axis=0)
+                    else:
+                        idx = np.linspace(0, vp_sorted.shape[0] - 1, pad, dtype=int)
+                        extra = vp_sorted[idx].astype(np.float64)
+                    means = np.concatenate([means.astype(np.float64), extra], axis=0)
         else:
-            means = np.column_stack(
-                [
-                    rng.uniform(0, height, size=n_gaussians),
-                    rng.uniform(0, width, size=n_gaussians),
-                ]
-            ).astype(np.float64)
+            if mode == "grid":
+                n_side = int(np.ceil(np.sqrt(n_gaussians)))
+                ys = np.linspace(0.5, height - 0.5, n_side)
+                xs = np.linspace(0.5, width - 0.5, n_side)
+                Y, X = np.meshgrid(ys, xs, indexing="ij")
+                means = np.stack([Y.ravel(), X.ravel()], axis=1)
+                if means.shape[0] > n_gaussians:
+                    means = means[:n_gaussians]
+                elif means.shape[0] < n_gaussians:
+                    pad = n_gaussians - means.shape[0]
+                    means = np.concatenate([means, means[:pad]], axis=0)
+            else:
+                means = np.column_stack(
+                    [
+                        rng.uniform(0, height, size=n_gaussians),
+                        rng.uniform(0, width, size=n_gaussians),
+                    ]
+                ).astype(np.float64)
 
-        # Covariance: start from cell-sized diagonal
-        cell_h = height / np.sqrt(n_gaussians)
-        cell_w = width / np.sqrt(n_gaussians)
+        # Covariance: start from cell-sized diagonal (bbox if mask is present)
+        if mask_w is not None and vp is not None:
+            y_min, x_min = vp.min(axis=0)
+            y_max, x_max = vp.max(axis=0)
+            eff_h = float(max(y_max - y_min + 1, 1))
+            eff_w = float(max(x_max - x_min + 1, 1))
+        else:
+            eff_h = float(height)
+            eff_w = float(width)
+
+        cell_h = eff_h / np.sqrt(n_gaussians)
+        cell_w = eff_w / np.sqrt(n_gaussians)
         # 少し広めにとり、初期レンダの暗さを避ける
         sigma_y = (0.5 * cell_h) ** 2
         sigma_x = (0.5 * cell_w) ** 2
@@ -79,9 +202,10 @@ class SingleImageGaussianMixtureEM:
             np.float64
         )
 
-        # Colors: local patch mean around each grid point
+        # Colors: local patch mean (mask-weighted if mask exists)
         rgb = []
         patch = int(max(cell_h, cell_w) // 2)
+        patch = max(patch, 1)
         for y, x in means:
             yy0 = int(np.clip(y - patch, 0, height - 1))
             yy1 = int(np.clip(y + patch, 0, height))
@@ -90,6 +214,14 @@ class SingleImageGaussianMixtureEM:
             patch_img = self.image[yy0:yy1, xx0:xx1]
             if patch_img.size == 0:
                 rgb.append(self.image[int(np.clip(y, 0, height - 1)), int(np.clip(x, 0, width - 1))])
+                continue
+            if mask_w is not None:
+                mp = mask_w[yy0:yy1, xx0:xx1]
+                wsum = float(mp.sum())
+                if wsum <= 0.0:
+                    rgb.append(self.image[int(np.clip(y, 0, height - 1)), int(np.clip(x, 0, width - 1))])
+                else:
+                    rgb.append((patch_img * mp[:, :, None]).sum(axis=(0, 1)) / wsum)
             else:
                 rgb.append(patch_img.mean(axis=(0, 1)))
         rgb = np.maximum(np.array(rgb, dtype=np.float64), eps)
@@ -232,15 +364,29 @@ class SingleImageGaussianMixtureEM:
         
         return gamma.astype(np.float64)
 
-    def _sum_Sk_chunked(self, gaussians: TwoDGaussians, H: int, W: int, k_chunk_size: int = 256) -> np.ndarray:
-        """Compute S_k = sum of phi_k values in chunked manner to save memory."""
+    def _sum_Sk_chunked(
+        self,
+        gaussians: TwoDGaussians,
+        H: int,
+        W: int,
+        k_chunk_size: int = 256,
+        mask_w: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Compute S_k = sum of phi_k values (mask-weighted if provided) in chunked manner."""
         S_k = np.zeros(gaussians.k, dtype=np.float64)
         for k_start in range(0, gaussians.k, k_chunk_size):
             k_end = min(k_start + k_chunk_size, gaussians.k)
-            phi = self.gaussian_pdf(gaussians.means[k_start:k_end],
-                                    gaussians.covs[k_start:k_end],
-                                    H, W, normalize_per_k=False)      # (H,W,kc)
-            S_k[k_start:k_end] = phi.sum(axis=(0, 1))
+            phi = self.gaussian_pdf(
+                gaussians.means[k_start:k_end],
+                gaussians.covs[k_start:k_end],
+                H,
+                W,
+                normalize_per_k=False,
+            )  # (H,W,kc)
+            if mask_w is None:
+                S_k[k_start:k_end] = phi.sum(axis=(0, 1))
+            else:
+                S_k[k_start:k_end] = (phi * mask_w[:, :, None]).sum(axis=(0, 1))
         return S_k
 
     def m_step(self, gamma: np.ndarray, gaussians: TwoDGaussians) -> TwoDGaussians:
@@ -257,8 +403,14 @@ class SingleImageGaussianMixtureEM:
         K = gaussians.k
         eps = 1e-12
 
-        # Expected counts: n_hat = I * gamma
-        I = np.clip(self.image, 0.0, None)  # (H, W, 3) - no upper clipping for Poisson
+        mask_w = self._mask_weights()  # (H,W) or None
+
+        # Expected counts: n_hat = I * gamma (mask outside treated as missing)
+        I = np.clip(self.image, 0.0, None)  # (H, W, 3)
+        if mask_w is not None:
+            I = I * mask_w[:, :, None]
+        if mask_w is not None:
+            gamma = gamma * mask_w[:, :, None, None]
         n_hat = I[:, :, None, :] * gamma  # (H, W, K, 3)
         
         # Compute N_ki and N_k
@@ -266,8 +418,8 @@ class SingleImageGaussianMixtureEM:
         N_k = N_ki.sum(axis=1) + eps  # (K,)
         N_total = N_k.sum() + eps
 
-        # Compute S_k for Poisson rate model using chunked computation
-        S_k = self._sum_Sk_chunked(gaussians, H, W, k_chunk_size=256) + eps  # (K,) - discrete sum of continuous Gaussian
+        # Compute S_k for Poisson rate model using chunked computation (mask-weighted if mask exists)
+        S_k = self._sum_Sk_chunked(gaussians, H, W, k_chunk_size=256, mask_w=mask_w) + eps  # (K,) - discrete sum of continuous Gaussian
 
         # Update mixing coefficients (MLE, simple normalization)
         new_alpha = N_k / N_total
@@ -300,6 +452,7 @@ class SingleImageGaussianMixtureEM:
         # Handle Gaussians with very low responsibility using residual-based reinit
         responsibility_threshold = 1e-6
         small_responsibility_indices = np.where((N_k < responsibility_threshold) | dead)[0]
+        reinit_colors = {}
         if len(small_responsibility_indices) > 0:
             rasterizer = Vanilla2DRasterizer(H, W)
             # build rotations/scales consistent with current covs for rendering
@@ -319,11 +472,18 @@ class SingleImageGaussianMixtureEM:
             )
             rates = rasterizer.render_rates(tmp_gauss)
             res = (np.clip(self.image, 0.0, None) - rates).sum(axis=2)
-            flat_idx = np.argsort(res.ravel())[::-1]
-            ys, xs = np.unravel_index(flat_idx, res.shape)
+            if mask_w is not None:
+                res = np.where(mask_w > 0.5, res, -np.inf)
+            flat = res.ravel()
+            finite_idx = np.flatnonzero(np.isfinite(flat))
+            if finite_idx.size == 0:
+                finite_idx = np.arange(flat.size)
+            sorted_idx = finite_idx[np.argsort(flat[finite_idx])[::-1]]
+            ys, xs = np.unravel_index(sorted_idx, res.shape)
             boost_alpha = float(new_alpha.mean() * 2.0)
+            reinit_colors = {}
             for j, idx in enumerate(small_responsibility_indices):
-                if j >= len(flat_idx):
+                if j >= len(sorted_idx):
                     break
                 y0, x0 = ys[j], xs[j]
                 new_means[idx] = np.array([y0, x0], dtype=np.float64)
@@ -333,6 +493,7 @@ class SingleImageGaussianMixtureEM:
                 new_colors[idx] = np.maximum(sampled_color, eps)
                 # give a bit more mass so reinit components can compete in next E-step
                 new_alpha[idx] = boost_alpha
+                reinit_colors[idx] = new_colors[idx].copy()
             # redistribute alpha: keep alive ratios, spread dead_mass evenly
             orig_alpha = new_alpha.copy()
             dead_mass = float(orig_alpha[small_responsibility_indices].sum())
@@ -370,9 +531,35 @@ class SingleImageGaussianMixtureEM:
         new_means[:, 0] = np.clip(new_means[:, 0], 0, H - 1)
         new_means[:, 1] = np.clip(new_means[:, 1], 0, W - 1)
 
-        return TwoDGaussians(new_means, new_covs, new_colors, new_alpha, new_rotations, new_scales)
+        # If mask exists, snap means that fall outside mask back into valid pixels (handles holes/disconnected regions)
+        if mask_w is not None and self.valid_pixels is not None and self.valid_pixels.size > 0:
+            mask_bool = mask_w > 0.5
+            rng = self._rng if hasattr(self, "_rng") and self._rng is not None else np.random.default_rng(0)
+            for k in range(K):
+                yi = int(np.clip(round(new_means[k, 0]), 0, H - 1))
+                xi = int(np.clip(round(new_means[k, 1]), 0, W - 1))
+                if not mask_bool[yi, xi]:
+                    ridx = int(rng.integers(0, self.valid_pixels.shape[0]))
+                    yx = self.valid_pixels[ridx]
+                    new_means[k] = np.array([float(yx[0]), float(yx[1])], dtype=np.float64)
+
+        # Recompute S_k with updated means/covs (mask-aware), then update colors consistently
+        dummy_gauss = TwoDGaussians(
+            new_means,
+            new_covs,
+            gaussians.rgb,  # rgb unused for S_k
+            new_alpha,
+            new_rotations,
+            new_scales,
+        )
+        S_k_new = self._sum_Sk_chunked(dummy_gauss, H, W, k_chunk_size=256, mask_w=mask_w) + eps
+        new_colors = N_ki / (new_alpha[:, None] * S_k_new[:, None])
+        new_colors = np.maximum(new_colors, eps)
+        for idx, col in reinit_colors.items():
+            new_colors[idx] = col
 
         return TwoDGaussians(new_means, new_covs, new_colors, new_alpha, new_rotations, new_scales)
+
 
     def ensure_positive_definite(
         self,
@@ -453,7 +640,9 @@ class SingleImageGaussianMixtureEM:
         
         # Observed intensities
         I = np.clip(self.image, 0.0, None)
-        
-        # Poisson NLL = Σ(λ - I*log(λ)) + constants
-        nll = (rates - I * np.log(rates + eps)).sum()
+        mask_w = self._mask_weights()
+        if mask_w is not None:
+            nll = ((rates - I * np.log(rates + eps)) * mask_w[:, :, None]).sum()
+        else:
+            nll = (rates - I * np.log(rates + eps)).sum()
         return float(nll)

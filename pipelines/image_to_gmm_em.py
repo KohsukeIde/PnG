@@ -2,6 +2,7 @@ import os
 import sys
 import shutil 
 import numpy as np
+from typing import Optional
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
@@ -95,12 +96,13 @@ def run_gaussian_mixture_on_image(
     min_iterations: int = 5,
     init_mode: str = "grid",
     mse_tol: float = None,
+    mask_path: Optional[str] = None,
 ):
     # Convert relative path to absolute path
     if not os.path.isabs(image_path):
         image_path = os.path.join(project_root, image_path)
     
-    gmm = SingleImageGaussianMixtureEM(image_path)
+    gmm = SingleImageGaussianMixtureEM(image_path, mask_path=mask_path)
     
     base_output_dir = "gaussian_mixture_results"
     output_dir = os.path.join(
@@ -348,6 +350,12 @@ if __name__ == "__main__":
         default=None,
         help="Optional relative MSE improvement threshold for early stopping",
     )
+    parser.add_argument(
+        "--mask_path",
+        type=str,
+        default=None,
+        help="Optional path to a mask image (same H,W). Pixels outside mask are treated as missing.",
+    )
     args = parser.parse_args()
 
     if args.k_list:
@@ -364,4 +372,5 @@ if __name__ == "__main__":
             tol=args.tol,
             min_iterations=args.min_iterations,
             init_mode=args.init_mode,
+            mask_path=args.mask_path,
         )
