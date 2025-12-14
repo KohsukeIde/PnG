@@ -97,6 +97,8 @@ def run_gaussian_mixture_on_image(
     init_mode: str = "grid",
     mse_tol: float = None,
     mask_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    save_intermediate: bool = True,
 ):
     # Convert relative path to absolute path
     if not os.path.isabs(image_path):
@@ -104,10 +106,15 @@ def run_gaussian_mixture_on_image(
     
     gmm = SingleImageGaussianMixtureEM(image_path, mask_path=mask_path)
     
-    base_output_dir = "gaussian_mixture_results"
-    output_dir = os.path.join(
-        base_output_dir, f"gaussians_{n_gaussians}_auto_{max_iterations}"
-    )
+    if output_dir is None:
+        base_output_dir = "gaussian_mixture_results"
+        output_dir = os.path.join(
+            base_output_dir, f"gaussians_{n_gaussians}_auto_{max_iterations}"
+        )
+    
+    # Convert output_dir to absolute path if relative
+    if not os.path.isabs(output_dir):
+        output_dir = os.path.join(project_root, output_dir)
     
     # Check if the output directory exists, and if so, delete it
     if os.path.exists(output_dir):
@@ -130,8 +137,9 @@ def run_gaussian_mixture_on_image(
     print(f"Alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
     print("------------------------------------------------------------")
 
-    visualize_gaussians(gmm.image, gaussians, 0, output_dir)
-    visualize_gaussian_parameters(gaussians, 0, output_dir, gmm.image.shape[0], gmm.image.shape[1])
+    if save_intermediate:
+        visualize_gaussians(gmm.image, gaussians, 0, output_dir)
+        visualize_gaussian_parameters(gaussians, 0, output_dir, gmm.image.shape[0], gmm.image.shape[1])
     
     prev_nll = np.inf
     nll_log = []
@@ -178,13 +186,14 @@ def run_gaussian_mixture_on_image(
             }
         )
 
-        visualize_gaussians(gmm.image, gaussians, i+1, output_dir)
-        # visualize_responsibilities(responsibilities, i+1, output_dir)
-        visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
+        if save_intermediate:
+            visualize_gaussians(gmm.image, gaussians, i+1, output_dir)
+            # visualize_responsibilities(responsibilities, i+1, output_dir)
+            visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
         print(f"Iteration {i+1} - Gaussians RGB min-max: {gaussians.rgb.min()}, {gaussians.rgb.max()}")
         print(f"Iteration {i+1} - Gaussians alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
         
-        if (i + 1) % 1 == 0:  # Save every n iterations
+        if save_intermediate and (i + 1) % 1 == 0:  # Save every n iterations
             height, width = gmm.image.shape[:2]
             rasterizer = Vanilla2DRasterizer(height, width)
             reconstructed_image = rasterizer.rasterize(gaussians)
@@ -242,14 +251,16 @@ def run_gaussian_mixture_on_image(
     ax2.set_title(f"Reconstructed Image ({n_gaussians} Gaussians)")
     ax2.axis('off')
 
-    plt.tight_layout()
-    comparison_path = os.path.join(output_dir, "comparison.png")
-    plt.savefig(comparison_path)
-    plt.close()
-
+    # Save final reconstructed image
     reconstructed_path = os.path.join(output_dir, "reconstructed_image.png")
     Image.fromarray(reconstructed_image).save(reconstructed_path)
     print(f"Reconstructed image saved to {reconstructed_path}")
+    
+    if save_intermediate:
+        plt.tight_layout()
+        comparison_path = os.path.join(output_dir, "comparison.png")
+        plt.savefig(comparison_path)
+        plt.close()
 
     # Save NLL log and metrics
     np.savetxt(os.path.join(output_dir, "poisson_nll.txt"), np.array(nll_log))
@@ -258,11 +269,13 @@ def run_gaussian_mixture_on_image(
 
         json.dump(metrics_log, f, indent=2)
 
-    # Plot basic curves (NLL, MSE, rates_max)
+    # Plot basic curves (NLL, MSE, rates_max, alpha_alive)
     try:
         iters = [m["iter"] for m in metrics_log]
         mse_vals = [m["mse"] for m in metrics_log]
         rates_max_vals = [m["rates_max"] for m in metrics_log]
+        alpha_alive_vals = [m["alpha_alive_gt1e4"] for m in metrics_log]
+        
         plt.figure()
         plt.plot(iters, nll_log, label="NLL")
         plt.xlabel("iter")
@@ -285,6 +298,14 @@ def run_gaussian_mixture_on_image(
         plt.ylabel("rates_max")
         plt.grid(True)
         plt.savefig(os.path.join(output_dir, "curve_rates_max.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(iters, alpha_alive_vals, label="alpha_alive_gt1e4", color="purple")
+        plt.xlabel("iter")
+        plt.ylabel("Number of active Gaussians (alpha > 1e-4)")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "curve_alpha_alive.png"))
         plt.close()
     except Exception as e:
         print(f"Plotting skipped due to error: {e}")
