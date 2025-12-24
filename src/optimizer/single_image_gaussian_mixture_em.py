@@ -378,13 +378,13 @@ class SingleImageGaussianMixtureEM:
             k_end = min(k_start + k_chunk_size, gaussians.k)
             phi = self.gaussian_pdf(
                 gaussians.means[k_start:k_end],
-                gaussians.covs[k_start:k_end],
+                                    gaussians.covs[k_start:k_end],
                 H,
                 W,
                 normalize_per_k=False,
             )  # (H,W,kc)
             if mask_w is None:
-                S_k[k_start:k_end] = phi.sum(axis=(0, 1))
+            S_k[k_start:k_end] = phi.sum(axis=(0, 1))
             else:
                 S_k[k_start:k_end] = (phi * mask_w[:, :, None]).sum(axis=(0, 1))
         return S_k
@@ -584,7 +584,7 @@ class SingleImageGaussianMixtureEM:
         
         # Clip eigenvalues to ensure positive definiteness
         if max_eigenvalue is None:
-            eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
+        eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
         else:
             eigenvalues = np.clip(eigenvalues, min_eigenvalue, max_eigenvalue)
         
@@ -644,5 +644,5 @@ class SingleImageGaussianMixtureEM:
         if mask_w is not None:
             nll = ((rates - I * np.log(rates + eps)) * mask_w[:, :, None]).sum()
         else:
-            nll = (rates - I * np.log(rates + eps)).sum()
+        nll = (rates - I * np.log(rates + eps)).sum()
         return float(nll)
