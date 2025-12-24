@@ -310,12 +310,50 @@ def run_gaussian_mixture_on_image(
     except Exception as e:
         print(f"Plotting skipped due to error: {e}")
 
-    # Save gaussians as pickle for downstream use
+    # Helper: convert TwoDGaussians from (y,x) to (x,y) ordering for means/covs/scales/rot
+    def to_xy_order(gauss):
+        P = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
+        new_means = gauss.means[:, ::-1].copy()  # (y,x) -> (x,y)
+        if hasattr(gauss, "covs") and gauss.covs is not None:
+            covs = gauss.covs
+        else:
+            # rebuild covs from scales/rotations if missing
+            covs = []
+            for s, r in zip(gauss.scales, gauss.rotations):
+                c, s_r = np.cos(r), np.sin(r)
+                R = np.array([[c, -s_r], [s_r, c]], dtype=np.float64)
+                Sigma = np.diag(np.square(s))
+                covs.append(R @ Sigma @ R.T)
+            covs = np.stack(covs, axis=0)
+        covs_xy = np.einsum("ij,kjl,ml->kim", P, covs, P)  # P @ cov @ P^T
+        rotations = np.zeros(gauss.k, dtype=np.float64)
+        scales = np.zeros((gauss.k, 2), dtype=np.float64)
+        for i in range(gauss.k):
+            ev, evec = np.linalg.eigh(covs_xy[i])
+            rotations[i] = np.arctan2(evec[1, 0], evec[0, 0])
+            scales[i] = np.sqrt(np.clip(ev, 1e-12, None))
+        return type(gauss)(
+            new_means.astype(np.float64),
+            covs_xy.astype(np.float64),
+            gauss.rgb.astype(np.float64),
+            gauss.alpha.astype(np.float64),
+            rotations.astype(np.float64),
+            scales.astype(np.float64),
+        )
+
+    # Save gaussians as pickle for downstream use (legacy dict format), now in (x,y)
     try:
         import pickle
 
+        gaussians_xy = to_xy_order(gaussians)
+        legacy_payload = {
+            "original_gaussians": gaussians,
+            "projected_gaussians": gaussians_xy,
+            "viewmat": np.eye(4, dtype=np.float64),  # placeholder (not used downstream here)
+            "K": np.eye(3, dtype=np.float64),  # placeholder intrinsics
+        }
         with open(os.path.join(output_dir, "gaussians.pkl"), "wb") as f:
-            pickle.dump(gaussians, f)
+            pickle.dump(legacy_payload, f)
     except Exception as e:
         print(f"Pickle save skipped due to error: {e}")
 
