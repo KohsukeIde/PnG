@@ -226,7 +226,13 @@ class SingleImageGaussianMixtureEM:
                 rgb.append(patch_img.mean(axis=(0, 1)))
         rgb = np.maximum(np.array(rgb, dtype=np.float64), eps)
 
-        alpha = np.full(n_gaussians, 1.0 / n_gaussians, dtype=np.float64)
+        # Reparameterize: alpha carries intensity, rgb is a normalized ratio.
+        alpha = rgb.sum(axis=1) + eps
+        rgb = rgb / alpha[:, None]
+        rgb = np.maximum(rgb, eps)
+        rgb = rgb / (rgb.sum(axis=1, keepdims=True) + eps)
+        # Keep a reasonable global scale for initialization.
+        alpha = alpha / (alpha.mean() + eps)
         rotations = np.zeros(n_gaussians, dtype=np.float64)
         eigenvalues, _ = np.linalg.eigh(covs)
         scales = np.sqrt(np.maximum(eigenvalues, eps))
@@ -296,7 +302,7 @@ class SingleImageGaussianMixtureEM:
         # Spatial distribution φ_k(x,y) = continuous 2D Gaussian (no discrete normalization)
         phi = self.gaussian_pdf(gaussians.means, gaussians.covs, H, W, normalize_per_k=False)  # (H, W, K)
 
-        # Color intensities ρ_{k,i} (non-negative, no normalization constraint)
+        # Color ratios ρ_{k,i} (non-negative; sum=1 with alpha intensity)
         rho = np.clip(gaussians.rgb, eps, None)  # (K, 3)
 
         # Log responsibilities: log α + log φ + log ρ
@@ -384,7 +390,7 @@ class SingleImageGaussianMixtureEM:
                 normalize_per_k=False,
             )  # (H,W,kc)
             if mask_w is None:
-            S_k[k_start:k_end] = phi.sum(axis=(0, 1))
+                S_k[k_start:k_end] = phi.sum(axis=(0, 1))
             else:
                 S_k[k_start:k_end] = (phi * mask_w[:, :, None]).sum(axis=(0, 1))
         return S_k
@@ -419,17 +425,22 @@ class SingleImageGaussianMixtureEM:
         N_total = N_k.sum() + eps
 
         # Compute S_k for Poisson rate model using chunked computation (mask-weighted if mask exists)
-        S_k = self._sum_Sk_chunked(gaussians, H, W, k_chunk_size=256, mask_w=mask_w) + eps  # (K,) - discrete sum of continuous Gaussian
+        S_k = self._sum_Sk_chunked(
+            gaussians, H, W, k_chunk_size=256, mask_w=mask_w
+        ) + eps  # (K,) - discrete sum of continuous Gaussian
 
-        # Update mixing coefficients (MLE, simple normalization)
-        new_alpha = N_k / N_total
-        new_alpha = np.clip(new_alpha, eps, None)
-        new_alpha /= new_alpha.sum()
+        # Amplitude per-channel: amp = alpha * rgb (scale-invariant quantity)
+        amp = N_ki / S_k[:, None]
+        amp = np.maximum(amp, eps)
+        alpha_mass = amp.sum(axis=1) + eps
+        rgb_norm = amp / alpha_mass[:, None]
+        rgb_norm = np.maximum(rgb_norm, eps)
+        rgb_norm = rgb_norm / (rgb_norm.sum(axis=1, keepdims=True) + eps)
+
+        # Relative mass for dead-component detection (scale-free)
+        rel_mass = N_k / N_total
         alpha_thresh = 1e-4
-        dead = new_alpha < alpha_thresh  # mark for potential reinit
-
-        # Update color intensities: ρ_{k,i} = N_{k,i} / (α_k * S_k)
-        new_colors = N_ki / (new_alpha[:, None] * S_k[:, None])  # (K, 3) - no normalization constraint
+        dead = rel_mass < alpha_thresh  # mark for potential reinit
 
         # Spatial weights (sum over color channels)
         w_xyk = n_hat.sum(axis=3)  # (H, W, K)
@@ -452,7 +463,8 @@ class SingleImageGaussianMixtureEM:
         # Handle Gaussians with very low responsibility using residual-based reinit
         responsibility_threshold = 1e-6
         small_responsibility_indices = np.where((N_k < responsibility_threshold) | dead)[0]
-        reinit_colors = {}
+        reinit_rgb = {}
+        reinit_alpha = {}
         if len(small_responsibility_indices) > 0:
             rasterizer = Vanilla2DRasterizer(H, W)
             # build rotations/scales consistent with current covs for rendering
@@ -465,8 +477,8 @@ class SingleImageGaussianMixtureEM:
             tmp_gauss = TwoDGaussians(
                 new_means.copy(),
                 new_covs.copy(),
-                new_colors.copy(),
-                new_alpha.copy(),
+                rgb_norm.copy(),
+                alpha_mass.copy(),
                 tmp_rot,
                 tmp_scales,
             )
@@ -480,8 +492,7 @@ class SingleImageGaussianMixtureEM:
                 finite_idx = np.arange(flat.size)
             sorted_idx = finite_idx[np.argsort(flat[finite_idx])[::-1]]
             ys, xs = np.unravel_index(sorted_idx, res.shape)
-            boost_alpha = float(new_alpha.mean() * 2.0)
-            reinit_colors = {}
+            boost_alpha = float(alpha_mass.mean() * 2.0)
             for j, idx in enumerate(small_responsibility_indices):
                 if j >= len(sorted_idx):
                     break
@@ -490,29 +501,11 @@ class SingleImageGaussianMixtureEM:
                 sigma0 = (0.05 * min(H, W)) ** 2
                 new_covs[idx] = np.array([[sigma0, 0.0], [0.0, sigma0]], dtype=np.float64)
                 sampled_color = self.image[int(y0), int(x0)]
-                new_colors[idx] = np.maximum(sampled_color, eps)
-                # give a bit more mass so reinit components can compete in next E-step
-                new_alpha[idx] = boost_alpha
-                reinit_colors[idx] = new_colors[idx].copy()
-            # redistribute alpha: keep alive ratios, spread dead_mass evenly
-            orig_alpha = new_alpha.copy()
-            dead_mass = float(orig_alpha[small_responsibility_indices].sum())
-            if dead_mass < eps:
-                dead_mass = eps * len(small_responsibility_indices)
-            alive_mask = np.ones(K, dtype=bool)
-            alive_mask[small_responsibility_indices] = False
-            alive_mass = float(orig_alpha[alive_mask].sum())
-            if alive_mass <= eps:
-                new_alpha[:] = 1.0 / K
-            else:
-                new_alpha[alive_mask] = orig_alpha[alive_mask] * max(
-                    1.0 - dead_mass, eps
-                ) / max(alive_mass, eps)
-                new_alpha[small_responsibility_indices] = dead_mass / len(
-                    small_responsibility_indices
-                )
-                new_alpha = np.maximum(new_alpha, eps)
-                new_alpha /= new_alpha.sum()
+                c = np.maximum(sampled_color, eps)
+                s = float(c.sum()) + eps
+                reinit_rgb[idx] = c / s
+                # Give reinit components enough mass to compete in next E-step.
+                reinit_alpha[idx] = max(boost_alpha, s)
 
         # Update rotations and scales from the new covariance matrices
         new_rotations = np.zeros(K, dtype=np.float64)
@@ -548,17 +541,29 @@ class SingleImageGaussianMixtureEM:
             new_means,
             new_covs,
             gaussians.rgb,  # rgb unused for S_k
-            new_alpha,
+            alpha_mass,
             new_rotations,
             new_scales,
         )
         S_k_new = self._sum_Sk_chunked(dummy_gauss, H, W, k_chunk_size=256, mask_w=mask_w) + eps
-        new_colors = N_ki / (new_alpha[:, None] * S_k_new[:, None])
-        new_colors = np.maximum(new_colors, eps)
-        for idx, col in reinit_colors.items():
-            new_colors[idx] = col
+        amp = N_ki / S_k_new[:, None]
+        amp = np.maximum(amp, eps)
+        alpha_mass = amp.sum(axis=1) + eps
+        rgb_norm = amp / alpha_mass[:, None]
+        rgb_norm = np.maximum(rgb_norm, eps)
+        rgb_norm = rgb_norm / (rgb_norm.sum(axis=1, keepdims=True) + eps)
+        for idx, col in reinit_rgb.items():
+            rgb_norm[idx] = col
+        for idx, val in reinit_alpha.items():
+            alpha_mass[idx] = val
+        rgb_norm = np.maximum(rgb_norm, eps)
+        rgb_norm = rgb_norm / (rgb_norm.sum(axis=1, keepdims=True) + eps)
+        total_pred = float(np.sum(alpha_mass * S_k_new))
+        target = float(N_total)
+        if np.isfinite(total_pred) and total_pred > eps:
+            alpha_mass *= target / total_pred
 
-        return TwoDGaussians(new_means, new_covs, new_colors, new_alpha, new_rotations, new_scales)
+        return TwoDGaussians(new_means, new_covs, rgb_norm, alpha_mass, new_rotations, new_scales)
 
 
     def ensure_positive_definite(
@@ -584,7 +589,7 @@ class SingleImageGaussianMixtureEM:
         
         # Clip eigenvalues to ensure positive definiteness
         if max_eigenvalue is None:
-        eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
+            eigenvalues = np.clip(eigenvalues, min_eigenvalue, None)
         else:
             eigenvalues = np.clip(eigenvalues, min_eigenvalue, max_eigenvalue)
         
@@ -644,5 +649,5 @@ class SingleImageGaussianMixtureEM:
         if mask_w is not None:
             nll = ((rates - I * np.log(rates + eps)) * mask_w[:, :, None]).sum()
         else:
-        nll = (rates - I * np.log(rates + eps)).sum()
+            nll = (rates - I * np.log(rates + eps)).sum()
         return float(nll)
