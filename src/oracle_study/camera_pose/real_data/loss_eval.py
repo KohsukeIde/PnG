@@ -252,24 +252,54 @@ def load_colmap_mapping(colmap_dir: str) -> Dict[str, Dict[str, np.ndarray]]:
     return mapping
 
 
-def load_gt_npz_mapping(npz_path: str) -> Dict[str, Dict[str, np.ndarray]]:
-    """Load GT cameras from DTU cameras.npz using cv2.decomposeProjectionMatrix.
+def load_gt_npz_mapping(
+    npz_path: str,
+    actual_image_size: tuple[int, int] | None = None,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Load GT cameras from DTU cameras.npz using NeuS-style interpretation.
 
-    DTU format: world_mat is a 4x4 matrix where the upper 3x4 is P = K[R|t].
-    We use OpenCV's RQ decomposition to extract K, R, and camera center.
+    DTU/NeuS format:
+    - world_mat: 4x4 matrix, upper 3x4 projects to normalized image coords
+    - scale_mat: 4x4 matrix for 3D coordinate normalization
+    - P = world_mat @ scale_mat projects to pixel coords for 1600x1200 image
+
+    Args:
+        npz_path: Path to cameras.npz file
+        actual_image_size: (width, height) of actual images. If provided, scales K
+                          from DTU's 1600x1200 to actual size.
     """
     data = np.load(npz_path)
     mapping: Dict[str, Dict[str, np.ndarray]] = {}
+
+    # DTU calibration assumes 1600x1200 images
+    W_dtu, H_dtu = 1600, 1200
+
+    # Compute scale factors if actual image size provided
+    if actual_image_size is not None:
+        W_actual, H_actual = actual_image_size
+        sx = W_actual / W_dtu
+        sy = H_actual / H_dtu
+    else:
+        sx, sy = 1.0, 1.0
+
     idx = 0
     while f"world_mat_{idx}" in data:
-        P = data[f"world_mat_{idx}"]  # 4x4, last row [0 0 0 1]
-        P3 = P[:3, :4].astype(np.float64)
+        # NeuS approach: P = world_mat @ scale_mat
+        world_mat = data[f"world_mat_{idx}"]
+        scale_mat = data[f"scale_mat_{idx}"]
+        P = (world_mat @ scale_mat)[:3, :4].astype(np.float64)
 
         # OpenCV's decomposeProjectionMatrix: P = K[R|t] -> returns K, R, camera_center
-        K, R, t_homog, _, _, _, _ = cv2.decomposeProjectionMatrix(P3)
+        K, R, t_homog, _, _, _, _ = cv2.decomposeProjectionMatrix(P)
 
         # Normalize K so K[2,2] = 1
         K = K / K[2, 2]
+
+        # Scale K for actual image size
+        K[0, 0] *= sx  # fx
+        K[1, 1] *= sy  # fy
+        K[0, 2] *= sx  # cx
+        K[1, 2] *= sy  # cy
 
         # t_homog is the camera center in homogeneous world coordinates (4,)
         camera_center = t_homog[:3, 0] / t_homog[3, 0]
@@ -606,8 +636,16 @@ def main() -> None:
     angles = [float(a) for a in args.angles_deg.split(",") if a.strip()]
     Path(gauss_dir).mkdir(parents=True, exist_ok=True)
 
+    # Get actual image size for DTU camera calibration scaling
+    actual_image_size = None
+    if args.images_dir is not None:
+        img1_path = Path(args.images_dir) / args.image1
+        if img1_path.exists():
+            with Image.open(img1_path) as im:
+                actual_image_size = im.size  # (width, height)
+
     if args.use_gt_cameras:
-        mapping = load_gt_npz_mapping(args.gt_npz)
+        mapping = load_gt_npz_mapping(args.gt_npz, actual_image_size=actual_image_size)
     else:
         mapping = load_colmap_mapping(colmap_dir)
     if args.image1 not in mapping or args.image2 not in mapping:
