@@ -41,6 +41,7 @@ class OptimalTransportSolver:
         cheirality_topk: Optional[int] = 3,
         epipolar_mode: str = "sed",  # one of {"sed", "sampson", "hybrid"}
         hybrid_alpha: float = 0.5,    # when epipolar_mode == "hybrid": alpha in [0,1]
+        epi_clip: Optional[float] = None,  # if set, add large cost when Sampson residual exceeds this px threshold
         device: Optional[torch.device] = None,
     ):
         """Initialize the OptimalTransportSolver.
@@ -102,6 +103,7 @@ class OptimalTransportSolver:
         self.hybrid_alpha = float(hybrid_alpha)
         if not (0.0 <= self.hybrid_alpha <= 1.0):
             raise ValueError("hybrid_alpha must be in [0, 1].")
+        self.epi_clip = epi_clip
 
         # Convert Gaussian parameters to torch tensors
         self._prepare_gaussians()
@@ -161,46 +163,95 @@ class OptimalTransportSolver:
         epsilon: Optional[float] = None,
         rho: Optional[float] = None,
         max_iter: int = 200,
-        tol: float = 1e-6
-    ) -> torch.Tensor:
-        """Simplified Unbalanced Optimal Transport with log-domain stability.
-        
-        Uses fixed epsilon scaling (2 steps) and log-domain computation only.
-        Eliminates complex parameter tuning while maintaining numerical stability.
+        tol: float = 1e-6,
+        record_mass: bool = False,
+        dustbin_cost: Optional[float] = None,
+        dustbin_mass: float = 1.0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Unbalanced OT (log-domain) with optional mass diagnostics and dustbin.
 
         Args:
-            cost_matrix: Cost matrix of shape (K1, K2)
-            epsilon: Entropy regularization (None for auto: 0.08 * median)
-            rho: KL regularization (None for auto: 10.0 * epsilon)
-            max_iter: Max iterations (fixed)
-            tol: Convergence tolerance
-
-        Returns:
-            Transport matrix of shape (K1, K2)
+            cost_matrix: Cost matrix (K1,K2)
+            epsilon: Entropy weight (None → 0.08 * median)
+            rho: KL weight (None → 10 * epsilon)  ※渡した rho をそのまま使う
+            record_mass: If True, also return (row_sum, col_sum)
+            dustbin_cost: If set, append a no-match row/col with this constant cost.
+            dustbin_mass: Relative mass assigned to each dustbin marginal.
         """
-        
-        # 1. Simple parameter auto-setting
         with torch.no_grad():
+            if dustbin_cost is not None:
+                total_mass = max(float(self.alpha1.sum().item()), float(self.alpha2.sum().item()))
+                db_mass = float(dustbin_mass) * total_mass
+                a = torch.cat(
+                    [
+                        self.alpha1.clone(),
+                        torch.tensor([db_mass], device=self.device, dtype=self.alpha1.dtype),
+                    ]
+                )
+                b = torch.cat(
+                    [
+                        self.alpha2.clone(),
+                        torch.tensor([db_mass], device=self.device, dtype=self.alpha2.dtype),
+                    ]
+                )
+                pad_row = torch.full(
+                    (cost_matrix.shape[0], 1),
+                    dustbin_cost,
+                    device=self.device,
+                    dtype=cost_matrix.dtype,
+                )
+                pad_col = torch.full(
+                    (1, cost_matrix.shape[1] + 1),
+                    dustbin_cost,
+                    device=self.device,
+                    dtype=cost_matrix.dtype,
+                )
+                cost_matrix = torch.cat([torch.cat([cost_matrix, pad_row], dim=1), pad_col], dim=0)
+            else:
+                a = self.alpha1.clone()
+                b = self.alpha2.clone()
+
             c_median = torch.median(cost_matrix).item()
             if epsilon is None:
-                epsilon = max(0.08 * c_median, 1e-3)  # Fixed: 8% of median with minimum
+                epsilon = max(0.08 * c_median, 1e-3)
             if rho is None:
-                rho = 10.0 * epsilon  # Fixed ratio
-        
-        # 2. Fixed epsilon scaling (2 steps only)
-        epsilons = [epsilon, 0.5 * epsilon]  # Simple 2-step scaling
-        
-        # 3. Simple iteration with warmstart
+                rho = 10.0 * epsilon
+            base_eps = epsilon
+            base_rho = rho
+
+        epsilons = [epsilon, 0.5 * epsilon]
         transport = None
         log_u, log_v = None, None
-        
+
         for eps_current in epsilons:
-            rho_current = 10.0 * eps_current  # Always proportional
+            rho_current = base_rho * (eps_current / base_eps)
             transport, log_u, log_v = self._sinkhorn_log_simple(
-                cost_matrix, eps_current, rho_current, max_iter, tol, log_u, log_v
+                cost_matrix, eps_current, rho_current, max_iter, tol, log_u, log_v, a, b
             )
-        
-        return transport
+
+        if record_mass:
+            row_sum = transport.sum(dim=1)
+            col_sum = transport.sum(dim=0)
+            return transport, (row_sum, col_sum)
+        return transport, None
+
+    def _apply_gate_mask(self, cost: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply a boolean gate (allowed=True) to cost.
+        Ensures each row/col has at least one allowed entry by reopening the min-cost spot if needed.
+        """
+        gate = gate.clone()
+        # row fallback
+        row_all_false = gate.sum(dim=1) == 0
+        if row_all_false.any():
+            idx = torch.argmin(cost[row_all_false], dim=1)
+            gate[row_all_false, idx] = True
+        # col fallback
+        col_all_false = gate.sum(dim=0) == 0
+        if col_all_false.any():
+            idx = torch.argmin(cost[:, col_all_false], dim=0)
+            gate[idx, col_all_false] = True
+        gated_cost = torch.where(gate, cost, cost.max().detach() + 1e6)
+        return gated_cost
 
     def _sinkhorn_log_simple(
         self,
@@ -210,14 +261,22 @@ class OptimalTransportSolver:
         max_iter: int,
         tol: float,
         log_u_init: Optional[torch.Tensor] = None,
-        log_v_init: Optional[torch.Tensor] = None
+        log_v_init: Optional[torch.Tensor] = None,
+        alpha_override: Optional[torch.Tensor] = None,
+        beta_override: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Simplified log-domain Sinkhorn with minimal overhead."""
         
         # Masses with small epsilon for numerical stability
         eps_mass = 1e-8  # Increased from 1e-16 for float32 stability
-        alpha = self.alpha1 + eps_mass
-        beta = self.alpha2 + eps_mass
+        if alpha_override is None:
+            alpha = self.alpha1 + eps_mass
+        else:
+            alpha = alpha_override + eps_mass
+        if beta_override is None:
+            beta = self.alpha2 + eps_mass
+        else:
+            beta = beta_override + eps_mass
         
         # Log kernel
         log_K = -cost_matrix / epsilon
@@ -438,6 +497,7 @@ class OptimalTransportSolver:
         k1, k2 = self.means1.size(0), self.means2.size(0)
 
         # -------- ① 同次座標 --------
+        # means は (x,y) 保存を前提
         ones1 = torch.ones(k1, 1, device=self.device)
         ones2 = torch.ones(k2, 1, device=self.device)
         p1_h = torch.cat([self.means1, ones1], 1)   # (K1,3)
@@ -481,6 +541,10 @@ class OptimalTransportSolver:
         u2 = torch.einsum('...i,...ij,...j->...', n2_exp, cov2_exp, n2_exp)
 
         epi_with_shape = dist_sq_sum + u1 + u2                          # (K1,K2)
+        if self.epi_clip is not None:
+            tau_sq = float(self.epi_clip) ** 2
+            gate = dist_sq_sum <= tau_sq  # ゲートは純粋な幾何残差に対して適用
+            epi_with_shape = self._apply_gate_mask(epi_with_shape, gate)
 
         # -------- ⑤ 形状の類似度（Bures/Wasserstein距離） --------
         cov_dist = self._bures_wasserstein_cov_dist(cov1, cov2)    # (K1,K2)
@@ -522,7 +586,7 @@ class OptimalTransportSolver:
         k1, k2 = self.means1.size(0), self.means2.size(0)
         
         # === 1. サンプソン距離の基本形 ===
-        # 同次座標変換
+        # 同次座標変換（means は (x,y) 保存を前提）
         ones1 = torch.ones(k1, 1, device=self.device)
         ones2 = torch.ones(k2, 1, device=self.device)
         p1 = torch.cat([self.means1, ones1], 1)  # (K1,3)
@@ -542,6 +606,10 @@ class OptimalTransportSolver:
         
         # サンプソン距離計算
         sampson = num / (denom + eps)  # (K1,K2)
+        if self.epi_clip is not None:
+            tau_sq = float(self.epi_clip) ** 2
+            gate = sampson <= tau_sq
+            sampson = self._apply_gate_mask(sampson, gate)
         
         # === 2. ガウス分布の形状を考慮 ===
         # 2.1 共分散行列の作成
