@@ -54,12 +54,34 @@ def process_images_batch(
     # Parse k_list
     k_values = [int(k.strip()) for k in k_list.split(",") if k.strip()]
     
-    # Get base name from input directory (e.g., "images_resized" -> "images_resized" or parent name)
+    # Get base name from input directory
+    # For NeRF synthetic: data/nerf_synthetic/chair/train -> "chair_train"
+    # For DTU: data/DTU/scan63/images_resized -> "scan63_images_resized"
     input_dir_path = Path(input_dir)
-    base_name = input_dir_path.name
-    # If the directory name is generic like "images_resized", try to use parent name
-    if base_name in ["images_resized", "images"]:
-        base_name = input_dir_path.parent.name if input_dir_path.parent.name else base_name
+    parts = input_dir_path.parts
+    
+    # Try to extract scene name and split name
+    # Check if this looks like NeRF synthetic structure (has "nerf_synthetic" in path)
+    if "nerf_synthetic" in parts:
+        # Find index of "nerf_synthetic"
+        nerf_idx = parts.index("nerf_synthetic")
+        if len(parts) > nerf_idx + 2:
+            # Has scene name and split name: .../nerf_synthetic/scene/split
+            scene_name = parts[nerf_idx + 1]
+            split_name = parts[nerf_idx + 2]
+            base_name = f"{scene_name}_{split_name}"
+        elif len(parts) > nerf_idx + 1:
+            # Only scene name: .../nerf_synthetic/scene
+            base_name = parts[nerf_idx + 1]
+        else:
+            base_name = input_dir_path.name
+    else:
+        # For other structures, use parent name if directory name is generic
+        base_name = input_dir_path.name
+        if base_name in ["images_resized", "images", "train", "val", "test"]:
+            parent_name = input_dir_path.parent.name
+            if parent_name:
+                base_name = f"{parent_name}_{base_name}"
     
     # Find all image files
     image_extensions = ["*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG"]
