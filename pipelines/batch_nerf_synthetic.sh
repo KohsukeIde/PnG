@@ -9,7 +9,8 @@ MAX_ITERATIONS=500
 TOL=1e-4
 MIN_ITERATIONS=5
 INIT_MODE="grid"
-OUTPUT_BASE_DIR="data/fitted_gs"
+# Base output under fitted_gs/nerf_synthetic to keep NeRF runs grouped
+OUTPUT_BASE_DIR="data/fitted_gs/nerf_synthetic"
 
 for scene in "${SCENES[@]}"; do
     input_dir="data/nerf_synthetic/${scene}/${SPLIT}"
