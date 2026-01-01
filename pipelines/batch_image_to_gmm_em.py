@@ -31,10 +31,12 @@ def process_images_batch(
     min_iterations: int = 5,
     init_mode: str = "grid",
     mse_tol: float = None,
+    reinit_dead: bool = True,
+    enforce_spd: bool = True,
 ):
     """
     Process all images in input_dir and save results to output_base_dir.
-    
+
     Args:
         input_dir: Directory containing input images
         output_base_dir: Base directory for output (e.g., data/fitted_gs)
@@ -44,6 +46,8 @@ def process_images_batch(
         min_iterations: Minimum iterations before early stopping
         init_mode: Initialization mode (grid|random)
         mse_tol: Optional MSE tolerance for early stopping
+        reinit_dead: If True, reinitialize dead components (may cause non-monotonic NLL)
+        enforce_spd: If True, enforce positive definite covariance
     """
     # Convert to absolute paths
     if not os.path.isabs(input_dir):
@@ -130,6 +134,8 @@ def process_images_batch(
                     mask_path=None,
                     output_dir=output_dir,
                     save_intermediate=False,  # Skip intermediate visualizations
+                    reinit_dead=reinit_dead,
+                    enforce_spd=enforce_spd,
                 )
                 
                 # Clean up: keep only essential files
@@ -234,9 +240,19 @@ if __name__ == "__main__":
         default=None,
         help="Optional relative MSE improvement threshold for early stopping",
     )
-    
+    parser.add_argument(
+        "--no_reinit_dead",
+        action="store_true",
+        help="Disable dead component reinitialization (for strict EM, monotonic NLL)",
+    )
+    parser.add_argument(
+        "--no_enforce_spd",
+        action="store_true",
+        help="Disable SPD enforcement on covariance (for strict EM)",
+    )
+
     args = parser.parse_args()
-    
+
     process_images_batch(
         input_dir=args.input_dir,
         output_base_dir=args.output_base_dir,
@@ -246,6 +262,8 @@ if __name__ == "__main__":
         min_iterations=args.min_iterations,
         init_mode=args.init_mode,
         mse_tol=args.mse_tol,
+        reinit_dead=not args.no_reinit_dead,
+        enforce_spd=not args.no_enforce_spd,
     )
 
 

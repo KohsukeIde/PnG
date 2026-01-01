@@ -1,6 +1,7 @@
 import os
 import sys
-import shutil 
+import copy
+import shutil
 import numpy as np
 from typing import Optional
 from PIL import Image
@@ -99,6 +100,8 @@ def run_gaussian_mixture_on_image(
     mask_path: Optional[str] = None,
     output_dir: Optional[str] = None,
     save_intermediate: bool = True,
+    reinit_dead: bool = True,
+    enforce_spd: bool = True,
 ):
     # Convert relative path to absolute path
     if not os.path.isabs(image_path):
@@ -145,18 +148,18 @@ def run_gaussian_mixture_on_image(
     nll_log = []
     metrics_log = []
     rates_prev = None
+    height, width = gmm.image.shape[:2]
 
     for i in range(max_iterations):
-        responsibilities = gmm.e_step(gaussians)
-        gaussians = gmm.m_step(responsibilities, gaussians)
-        nll = gmm.poisson_nll(gaussians)
+        # Use streaming EM for speed (4x faster than separate e_step + m_step)
+        gaussians, nll = gmm.em_step_streaming(
+            gaussians, reinit_dead=reinit_dead, enforce_spd=enforce_spd
+        )
         nll_log.append(nll)
         print(f"\nIteration {i+1} completed")
         print(f"Poisson NLL: {nll:.6f}")
-        # rates stats for debugging scale
-        height, width = gmm.image.shape[:2]
-        rasterizer = Vanilla2DRasterizer(height, width)
-        rates = rasterizer.render_rates(gaussians)
+        # rates stats for debugging scale - use torch version for speed
+        rates = gmm.render_rates_torch(gaussians)
         rates_min, rates_max, rates_mean = rates.min(), rates.max(), rates.mean()
         mse = np.mean((gmm.image - np.clip(rates, 0.0, 1.0)) ** 2)
         print(f"Rates stats min={rates_min:.3e}, max={rates_max:.3e}, mean={rates_mean:.3e}, MSE={mse:.6f}")
@@ -194,7 +197,6 @@ def run_gaussian_mixture_on_image(
         print(f"Iteration {i+1} - Gaussians alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
         
         if save_intermediate and (i + 1) % 1 == 0:  # Save every n iterations
-            height, width = gmm.image.shape[:2]
             rasterizer = Vanilla2DRasterizer(height, width)
             reconstructed_image = rasterizer.rasterize(gaussians)
             reconstructed_image = reconstructed_image.astype(np.uint8)
@@ -233,9 +235,19 @@ def run_gaussian_mixture_on_image(
     print(f"Alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
     print("---------------------------------------------------------------")
 
-    height, width = gmm.image.shape[:2]
+    # Safety: ensure positive definite covariances for visualization
+    # (strict EM mode without enforce_spd may produce degenerate covariances)
+    # Rasterizer eps = 1e-12, so use larger margin (1e-4) to be safe
+    gaussians_viz = copy.deepcopy(gaussians)
+    eps_det = 1e-4
+    for k in range(len(gaussians_viz.covs)):
+        det = np.linalg.det(gaussians_viz.covs[k])
+        if det < eps_det:
+            # Add regularization for visualization only (does not affect saved gaussians.pkl)
+            gaussians_viz.covs[k] = gaussians_viz.covs[k] + eps_det * np.eye(2)
+
     rasterizer = Vanilla2DRasterizer(height, width)
-    reconstructed_image = rasterizer.rasterize(gaussians)
+    reconstructed_image = rasterizer.rasterize(gaussians_viz)
     reconstructed_image = reconstructed_image.astype(np.uint8)
 
     mse = np.mean((gmm.image - reconstructed_image/255.0)**2)
@@ -346,11 +358,19 @@ def run_gaussian_mixture_on_image(
         import pickle
 
         gaussians_xy = to_xy_order(gaussians)
+
+        # Compute ot_mass = alpha * S_k for OT marginal (visible mass in image region)
+        # S_k = sum of phi_k(x) over image, represents how much of Gaussian is visible
+        S_k = gmm._sum_Sk_chunked(gaussians, height, width)
+        ot_mass = gaussians.alpha * S_k  # visible mass (≈ N_k from EM)
+
         legacy_payload = {
             "original_gaussians": gaussians,
             "projected_gaussians": gaussians_xy,
             "viewmat": np.eye(4, dtype=np.float64),  # placeholder (not used downstream here)
             "K": np.eye(3, dtype=np.float64),  # placeholder intrinsics
+            "ot_mass": ot_mass.astype(np.float64),  # OT marginal: alpha * S_k
+            "S_k": S_k.astype(np.float64),  # for diagnostics
         }
         with open(os.path.join(output_dir, "gaussians.pkl"), "wb") as f:
             pickle.dump(legacy_payload, f)
@@ -415,6 +435,16 @@ if __name__ == "__main__":
         default=None,
         help="Optional path to a mask image (same H,W). Pixels outside mask are treated as missing.",
     )
+    parser.add_argument(
+        "--no_reinit_dead",
+        action="store_true",
+        help="Disable dead component reinitialization (for strict EM, monotonic NLL)",
+    )
+    parser.add_argument(
+        "--no_enforce_spd",
+        action="store_true",
+        help="Disable SPD enforcement on covariance (for strict EM)",
+    )
     args = parser.parse_args()
 
     if args.k_list:
@@ -432,4 +462,6 @@ if __name__ == "__main__":
             min_iterations=args.min_iterations,
             init_mode=args.init_mode,
             mask_path=args.mask_path,
+            reinit_dead=not args.no_reinit_dead,
+            enforce_spd=not args.no_enforce_spd,
         )
