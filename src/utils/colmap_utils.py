@@ -191,6 +191,110 @@ def read_images_binary(path_to_model_file: str) -> dict:
     return images
 
 
+def read_images_with_points2d(path_to_model_file: str) -> dict:
+    """Read image parameters from COLMAP binary file including 2D points.
+
+    Args:
+        path_to_model_file: Path to images.bin file
+
+    Returns:
+        dict: Dictionary mapping image_id to image parameters with 2D points
+    """
+    images = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_reg_images = struct.unpack("<Q", fid.read(8))[0]
+        for _ in range(num_reg_images):
+            binary_image_properties = struct.unpack("<Idddddddi", fid.read(64))
+            image_id = binary_image_properties[0]
+            qw = binary_image_properties[1]
+            qx = binary_image_properties[2]
+            qy = binary_image_properties[3]
+            qz = binary_image_properties[4]
+            tx = binary_image_properties[5]
+            ty = binary_image_properties[6]
+            tz = binary_image_properties[7]
+            camera_id = binary_image_properties[8]
+
+            image_name = ""
+            while True:
+                current_char = fid.read(1).decode("utf-8")
+                if current_char == "\x00":
+                    break
+                image_name += current_char
+
+            # Read 2D points
+            num_points_2d = struct.unpack("<Q", fid.read(8))[0]
+            points2d = []
+            for _ in range(num_points_2d):
+                x, y = struct.unpack("<dd", fid.read(16))
+                point3d_id = struct.unpack("<q", fid.read(8))[0]  # signed
+                points2d.append({
+                    "x": x,
+                    "y": y,
+                    "point3d_id": point3d_id  # -1 if not triangulated
+                })
+
+            images[image_id] = {
+                "qw": qw,
+                "qx": qx,
+                "qy": qy,
+                "qz": qz,
+                "tx": tx,
+                "ty": ty,
+                "tz": tz,
+                "camera_id": camera_id,
+                "name": image_name,
+                "points2d": points2d,
+            }
+    return images
+
+
+def get_corresponding_points(images: dict, image_name1: str, image_name2: str) -> tuple:
+    """Get 2D points that are observed in both images (same 3D point).
+
+    Args:
+        images: Dictionary from read_images_with_points2d
+        image_name1: Name of first image
+        image_name2: Name of second image
+
+    Returns:
+        tuple: (pts1, pts2) where each is (N, 2) array of 2D coordinates
+    """
+    # Find image data by name
+    img1_data = None
+    img2_data = None
+    for img_data in images.values():
+        if img_data["name"] == image_name1:
+            img1_data = img_data
+        if img_data["name"] == image_name2:
+            img2_data = img_data
+
+    if img1_data is None or img2_data is None:
+        raise ValueError(f"Images not found: {image_name1}, {image_name2}")
+
+    # Build point3d_id -> (x, y) mapping for each image
+    pts1_by_id = {}
+    for pt in img1_data["points2d"]:
+        if pt["point3d_id"] != -1:
+            pts1_by_id[pt["point3d_id"]] = (pt["x"], pt["y"])
+
+    pts2_by_id = {}
+    for pt in img2_data["points2d"]:
+        if pt["point3d_id"] != -1:
+            pts2_by_id[pt["point3d_id"]] = (pt["x"], pt["y"])
+
+    # Find common point3d_ids
+    common_ids = set(pts1_by_id.keys()) & set(pts2_by_id.keys())
+
+    pts1 = []
+    pts2 = []
+    for pid in sorted(common_ids):
+        pts1.append(pts1_by_id[pid])
+        pts2.append(pts2_by_id[pid])
+
+    return np.array(pts1), np.array(pts2)
+
+
 def quaternion_to_rotation_matrix(
     qw: float, qx: float, qy: float, qz: float
 ) -> np.ndarray:
