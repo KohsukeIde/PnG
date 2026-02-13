@@ -8,12 +8,12 @@ class TwoDGaussians:
     """Represents a collection of 2D Gaussians with associated properties.
 
     Attributes:
-        means (np.ndarray): Array of shape [k, 2] representing the means of k Gaussians.
+        means (np.ndarray): Array of shape [k, 2] for Gaussian means in (x, y).
         covs (np.ndarray): Array of shape [k, 2, 2] representing the covariance matrices of k Gaussians.
         rgb (np.ndarray): Array of shape [k, 3] representing the RGB colors of k Gaussians.
         alpha (np.ndarray): Array of shape [k] representing the alpha values of k Gaussians.
         rotations (np.ndarray): Array of shape [k] representing the rotation angles (in radians) of k Gaussians.
-        scales (np.ndarray): Array of shape [k, 2] representing the scale factors (x and y) of k Gaussians.
+        scales (np.ndarray): Array of shape [k, 2] for scale factors (sx, sy).
     """
 
     means: np.ndarray  # [k, 2]

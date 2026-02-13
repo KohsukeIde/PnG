@@ -1,7 +1,9 @@
 import os
 import sys
-import shutil 
+import copy
+import shutil
 import numpy as np
+from typing import Optional
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
@@ -87,15 +89,35 @@ def visualize_log_likelihood(log_likelihood, iteration, output_dir):
     plt.close()
     print(f"Saved: {output_path}")
 
-def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
+def run_gaussian_mixture_on_image(
+    image_path: str,
+    n_gaussians: int = 300,
+    max_iterations: int = 50,
+    tol: float = 1e-4,
+    min_iterations: int = 5,
+    init_mode: str = "grid",
+    mse_tol: float = None,
+    mask_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    save_intermediate: bool = True,
+    reinit_dead: bool = True,
+    enforce_spd: bool = True,
+):
     # Convert relative path to absolute path
     if not os.path.isabs(image_path):
         image_path = os.path.join(project_root, image_path)
     
-    gmm = SingleImageGaussianMixtureEM(image_path)
+    gmm = SingleImageGaussianMixtureEM(image_path, mask_path=mask_path)
     
-    base_output_dir = "gaussian_mixture_results"
-    output_dir = os.path.join(base_output_dir, f"gaussians_{n_gaussians}_iterations_{n_iterations}")
+    if output_dir is None:
+        base_output_dir = "gaussian_mixture_results"
+        output_dir = os.path.join(
+            base_output_dir, f"gaussians_{n_gaussians}_auto_{max_iterations}"
+        )
+    
+    # Convert output_dir to absolute path if relative
+    if not os.path.isabs(output_dir):
+        output_dir = os.path.join(project_root, output_dir)
     
     # Check if the output directory exists, and if so, delete it
     if os.path.exists(output_dir):
@@ -109,7 +131,7 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
     print("Image shape:", gmm.image.shape)
     print("Image min-max:", gmm.image.min(), gmm.image.max())
     
-    gaussians = gmm.initialize_gaussians(n_gaussians)
+    gaussians = gmm.initialize_gaussians(n_gaussians, mode=init_mode)
     
     print("Initial gaussians statistics---------------------------------")
     print(f"Means min-max: {gaussians.means.min()}, {gaussians.means.max()}")
@@ -118,21 +140,63 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
     print(f"Alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
     print("------------------------------------------------------------")
 
-    visualize_gaussians(gmm.image, gaussians, 0, output_dir)
-    visualize_gaussian_parameters(gaussians, 0, output_dir, gmm.image.shape[0], gmm.image.shape[1])
+    if save_intermediate:
+        visualize_gaussians(gmm.image, gaussians, 0, output_dir)
+        visualize_gaussian_parameters(gaussians, 0, output_dir, gmm.image.shape[0], gmm.image.shape[1])
     
-    for i in range(n_iterations):
-        responsibilities = gmm.e_step(gaussians)
-        gaussians = gmm.m_step(responsibilities, gaussians)
+    prev_nll = np.inf
+    nll_log = []
+    metrics_log = []
+    rates_prev = None
+    height, width = gmm.image.shape[:2]
+
+    for i in range(max_iterations):
+        # Use streaming EM for speed (4x faster than separate e_step + m_step)
+        gaussians, nll = gmm.em_step_streaming(
+            gaussians, reinit_dead=reinit_dead, enforce_spd=enforce_spd
+        )
+        nll_log.append(nll)
         print(f"\nIteration {i+1} completed")
-        visualize_gaussians(gmm.image, gaussians, i+1, output_dir)
-        # visualize_responsibilities(responsibilities, i+1, output_dir)
-        visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
+        print(f"Poisson NLL: {nll:.6f}")
+        # rates stats for debugging scale - use torch version for speed
+        rates = gmm.render_rates_torch(gaussians)
+        rates_min, rates_max, rates_mean = rates.min(), rates.max(), rates.mean()
+        mse = np.mean((gmm.image - np.clip(rates, 0.0, 1.0)) ** 2)
+        print(f"Rates stats min={rates_min:.3e}, max={rates_max:.3e}, mean={rates_mean:.3e}, MSE={mse:.6f}")
+        alpha = gaussians.alpha
+        alive = (alpha > 1e-4).sum()
+        scales = gaussians.scales
+        scale_stats = {
+            "sx_median": float(np.median(scales[:, 0])),
+            "sy_median": float(np.median(scales[:, 1])),
+            "sx_p95": float(np.percentile(scales[:, 0], 95)),
+            "sy_p95": float(np.percentile(scales[:, 1], 95)),
+            "sx_max": float(scales[:, 0].max()),
+            "sy_max": float(scales[:, 1].max()),
+        }
+        metrics_log.append(
+            {
+                "iter": i + 1,
+                "nll": float(nll),
+                "mse": float(mse),
+                "rates_min": float(rates_min),
+                "rates_max": float(rates_max),
+                "rates_mean": float(rates_mean),
+                "alpha_min": float(alpha.min()),
+                "alpha_max": float(alpha.max()),
+                "alpha_alive_gt1e4": int(alive),
+                **scale_stats,
+            }
+        )
+
+        if save_intermediate:
+            visualize_gaussians(gmm.image, gaussians, i+1, output_dir)
+            # visualize_responsibilities(responsibilities, i+1, output_dir)
+            visualize_gaussian_parameters(gaussians, i+1, output_dir, gmm.image.shape[0], gmm.image.shape[1])
         print(f"Iteration {i+1} - Gaussians RGB min-max: {gaussians.rgb.min()}, {gaussians.rgb.max()}")
         print(f"Iteration {i+1} - Gaussians alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
         
-        if (i + 1) % 1 == 0:  # Save every n iterations
-            height, width = gmm.image.shape[:2]
+        if save_intermediate and (i + 1) % 1 == 0:  # Save every n iterations
             rasterizer = Vanilla2DRasterizer(height, width)
             reconstructed_image = rasterizer.rasterize(gaussians)
             reconstructed_image = reconstructed_image.astype(np.uint8)
@@ -149,7 +213,20 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
             plt.savefig(reconstructed_path)
             plt.close()
             print(f"Reconstructed image saved to {reconstructed_path}")
-        
+
+        # Early stopping based on relative NLL (and optional MSE) improvement
+        rel_improve = abs(prev_nll - nll) / max(abs(prev_nll), 1.0)
+        prev_nll = nll
+        mse_improve_ok = True
+        if mse_tol is not None and i > 0:
+            prev_mse = np.mean((gmm.image - np.clip(rates_prev, 0.0, 1.0)) ** 2)
+            rel_mse_improve = abs(prev_mse - mse) / max(abs(prev_mse), 1.0)
+            mse_improve_ok = rel_mse_improve < mse_tol
+        rates_prev = rates  # cache for next iter
+        if (i + 1) >= min_iterations and rel_improve < tol and mse_improve_ok:
+            print(f"Early stop at iter {i+1}: rel_improve={rel_improve:.3e} < tol={tol}"
+                  f"{'' if mse_tol is None else f', mse_improve<{mse_tol}'}")
+            break
 
     print("\nFinal Gaussian statistics-------------------------------------")
     print(f"Means min-max: {gaussians.means.min()}, {gaussians.means.max()}")
@@ -158,9 +235,19 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
     print(f"Alpha min-max: {gaussians.alpha.min()}, {gaussians.alpha.max()}")
     print("---------------------------------------------------------------")
 
-    height, width = gmm.image.shape[:2]
+    # Safety: ensure positive definite covariances for visualization
+    # (strict EM mode without enforce_spd may produce degenerate covariances)
+    # Rasterizer eps = 1e-12, so use larger margin (1e-4) to be safe
+    gaussians_viz = copy.deepcopy(gaussians)
+    eps_det = 1e-4
+    for k in range(len(gaussians_viz.covs)):
+        det = np.linalg.det(gaussians_viz.covs[k])
+        if det < eps_det:
+            # Add regularization for visualization only (does not affect saved gaussians.pkl)
+            gaussians_viz.covs[k] = gaussians_viz.covs[k] + eps_det * np.eye(2)
+
     rasterizer = Vanilla2DRasterizer(height, width)
-    reconstructed_image = rasterizer.rasterize(gaussians)
+    reconstructed_image = rasterizer.rasterize(gaussians_viz)
     reconstructed_image = reconstructed_image.astype(np.uint8)
 
     mse = np.mean((gmm.image - reconstructed_image/255.0)**2)
@@ -176,24 +263,205 @@ def run_gaussian_mixture_on_image(image_path, n_gaussians=300, n_iterations=15):
     ax2.set_title(f"Reconstructed Image ({n_gaussians} Gaussians)")
     ax2.axis('off')
 
-    plt.tight_layout()
-    comparison_path = os.path.join(output_dir, "comparison.png")
-    plt.savefig(comparison_path)
-    plt.close()
-
+    # Save final reconstructed image
     reconstructed_path = os.path.join(output_dir, "reconstructed_image.png")
     Image.fromarray(reconstructed_image).save(reconstructed_path)
     print(f"Reconstructed image saved to {reconstructed_path}")
+    
+    if save_intermediate:
+        plt.tight_layout()
+        comparison_path = os.path.join(output_dir, "comparison.png")
+        plt.savefig(comparison_path)
+        plt.close()
 
-    return gaussians
+    # Save NLL log and metrics
+    np.savetxt(os.path.join(output_dir, "poisson_nll.txt"), np.array(nll_log))
+    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+        import json
+
+        json.dump(metrics_log, f, indent=2)
+
+    # Plot basic curves (NLL, MSE, rates_max, alpha_alive)
+    try:
+        iters = [m["iter"] for m in metrics_log]
+        mse_vals = [m["mse"] for m in metrics_log]
+        rates_max_vals = [m["rates_max"] for m in metrics_log]
+        alpha_alive_vals = [m["alpha_alive_gt1e4"] for m in metrics_log]
+        
+        plt.figure()
+        plt.plot(iters, nll_log, label="NLL")
+        plt.xlabel("iter")
+        plt.ylabel("NLL")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "curve_nll.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(iters, mse_vals, label="MSE", color="orange")
+        plt.xlabel("iter")
+        plt.ylabel("MSE")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "curve_mse.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(iters, rates_max_vals, label="rates_max", color="green")
+        plt.xlabel("iter")
+        plt.ylabel("rates_max")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "curve_rates_max.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(iters, alpha_alive_vals, label="alpha_alive_gt1e4", color="purple")
+        plt.xlabel("iter")
+        plt.ylabel("Number of active Gaussians (alpha > 1e-4)")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "curve_alpha_alive.png"))
+        plt.close()
+    except Exception as e:
+        print(f"Plotting skipped due to error: {e}")
+
+    # Helper: convert TwoDGaussians from (y,x) to (x,y) ordering for means/covs/scales/rot
+    def to_xy_order(gauss):
+        P = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
+        new_means = gauss.means[:, ::-1].copy()  # (y,x) -> (x,y)
+        if hasattr(gauss, "covs") and gauss.covs is not None:
+            covs = gauss.covs
+        else:
+            # rebuild covs from scales/rotations if missing
+            covs = []
+            for s, r in zip(gauss.scales, gauss.rotations):
+                c, s_r = np.cos(r), np.sin(r)
+                R = np.array([[c, -s_r], [s_r, c]], dtype=np.float64)
+                Sigma = np.diag(np.square(s))
+                covs.append(R @ Sigma @ R.T)
+            covs = np.stack(covs, axis=0)
+        covs_xy = np.einsum("ij,kjl,ml->kim", P, covs, P)  # P @ cov @ P^T
+        rotations = np.zeros(gauss.k, dtype=np.float64)
+        scales = np.zeros((gauss.k, 2), dtype=np.float64)
+        for i in range(gauss.k):
+            ev, evec = np.linalg.eigh(covs_xy[i])
+            rotations[i] = np.arctan2(evec[1, 0], evec[0, 0])
+            scales[i] = np.sqrt(np.clip(ev, 1e-12, None))
+        return type(gauss)(
+            new_means.astype(np.float64),
+            covs_xy.astype(np.float64),
+            gauss.rgb.astype(np.float64),
+            gauss.alpha.astype(np.float64),
+            rotations.astype(np.float64),
+            scales.astype(np.float64),
+        )
+
+    # Save gaussians as pickle for downstream use (legacy dict format), now in (x,y)
+    try:
+        import pickle
+
+        gaussians_xy = to_xy_order(gaussians)
+
+        # Compute ot_mass = alpha * S_k for OT marginal (visible mass in image region)
+        # S_k = sum of phi_k(x) over image, represents how much of Gaussian is visible
+        S_k = gmm._sum_Sk_chunked(gaussians, height, width)
+        ot_mass = gaussians.alpha * S_k  # visible mass (≈ N_k from EM)
+
+        legacy_payload = {
+            "original_gaussians": gaussians,
+            "projected_gaussians": gaussians_xy,
+            "viewmat": np.eye(4, dtype=np.float64),  # placeholder (not used downstream here)
+            "K": np.eye(3, dtype=np.float64),  # placeholder intrinsics
+            "ot_mass": ot_mass.astype(np.float64),  # OT marginal: alpha * S_k
+            "S_k": S_k.astype(np.float64),  # for diagnostics
+        }
+        with open(os.path.join(output_dir, "gaussians.pkl"), "wb") as f:
+            pickle.dump(legacy_payload, f)
+    except Exception as e:
+        print(f"Pickle save skipped due to error: {e}")
+
+    return gaussians, nll_log
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Gaussian Mixture Model EM algorithm on an image")
-    parser.add_argument("--image_path", type=str, 
-                       default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
-                       help="Path to the input image")
-    parser.add_argument("--n_gaussians", type=int, default=5000, help="Number of Gaussians")
-    parser.add_argument("--n_iterations", type=int, default=8, help="Number of EM iterations")
+    parser.add_argument(
+        "--image_path",
+        type=str,
+        default=os.path.join("data", "tsukuba", "scene1.row3.col1.ppm"),
+        help="Path to the input image",
+    )
+    parser.add_argument(
+        "--n_gaussians",
+        type=int,
+        default=300,
+        help="Number of Gaussians (used when --k_list is not provided)",
+    )
+    parser.add_argument(
+        "--k_list",
+        type=str,
+        default=None,
+        help="Comma-separated list of K values to sweep (e.g., '150,200,250,300,500')",
+    )
+    parser.add_argument(
+        "--max_iterations",
+        type=int,
+        default=50,
+        help="Maximum EM iterations (upper bound)",
+    )
+    parser.add_argument(
+        "--tol",
+        type=float,
+        default=1e-4,
+        help="Relative NLL improvement threshold for early stopping",
+    )
+    parser.add_argument(
+        "--min_iterations",
+        type=int,
+        default=5,
+        help="Minimum iterations before checking early stopping",
+    )
+    parser.add_argument(
+        "--init_mode",
+        type=str,
+        default="grid",
+        help="Initialization mode for Gaussians (grid|random)",
+    )
+    parser.add_argument(
+        "--mse_tol",
+        type=float,
+        default=None,
+        help="Optional relative MSE improvement threshold for early stopping",
+    )
+    parser.add_argument(
+        "--mask_path",
+        type=str,
+        default=None,
+        help="Optional path to a mask image (same H,W). Pixels outside mask are treated as missing.",
+    )
+    parser.add_argument(
+        "--no_reinit_dead",
+        action="store_true",
+        help="Disable dead component reinitialization (for strict EM, monotonic NLL)",
+    )
+    parser.add_argument(
+        "--no_enforce_spd",
+        action="store_true",
+        help="Disable SPD enforcement on covariance (for strict EM)",
+    )
     args = parser.parse_args()
 
-    final_gaussians = run_gaussian_mixture_on_image(args.image_path, args.n_gaussians, args.n_iterations)
+    if args.k_list:
+        k_values = [int(k.strip()) for k in args.k_list.split(",") if k.strip()]
+    else:
+        k_values = [args.n_gaussians]
+
+    for k in k_values:
+        print(f"\n=== Running EM for K={k} ===")
+        run_gaussian_mixture_on_image(
+            args.image_path,
+            n_gaussians=k,
+            max_iterations=args.max_iterations,
+            tol=args.tol,
+            min_iterations=args.min_iterations,
+            init_mode=args.init_mode,
+            mask_path=args.mask_path,
+            reinit_dead=not args.no_reinit_dead,
+            enforce_spd=not args.no_enforce_spd,
+        )

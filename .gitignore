@@ -9,6 +9,8 @@ __pycache__
 .pytest_cache
 .venv
 *.env
+*.json
+*.npy
 
 # Exceptions for specific README and environment files
 !data/README.md
@@ -34,6 +36,11 @@ utils/rodrigues_numerical_comparison.png
 perspective_n_gaussian.pdf
 overview.tex
 /.kiro/*
+/AGENTS.md
 
 # Oracle study results (experimental data and figures)
 src/oracle_study/results/*
+src/oracle_study/camera_pose/results/*
+src/oracle_study/matching/results/*
+
+src/oracle_study/matching/experiments/toy_generator_test/figures/*

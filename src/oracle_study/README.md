@@ -68,24 +68,20 @@ src/oracle_study/
 
 ### Option 1: Direct Execution
 ```bash
-# Run transport matrix analysis (recommended first)
-python src/oracle_study/experiments/transport_matrix_analysis.py
-
-# Run cost function analysis
-python src/oracle_study/experiments/cost_function_analysis.py
+# Run unified transport + cost analysis (recommended first)
+python src/oracle_study/matching/experiments/unified_analysis.py --epipolar-mode hybrid
 
 # Validate toy generator
-python src/oracle_study/experiments/toy_generator_validation.py
+python src/oracle_study/matching/experiments/toy_generator_validation.py
 
 # Run integration tests
-python src/oracle_study/experiments/integration_validation.py
+python src/oracle_study/matching/experiments/integration_validation.py
 ```
 
 ### Option 2: Using Experiment Runner
 ```bash
 # More convenient interface
-python src/oracle_study/run_experiment.py transport_matrix_analysis
-python src/oracle_study/run_experiment.py cost_function_analysis
+python src/oracle_study/run_experiment.py unified_analysis
 python src/oracle_study/run_experiment.py toy_generator_validation
 python src/oracle_study/run_experiment.py integration_validation
 ```

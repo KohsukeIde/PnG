@@ -108,101 +108,9 @@ class ToyProblemGenerator:
             scales=scales
         )
 
+
+
     def generate_epipolar_correspondences(
-        self,
-        n_gaussians: int,
-        K: np.ndarray,
-        R_wc: np.ndarray,
-        t_wc: np.ndarray,
-        depth_range: tuple = (2.0, 6.0),
-        norm_xy_range: tuple = (-0.5, 0.5),
-        color_mode: str = 'gradient'
-    ) -> Tuple[TwoDGaussians, TwoDGaussians, np.ndarray, np.ndarray]:
-        """
-        Generate a pair of Gaussian sets consistent with epipolar geometry using
-        a simple two-view pinhole camera model. Camera-1 is at identity pose.
-
-        Returns (gaussians1, gaussians2, correspondences, F_gt)
-        where F_gt = K^{-T} [t]_x R K^{-1} with R=R_wc, t=t_wc.
-        Inputs:
-          - K: 3x3 intrinsics (same for both views)
-          - R_wc, t_wc: pose of camera-2 (world->camera2)
-        """
-        # 1) Sample 3D points in camera-1/world frame (camera-1 is identity)
-        z_vals = self.rng.uniform(depth_range[0], depth_range[1], size=(n_gaussians,)).astype(np.float32)
-        x_norm = self.rng.uniform(norm_xy_range[0], norm_xy_range[1], size=(n_gaussians,)).astype(np.float32)
-        y_norm = self.rng.uniform(norm_xy_range[0], norm_xy_range[1], size=(n_gaussians,)).astype(np.float32)
-
-        # Camera-1 coordinates (also world coordinates)
-        X_cam1 = np.stack([x_norm * z_vals, y_norm * z_vals, z_vals], axis=1).astype(np.float32)
-
-        # 2) Project to image-1 pixels
-        x1 = X_cam1[:, 0] / X_cam1[:, 2]
-        y1 = X_cam1[:, 1] / X_cam1[:, 2]
-        ones = np.ones_like(x1)
-        p1_h = np.stack([x1, y1, ones], axis=1).astype(np.float32)  # normalized
-        p1_pix = (K @ p1_h.T).T[:, :2].astype(np.float32)
-
-        # 3) Transform to camera-2 frame and project
-        X_cam2 = (R_wc @ X_cam1.T + t_wc.reshape(3, 1)).T
-        x2 = X_cam2[:, 0] / X_cam2[:, 2]
-        y2 = X_cam2[:, 1] / X_cam2[:, 2]
-        p2_h = np.stack([x2, y2, np.ones_like(x2)], axis=1).astype(np.float32)
-        p2_pix = (K @ p2_h.T).T[:, :2].astype(np.float32)
-
-        # 4) Build Gaussians (simple isotropic covariances)
-        scales = self.rng.uniform(1.5, 3.5, size=(n_gaussians, 2)).astype(np.float32)
-        rotations = np.zeros(n_gaussians, dtype=np.float32)
-        covs = np.zeros((n_gaussians, 2, 2), dtype=np.float32)
-        for i in range(n_gaussians):
-            covs[i] = np.diag(scales[i] ** 2)
-
-        if color_mode == 'gradient':
-            colors = np.zeros((n_gaussians, 3), dtype=np.float32)
-            for i in range(n_gaussians):
-                t = i / max(1, n_gaussians - 1)
-                colors[i] = [t, 1.0 - t, 0.5]
-        elif color_mode == 'random':
-            colors = self.rng.uniform(0, 1, size=(n_gaussians, 3)).astype(np.float32)
-        else:
-            colors = np.ones((n_gaussians, 3), dtype=np.float32) * 0.5
-
-        alpha = np.ones(n_gaussians, dtype=np.float32) * 0.8
-
-        gaussians1 = TwoDGaussians(
-            means=p1_pix,
-            covs=covs.copy(),
-            rgb=colors.copy(),
-            alpha=alpha.copy(),
-            rotations=rotations.copy(),
-            scales=scales.copy()
-        )
-
-        gaussians2 = TwoDGaussians(
-            means=p2_pix,
-            covs=covs.copy(),
-            rgb=colors.copy(),
-            alpha=alpha.copy(),
-            rotations=rotations.copy(),
-            scales=scales.copy()
-        )
-
-        # 5) Identity correspondences
-        correspondences = np.column_stack([np.arange(n_gaussians), np.arange(n_gaussians)])
-
-        # 6) Ground-truth Fundamental matrix
-        #   E = [t]_x R,  F = K^{-T} E K^{-1}
-        def skew(t: np.ndarray) -> np.ndarray:
-            return np.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]], dtype=np.float32)
-
-        K_inv = np.linalg.inv(K).astype(np.float32)
-        K_inv_T = K_inv.T
-        E = skew(t_wc.astype(np.float32)) @ R_wc.astype(np.float32)
-        F_gt = K_inv_T @ E @ K_inv
-
-        return gaussians1, gaussians2, correspondences, F_gt.astype(np.float32)
-
-    def generate_epipolar_correspondences_3dgs(
         self,
         n_gaussians: int,
         K: np.ndarray,
@@ -607,5 +515,439 @@ class ToyProblemGenerator:
         
         # Create identity correspondences (same positions = same indices)
         correspondences = np.column_stack([np.arange(n_gaussians), np.arange(n_gaussians)])
-        
+
         return new_gaussians, correspondences
+
+    # ------------------------------------------------------------------
+    # Scenario helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clone_gaussians(gaussians: TwoDGaussians) -> TwoDGaussians:
+        """Create a deep copy of a TwoDGaussians structure."""
+        return TwoDGaussians(
+            means=gaussians.means.copy(),
+            covs=gaussians.covs.copy(),
+            rgb=gaussians.rgb.copy(),
+            alpha=gaussians.alpha.copy(),
+            rotations=gaussians.rotations.copy(),
+            scales=gaussians.scales.copy(),
+        )
+
+    @staticmethod
+    def rotation_matrix(axis: str, angle: float) -> np.ndarray:
+        """Return a float32 rotation matrix for the requested axis."""
+        axis = axis.lower()
+        c, s = np.cos(angle), np.sin(angle)
+
+        if axis in {"x", "pitch"}:
+            return np.array(
+                [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+                dtype=np.float32,
+            )
+        if axis in {"y", "yaw"}:
+            return np.array(
+                [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+                dtype=np.float32,
+            )
+        if axis in {"z", "roll"}:
+            return np.array(
+                [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+        raise ValueError(f"Unknown axis: {axis}")
+
+    @classmethod
+    def get_epipolar_standard_scenarios(cls) -> Dict[str, Dict[str, np.ndarray]]:
+        """Return the core epipolar scenarios used across analyses."""
+
+        def R_yaw(angle: float) -> np.ndarray:
+            return cls.rotation_matrix("yaw", angle)
+
+        return {
+            "epi_translation": {
+                "R_wc": R_yaw(0.0),
+                "t_wc": np.array([0.25, 0.02, 0.0], dtype=np.float32),
+            },
+            "epi_yaw_rotation": {
+                "R_wc": R_yaw(0.12),
+                "t_wc": np.array([0.18, 0.01, 0.02], dtype=np.float32),
+            },
+            "epi_forward_scale_like": {
+                "R_wc": R_yaw(0.02),
+                "t_wc": np.array([0.05, 0.0, 0.15], dtype=np.float32),
+            },
+            "epi_combined": {
+                "R_wc": R_yaw(0.10),
+                "t_wc": np.array([0.25, 0.02, 0.05], dtype=np.float32),
+            },
+            "epi_color_change": {
+                "R_wc": R_yaw(0.08),
+                "t_wc": np.array([0.20, 0.01, 0.03], dtype=np.float32),
+            },
+        }
+
+    @classmethod
+    def get_epipolar_baseline_scenarios(cls) -> Dict[str, Dict[str, Any]]:
+        """Return baseline epipolar scenarios (translation/rotation variants)."""
+
+        return {
+            "baseline_translation": {
+                "R_wc": cls.rotation_matrix("yaw", 0.0),
+                "t_wc": np.array([0.25, 0.02, 0.0], dtype=np.float32),
+                "description": "Pure translation baseline",
+            },
+            "baseline_yaw": {
+                "R_wc": cls.rotation_matrix("yaw", 0.12),
+                "t_wc": np.array([0.18, 0.01, 0.02], dtype=np.float32),
+                "description": "Yaw rotation with small translation",
+            },
+            "baseline_forward": {
+                "R_wc": cls.rotation_matrix("yaw", 0.02),
+                "t_wc": np.array([0.05, 0.0, 0.15], dtype=np.float32),
+                "description": "Forward motion with minimal yaw",
+            },
+            "baseline_combined": {
+                "R_wc": cls.rotation_matrix("yaw", 0.10),
+                "t_wc": np.array([0.25, 0.02, 0.05], dtype=np.float32),
+                "description": "Combined yaw and translation",
+            },
+        }
+
+    @classmethod
+    def get_epipolar_challenging_scenarios(cls) -> Dict[str, Dict[str, Any]]:
+        """Return challenging scenarios for stress testing the solver."""
+
+        scenarios: Dict[str, Dict[str, Any]] = {}
+
+        for i, scale in enumerate([0.5, 1.5, 2.0, 3.0]):
+            scenarios[f"scale_test_{i}"] = {
+                "R_wc": cls.rotation_matrix("yaw", 0.1),
+                "t_wc": np.array([0.2, 0.02, 0.05], dtype=np.float32) * scale,
+                "description": f"Scale test with factor {scale}",
+            }
+
+        for i, angle in enumerate([0.3, 0.5, 0.7, 1.0]):
+            scenarios[f"large_yaw_{i}"] = {
+                "R_wc": cls.rotation_matrix("yaw", angle),
+                "t_wc": np.array([0.3, 0.05, 0.05], dtype=np.float32),
+                "description": f"Large yaw rotation {np.degrees(angle):.1f} degrees",
+            }
+
+        angles = [0.15, 0.2, 0.25]
+        for i, (pitch, yaw, roll) in enumerate(
+            zip(angles, angles[::-1], angles[1:] + [angles[0]])
+        ):
+            R = (
+                cls.rotation_matrix("pitch", pitch)
+                @ cls.rotation_matrix("yaw", yaw)
+                @ cls.rotation_matrix("roll", roll)
+            )
+            scenarios[f"multi_axis_{i}"] = {
+                "R_wc": R,
+                "t_wc": np.array([0.3, 0.1, 0.08], dtype=np.float32),
+                "description": (
+                    f"Multi-axis rotation P{np.degrees(pitch):.0f}°"
+                    f"Y{np.degrees(yaw):.0f}°R{np.degrees(roll):.0f}°"
+                ),
+            }
+
+        scenarios.update(
+            {
+                "near_identity": {
+                    "R_wc": cls.rotation_matrix("yaw", 0.01),
+                    "t_wc": np.array([0.01, 0.002, 0.001], dtype=np.float32),
+                    "description": "Near-identity transformation",
+                },
+                "large_baseline": {
+                    "R_wc": cls.rotation_matrix("yaw", 0.6),
+                    "t_wc": np.array([1.5, 0.3, 0.2], dtype=np.float32),
+                    "description": "Large baseline stereo",
+                },
+                "pure_forward": {
+                    "R_wc": cls.rotation_matrix("yaw", 0.0),
+                    "t_wc": np.array([0.0, 0.0, 0.5], dtype=np.float32),
+                    "description": "Pure forward motion (challenging for epipolar)",
+                },
+            }
+        )
+
+        return scenarios
+
+    @classmethod
+    def get_epipolar_noise_scenarios(cls) -> Dict[str, Dict[str, Any]]:
+        """Return scenarios for testing robustness to synthetic noise."""
+
+        base_R = cls.rotation_matrix("yaw", 0.15)
+        base_t = np.array([0.3, 0.05, 0.08], dtype=np.float32)
+
+        scenarios: Dict[str, Dict[str, Any]] = {
+            "noise_baseline": {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": "Baseline for noise tests",
+                "color_noise": 0.0,
+                "gaussian_noise": 0.0,
+            }
+        }
+
+        for i, noise_level in enumerate([0.1, 0.2, 0.3, 0.5]):
+            scenarios[f"color_noise_{i}"] = {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": f"Color noise level {noise_level}",
+                "color_noise": noise_level,
+                "gaussian_noise": 0.0,
+            }
+
+        for i, pos_noise in enumerate([0.5, 1.0, 2.0, 3.0]):
+            scenarios[f"position_noise_{i}"] = {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": f"Position noise {pos_noise} pixels",
+                "color_noise": 0.0,
+                "gaussian_noise": pos_noise,
+            }
+
+        for i, (c_noise, p_noise) in enumerate([(0.1, 0.5), (0.2, 1.0), (0.3, 1.5)]):
+            scenarios[f"combined_noise_{i}"] = {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": f"Combined noise C{c_noise} P{p_noise}",
+                "color_noise": c_noise,
+                "gaussian_noise": p_noise,
+            }
+
+        return scenarios
+
+    @classmethod
+    def get_epipolar_illumination_scenarios(cls) -> Dict[str, Dict[str, Any]]:
+        """Return illumination-change scenarios."""
+
+        base_R = cls.rotation_matrix("yaw", 0.12)
+        base_t = np.array([0.25, 0.03, 0.05], dtype=np.float32)
+
+        return {
+            "illumination_baseline": {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": "Baseline illumination",
+                "illumination_change": "none",
+            },
+            "global_brightness": {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": "Global brightness change",
+                "illumination_change": "brightness",
+                "brightness_factor": 0.7,
+            },
+            "contrast_change": {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": "Contrast change",
+                "illumination_change": "contrast",
+                "contrast_factor": 1.5,
+            },
+            "color_shift": {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": "Color channel shift",
+                "illumination_change": "color_shift",
+                "color_shift": np.array([0.1, -0.05, 0.08], dtype=np.float32),
+            },
+            "random_illumination": {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": "Random illumination changes",
+                "illumination_change": "random",
+            },
+        }
+
+    @classmethod
+    def get_epipolar_occlusion_scenarios(cls) -> Dict[str, Dict[str, Any]]:
+        """Return scenarios with partial occlusions."""
+
+        base_R = cls.rotation_matrix("yaw", 0.18)
+        base_t = np.array([0.35, 0.04, 0.06], dtype=np.float32)
+
+        scenarios: Dict[str, Dict[str, Any]] = {}
+
+        for i, occlusion_rate in enumerate([0.1, 0.2, 0.3, 0.5]):
+            scenarios[f"occlusion_{i}"] = {
+                "R_wc": base_R,
+                "t_wc": base_t,
+                "description": f"Random occlusion {occlusion_rate*100:.0f}%",
+                "occlusion_rate": occlusion_rate,
+                "occlusion_type": "random",
+            }
+
+        scenarios.update(
+            {
+                "left_occlusion": {
+                    "R_wc": base_R,
+                    "t_wc": base_t,
+                    "description": "Left side occlusion",
+                    "occlusion_type": "left_half",
+                },
+                "center_occlusion": {
+                    "R_wc": base_R,
+                    "t_wc": base_t,
+                    "description": "Center region occlusion",
+                    "occlusion_type": "center_circle",
+                },
+                "corner_occlusion": {
+                    "R_wc": base_R,
+                    "t_wc": base_t,
+                    "description": "Corner occlusion",
+                    "occlusion_type": "corners",
+                },
+            }
+        )
+
+        return scenarios
+
+    @classmethod
+    def get_epipolar_comprehensive_suite(
+        cls,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """Return (all scenarios, representative subset) for epipolar studies."""
+
+        categories = {
+            "baseline": cls.get_epipolar_baseline_scenarios(),
+            "challenge": cls.get_epipolar_challenging_scenarios(),
+            "noise": cls.get_epipolar_noise_scenarios(),
+            "illumination": cls.get_epipolar_illumination_scenarios(),
+            "occlusion": cls.get_epipolar_occlusion_scenarios(),
+        }
+
+        all_scenarios: Dict[str, Dict[str, Any]] = {}
+        for prefix, group in categories.items():
+            for name, params in group.items():
+                all_scenarios[f"{prefix}_{name}"] = params
+
+        baseline = categories["baseline"]
+        challenge = categories["challenge"]
+        noise = categories["noise"]
+        illumination = categories["illumination"]
+
+        optimization_subset = {
+            "baseline_translation": baseline["baseline_translation"],
+            "baseline_yaw": baseline["baseline_yaw"],
+            "baseline_combined": baseline["baseline_combined"],
+            "challenge_scale_test_1": challenge["scale_test_1"],
+            "challenge_large_yaw_1": challenge["large_yaw_1"],
+            "challenge_multi_axis_0": challenge["multi_axis_0"],
+            "challenge_large_baseline": challenge["large_baseline"],
+            "noise_color_noise_1": noise["color_noise_1"],
+            "noise_position_noise_1": noise["position_noise_1"],
+            "noise_combined_noise_0": noise["combined_noise_0"],
+            "illumination_global_brightness": illumination["global_brightness"],
+            "illumination_random_illumination": illumination["random_illumination"],
+        }
+
+        return all_scenarios, optimization_subset
+
+    @classmethod
+    def get_optuna_scenarios(cls) -> List[Dict[str, Any]]:
+        """Return the scenario list used for Optuna hyperparameter search."""
+
+        def R_yaw(angle: float) -> np.ndarray:
+            return cls.rotation_matrix("yaw", angle)
+
+        def R_pitch(angle: float) -> np.ndarray:
+            return cls.rotation_matrix("pitch", angle)
+
+        return [
+            {"name": "pure_translation_x", "R_wc": R_yaw(0.0), "t_wc": np.array([0.3, 0.0, 0.0], dtype=np.float32), "color_noise": False},
+            {"name": "pure_translation_y", "R_wc": R_yaw(0.0), "t_wc": np.array([0.0, 0.3, 0.0], dtype=np.float32), "color_noise": False},
+            {"name": "pure_translation_z", "R_wc": R_yaw(0.0), "t_wc": np.array([0.0, 0.0, 0.2], dtype=np.float32), "color_noise": False},
+            {"name": "pure_yaw_small", "R_wc": R_yaw(0.05), "t_wc": np.array([0.0, 0.0, 0.0], dtype=np.float32), "color_noise": False},
+            {"name": "pure_yaw_large", "R_wc": R_yaw(0.15), "t_wc": np.array([0.0, 0.0, 0.0], dtype=np.float32), "color_noise": False},
+            {"name": "pure_pitch", "R_wc": R_pitch(0.08), "t_wc": np.array([0.0, 0.0, 0.0], dtype=np.float32), "color_noise": False},
+            {"name": "small_motion", "R_wc": R_yaw(0.03), "t_wc": np.array([0.1, 0.02, 0.01], dtype=np.float32), "color_noise": False},
+            {"name": "medium_motion", "R_wc": R_yaw(0.08), "t_wc": np.array([0.2, 0.05, 0.03], dtype=np.float32), "color_noise": False},
+            {"name": "large_motion", "R_wc": R_yaw(0.12), "t_wc": np.array([0.3, 0.08, 0.05], dtype=np.float32), "color_noise": False},
+            {"name": "medium_motion_color_noise", "R_wc": R_yaw(0.08), "t_wc": np.array([0.2, 0.05, 0.03], dtype=np.float32), "color_noise": True},
+            {"name": "large_motion_color_noise", "R_wc": R_yaw(0.12), "t_wc": np.array([0.3, 0.08, 0.05], dtype=np.float32), "color_noise": True},
+            {"name": "forward_motion", "R_wc": R_yaw(0.02), "t_wc": np.array([0.02, 0.0, 0.15], dtype=np.float32), "color_noise": False},
+            {"name": "backward_motion", "R_wc": R_yaw(0.02), "t_wc": np.array([0.02, 0.0, -0.10], dtype=np.float32), "color_noise": False},
+        ]
+
+    def apply_epipolar_scenario_effects(
+        self,
+        gaussians1: TwoDGaussians,
+        gaussians2: TwoDGaussians,
+        scenario: Dict[str, Any],
+        seed: Optional[int] = None,
+    ) -> Tuple[TwoDGaussians, TwoDGaussians]:
+        """Apply scenario-specific perturbations such as noise or occlusion."""
+
+        rng = np.random.RandomState(seed if seed is not None else self.seed)
+        g1 = self._clone_gaussians(gaussians1)
+        g2 = self._clone_gaussians(gaussians2)
+
+        color_noise = float(scenario.get("color_noise", 0.0) or 0.0)
+        if color_noise > 0.0:
+            delta = rng.normal(0.0, color_noise, g2.rgb.shape).astype(np.float32)
+            g2.rgb = np.clip(g2.rgb + delta, 0.0, 1.0)
+
+        gaussian_noise = float(scenario.get("gaussian_noise", 0.0) or 0.0)
+        if gaussian_noise > 0.0:
+            delta = rng.normal(0.0, gaussian_noise, g2.means.shape).astype(np.float32)
+            g2.means += delta
+
+        illumination = scenario.get("illumination_change")
+        if illumination == "brightness":
+            factor = float(scenario.get("brightness_factor", 1.0))
+            g2.rgb = np.clip(g2.rgb * factor, 0.0, 1.0)
+        elif illumination == "contrast":
+            factor = float(scenario.get("contrast_factor", 1.0))
+            g2.rgb = np.clip(0.5 + factor * (g2.rgb - 0.5), 0.0, 1.0)
+        elif illumination == "color_shift":
+            shift = np.asarray(scenario.get("color_shift", [0.0, 0.0, 0.0]), dtype=np.float32)
+            g2.rgb = np.clip(g2.rgb + shift, 0.0, 1.0)
+        elif illumination == "random":
+            brightness = rng.uniform(0.6, 1.25)
+            contrast = rng.uniform(0.8, 1.25)
+            shift = rng.normal(0.0, 0.08, size=(1, 3)).astype(np.float32)
+            g2.rgb = np.clip(0.5 + contrast * (g2.rgb - 0.5), 0.0, 1.0)
+            g2.rgb = np.clip(g2.rgb * brightness + shift, 0.0, 1.0)
+
+        occlusion_type = scenario.get("occlusion_type")
+        if occlusion_type is not None:
+            mask = np.zeros(g2.means.shape[0], dtype=bool)
+            if occlusion_type == "random":
+                rate = float(scenario.get("occlusion_rate", 0.0) or 0.0)
+                if rate > 0.0:
+                    count = max(1, int(round(rate * g2.means.shape[0])))
+                    count = min(count, g2.means.shape[0])
+                    idx = rng.choice(g2.means.shape[0], size=count, replace=False)
+                    mask[idx] = True
+            elif occlusion_type == "left_half":
+                median_x = np.median(g2.means[:, 0])
+                mask = g2.means[:, 0] <= median_x
+            elif occlusion_type == "center_circle":
+                center = g2.means.mean(axis=0)
+                extents = np.ptp(g2.means, axis=0)
+                radius = scenario.get("occlusion_radius")
+                if radius is None:
+                    radius = 0.35 * float(max(extents[0], extents[1]))
+                distance = np.linalg.norm(g2.means - center, axis=1)
+                mask = distance <= radius
+            elif occlusion_type == "corners":
+                x = g2.means[:, 0]
+                y = g2.means[:, 1]
+                x_min, x_max = x.min(), x.max()
+                y_min, y_max = y.min(), y.max()
+                margin_x = 0.15 * max(1e-6, x_max - x_min)
+                margin_y = 0.15 * max(1e-6, y_max - y_min)
+                top_left = (x <= x_min + margin_x) & (y >= y_max - margin_y)
+                top_right = (x >= x_max - margin_x) & (y >= y_max - margin_y)
+                bottom_left = (x <= x_min + margin_x) & (y <= y_min + margin_y)
+                bottom_right = (x >= x_max - margin_x) & (y <= y_min + margin_y)
+                mask = top_left | top_right | bottom_left | bottom_right
+
+            if mask.any():
+                g2.alpha[mask] = np.clip(g2.alpha[mask] * 0.1, 0.0, 1.0)
+                g2.rgb[mask] = np.clip(g2.rgb[mask] * 0.3, 0.0, 1.0)
+
+        return g1, g2

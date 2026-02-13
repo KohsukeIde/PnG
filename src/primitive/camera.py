@@ -112,6 +112,17 @@ class Lie():
                           torch.stack([-w1,w0,O],dim=-1)],dim=-2)
         return wx
 
+    def SO3_to_quat(self, R: torch.Tensor) -> torch.Tensor:
+        """Convert rotation matrix to quaternion."""
+        quat_util = Quaternion()
+        # Add batch dimension if needed (R_to_q expects batch dimension)
+        if R.dim() == 2:
+            R = R.unsqueeze(0)
+            result = quat_util.R_to_q(R)
+            return result.squeeze(0)
+        else:
+            return quat_util.R_to_q(R)
+
     def taylor_A(self,x,nth=10):
         # Taylor expansion of sin(x)/x
         ans = torch.zeros_like(x)
