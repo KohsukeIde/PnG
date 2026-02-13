@@ -43,6 +43,11 @@ class OptimalTransportSolver:
         hybrid_alpha: float = 0.5,    # when epipolar_mode == "hybrid": alpha in [0,1]
         epi_clip: Optional[float] = None,  # if set, add large cost when Sampson residual exceeds this px threshold
         device: Optional[torch.device] = None,
+        normalize_ot_mass: bool = True,
+        ot_mass_eps: float = 1e-8,
+        # OT marginal mass (visible mass in image region = alpha * S_k)
+        ot_mass1: Optional[np.ndarray] = None,  # If None, use gaussians1.alpha
+        ot_mass2: Optional[np.ndarray] = None,  # If None, use gaussians2.alpha
     ):
         """Initialize the OptimalTransportSolver.
 
@@ -56,6 +61,8 @@ class OptimalTransportSolver:
             lambda_cov (float): Weight for covariance difference term.
             lambda_color (float): Weight for color difference term.
             device (torch.device): Device to perform computations on.
+            normalize_ot_mass (bool): If True, normalize OT masses to sum to 1.
+            ot_mass_eps (float): Epsilon for mass normalization safety checks.
         """
         self.gaussians1 = copy.deepcopy(gaussians1)
         self.gaussians2 = copy.deepcopy(gaussians2)
@@ -91,6 +98,8 @@ class OptimalTransportSolver:
         self.sigma_epipolar = float(sigma_epipolar)
         self.sigma_color = float(sigma_color)
         self.sigma_cov = float(sigma_cov)
+        self.normalize_ot_mass = bool(normalize_ot_mass)
+        self.ot_mass_eps = float(ot_mass_eps)
         self.noise_model = noise_model.lower()
         if self.noise_model not in {"gaussian", "cauchy", "huber"}:
             raise ValueError("noise_model must be one of {'gaussian','cauchy','huber'}")
@@ -105,11 +114,31 @@ class OptimalTransportSolver:
             raise ValueError("hybrid_alpha must be in [0, 1].")
         self.epi_clip = epi_clip
 
+        # OT marginal mass (visible mass = alpha * S_k, or alpha if not provided)
+        self._ot_mass1_input = ot_mass1  # Store for use in _prepare_gaussians
+        self._ot_mass2_input = ot_mass2
+
+        # Gate mask for epsilon calculation (set by compute_cost_matrix_*)
+        self._last_gate_mask: Optional[torch.Tensor] = None
+
+        # Actual ε/ρ used in last Sinkhorn call (for full_uot consistency)
+        # These are set by unbalanced_sinkhorn_algorithm after final iteration
+        self._last_sinkhorn_epsilon: Optional[float] = None
+        self._last_sinkhorn_rho: Optional[float] = None
+
         # Convert Gaussian parameters to torch tensors
         self._prepare_gaussians()
         # Lieクラスのインスタンス化
         self.lie = Lie()
         self.quaternion = Quaternion()
+
+    def _normalize_mass(self, mass: torch.Tensor) -> torch.Tensor:
+        """Normalize mass to sum to 1 with safety fallback."""
+        mass = torch.clamp(mass, min=0.0)
+        total = mass.sum()
+        if not torch.isfinite(total) or total <= self.ot_mass_eps:
+            return torch.full_like(mass, 1.0 / mass.numel())
+        return mass / total
 
     def _prepare_gaussians(self) -> None:
         """Prepare Gaussian parameters as torch tensors."""
@@ -125,9 +154,15 @@ class OptimalTransportSolver:
         self.rgb1 = torch.as_tensor(
             self.gaussians1.rgb, dtype=torch.float32, device=self.device
         )  # Shape: (K1, 3)
-        self.alpha1 = torch.as_tensor(
-            self.gaussians1.alpha, dtype=torch.float32, device=self.device
-        )  # Shape: (K1,)
+        # Use ot_mass if provided (= alpha * S_k), otherwise fall back to alpha
+        if self._ot_mass1_input is not None:
+            self.alpha1 = torch.as_tensor(
+                self._ot_mass1_input, dtype=torch.float32, device=self.device
+            )  # Shape: (K1,) - visible mass for OT marginal
+        else:
+            self.alpha1 = torch.as_tensor(
+                self.gaussians1.alpha, dtype=torch.float32, device=self.device
+            )  # Shape: (K1,)
 
         self.means2 = torch.as_tensor(
             self.gaussians2.means, dtype=torch.float32, device=self.device
@@ -141,10 +176,15 @@ class OptimalTransportSolver:
         self.rgb2 = torch.as_tensor(
             self.gaussians2.rgb, dtype=torch.float32, device=self.device
         )  # Shape: (K2, 3)
-        self.alpha2 = torch.as_tensor(
-            self.gaussians2.alpha, dtype=torch.float32, device=self.device
-        )  # Shape: (K2,)
-
+        # Use ot_mass if provided (= alpha * S_k), otherwise fall back to alpha
+        if self._ot_mass2_input is not None:
+            self.alpha2 = torch.as_tensor(
+                self._ot_mass2_input, dtype=torch.float32, device=self.device
+            )  # Shape: (K2,) - visible mass for OT marginal
+        else:
+            self.alpha2 = torch.as_tensor(
+                self.gaussians2.alpha, dtype=torch.float32, device=self.device
+            )  # Shape: (K2,)
 
     def _build_F_from_wc(self, R_wc: torch.Tensor, t_wc: torch.Tensor) -> torch.Tensor:
         """R_wc, t_wc から F を構築。Lieクラスのskew_symmetricを使用。"""
@@ -167,17 +207,22 @@ class OptimalTransportSolver:
         record_mass: bool = False,
         dustbin_cost: Optional[float] = None,
         dustbin_mass: float = 1.0,
+        gate_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Unbalanced OT (log-domain) with optional mass diagnostics and dustbin.
 
         Args:
             cost_matrix: Cost matrix (K1,K2)
-            epsilon: Entropy weight (None → 0.08 * median)
+            epsilon: Entropy weight (None → 0.08 * median of valid entries)
             rho: KL weight (None → 10 * epsilon)  ※渡した rho をそのまま使う
             record_mass: If True, also return (row_sum, col_sum)
             dustbin_cost: If set, append a no-match row/col with this constant cost.
             dustbin_mass: Relative mass assigned to each dustbin marginal.
+            gate_mask: Boolean mask (True=valid) to exclude gated entries from median.
         """
+        # Reset actual ε/ρ to avoid stale values on failed calls.
+        self._last_sinkhorn_epsilon = None
+        self._last_sinkhorn_rho = None
         with torch.no_grad():
             if dustbin_cost is not None:
                 total_mass = max(float(self.alpha1.sum().item()), float(self.alpha2.sum().item()))
@@ -211,7 +256,16 @@ class OptimalTransportSolver:
                 a = self.alpha1.clone()
                 b = self.alpha2.clone()
 
-            c_median = torch.median(cost_matrix).item()
+            # Compute median excluding gated (invalid) entries if mask is provided
+            if gate_mask is not None and epsilon is None:
+                valid_costs = cost_matrix[gate_mask]
+                if valid_costs.numel() > 0:
+                    c_median = torch.median(valid_costs).item()
+                else:
+                    # Fallback to full median if no valid entries
+                    c_median = torch.median(cost_matrix).item()
+            else:
+                c_median = torch.median(cost_matrix).item()
             if epsilon is None:
                 epsilon = max(0.08 * c_median, 1e-3)
             if rho is None:
@@ -229,15 +283,26 @@ class OptimalTransportSolver:
                 cost_matrix, eps_current, rho_current, max_iter, tol, log_u, log_v, a, b
             )
 
+        # Store actual ε/ρ used in final iteration for full_uot calculation
+        # This is critical: the outer optimization must use the same ε/ρ as Sinkhorn
+        self._last_sinkhorn_epsilon = eps_current
+        self._last_sinkhorn_rho = rho_current
+
         if record_mass:
             row_sum = transport.sum(dim=1)
             col_sum = transport.sum(dim=0)
             return transport, (row_sum, col_sum)
         return transport, None
 
-    def _apply_gate_mask(self, cost: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def _apply_gate_mask(
+        self, cost: torch.Tensor, gate: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply a boolean gate (allowed=True) to cost.
         Ensures each row/col has at least one allowed entry by reopening the min-cost spot if needed.
+
+        Returns:
+            gated_cost: Cost matrix with invalid entries set to high penalty
+            updated_gate: Gate mask after fallback corrections (True=valid)
         """
         gate = gate.clone()
         # row fallback
@@ -251,7 +316,7 @@ class OptimalTransportSolver:
             idx = torch.argmin(cost[:, col_all_false], dim=0)
             gate[idx, col_all_false] = True
         gated_cost = torch.where(gate, cost, cost.max().detach() + 1e6)
-        return gated_cost
+        return gated_cost, gate
 
     def _sinkhorn_log_simple(
         self,
@@ -270,13 +335,18 @@ class OptimalTransportSolver:
         # Masses with small epsilon for numerical stability
         eps_mass = 1e-8  # Increased from 1e-16 for float32 stability
         if alpha_override is None:
-            alpha = self.alpha1 + eps_mass
+            alpha = self.alpha1
         else:
-            alpha = alpha_override + eps_mass
+            alpha = alpha_override
         if beta_override is None:
-            beta = self.alpha2 + eps_mass
+            beta = self.alpha2
         else:
-            beta = beta_override + eps_mass
+            beta = beta_override
+        if self.normalize_ot_mass:
+            alpha = self._normalize_mass(alpha)
+            beta = self._normalize_mass(beta)
+        alpha = alpha + eps_mass
+        beta = beta + eps_mass
         
         # Log kernel
         log_K = -cost_matrix / epsilon
@@ -504,8 +574,11 @@ class OptimalTransportSolver:
         p2_h = torch.cat([self.means2, ones2], 1)   # (K2,3)
 
         # -------- ② エピポーラ線 --------
-        l1 = (F   @ p2_h.T).T            # image-1 上 (K2,3)
-        l2 = (F.T @ p1_h.T).T            # image-2 上 (K1,3)
+        # Epipolar constraint: x2^T F x1 = 0
+        # Line in image1 (from x2): l1 = F^T @ x2
+        # Line in image2 (from x1): l2 = F @ x1
+        l1 = (F.T @ p2_h.T).T            # (K2,3) lines in image1 for points in image2
+        l2 = (F   @ p1_h.T).T            # (K1,3) lines in image2 for points in image1
 
         n1 = l1[:, :2]                              # (K2,2)
         eps = 1e-9
@@ -517,9 +590,9 @@ class OptimalTransportSolver:
         n2_unit = n2 / n2_norm
 
         # -------- ③ 点⇔線  "符号付き" 距離 --------
-        #     d_12(i,j):  p1_i → ℓ1_j
-        #     d_21(i,j):  p2_j → ℓ2_i
-        # ※ abs を外して「符号付き」にしても結果は d^2 なので同じですが、そのまま再利用します
+        # d_12(i,j): p1_i → l1_j (point i in image1 to line j in image1, line from p2_j)
+        # d_21(i,j): p2_j → l2_i (point j in image2 to line i in image2, line from p1_i)
+        # For correct correspondence (i,j), both distances should be ~0
         num_12 = p1_h @ l1.T                                           # (K1,K2)
         num_21 = (p2_h @ l2.T).T                                       # (K1,K2)
 
@@ -544,7 +617,10 @@ class OptimalTransportSolver:
         if self.epi_clip is not None:
             tau_sq = float(self.epi_clip) ** 2
             gate = dist_sq_sum <= tau_sq  # ゲートは純粋な幾何残差に対して適用
-            epi_with_shape = self._apply_gate_mask(epi_with_shape, gate)
+            epi_with_shape, updated_gate = self._apply_gate_mask(epi_with_shape, gate)
+            self._last_gate_mask = updated_gate  # Store updated gate for epsilon calculation
+        else:
+            self._last_gate_mask = None
 
         # -------- ⑤ 形状の類似度（Bures/Wasserstein距離） --------
         cov_dist = self._bures_wasserstein_cov_dist(cov1, cov2)    # (K1,K2)
@@ -609,7 +685,10 @@ class OptimalTransportSolver:
         if self.epi_clip is not None:
             tau_sq = float(self.epi_clip) ** 2
             gate = sampson <= tau_sq
-            sampson = self._apply_gate_mask(sampson, gate)
+            sampson, updated_gate = self._apply_gate_mask(sampson, gate)
+            self._last_gate_mask = updated_gate  # Store updated gate for epsilon calculation
+        else:
+            self._last_gate_mask = None
         
         # === 2. ガウス分布の形状を考慮 ===
         # 2.1 共分散行列の作成
@@ -683,8 +762,31 @@ class OptimalTransportSolver:
                         save_diagnostics=True, diagnostics_dir=None,
                         rot_lr=5e-3, trans_lr=5e-4, momentum=0.9,
                         grad_clip=0.1, seed=None,
-                        differentiable_transport=True):
-        """Optimize camera pose using Lie algebra SE(3) representation with separate rotation/translation."""
+                        differentiable_transport=True,
+                        log_cheirality: bool = False,
+                        # Fixed Sinkhorn parameters (Step E compatibility)
+                        sinkhorn_epsilon: Optional[float] = None,
+                        sinkhorn_rho: Optional[float] = None,
+                        # Score function selection
+                        score_type: str = "loss",  # "loss", "avg_cost", "mass_aware", "full_uot"
+                        lambda_kl: float = 0.1,  # for mass_aware score
+                        # Epsilon annealing (Step G: collapse prevention)
+                        epsilon_annealing: bool = False,
+                        epsilon_start: float = 0.2,  # Initial high epsilon
+                        epsilon_end: float = 0.05,   # Final low epsilon
+                        anneal_steps: int = 100,     # Steps to anneal from start to end
+                        # Step II: R/t separation for drift diagnosis
+                        optimize_mode: str = "both",  # "both", "rotation_only", "translation_only"
+                        ):
+        """Optimize camera pose using Lie algebra SE(3) representation with separate rotation/translation.
+
+        Args:
+            optimize_mode: Which parameters to optimize:
+                - "both": Optimize rotation and translation (default)
+                - "rotation_only": Only optimize rotation, keep translation fixed
+                - "translation_only": Only optimize translation, keep rotation fixed
+            log_cheirality: If True, log raw cheirality loss even when lambda_cheirality is 0.
+        """
         # -------------------------  出力ディレクトリ  ---------------------- #
         transport_dir = os.path.join("results", "transport_SE3")
         os.makedirs(transport_dir, exist_ok=True)
@@ -701,10 +803,31 @@ class OptimalTransportSolver:
             self._init_se3_like_cam1(rot_noise=0.05, trans_noise=0.05, seed=seed)
 
         # ------------------------- オプティマイザ設定 ----------------------- #
-        optimizer = torch.optim.SGD([
-            {'params': self.rot_vec, 'lr': rot_lr, 'momentum': momentum, 'nesterov': True},
-            {'params': self.trans_vec, 'lr': trans_lr, 'momentum': momentum, 'nesterov': True}
-        ])
+        # Step II: Configure optimizer based on optimize_mode
+        if optimize_mode == "rotation_only":
+            # Only optimize rotation, fix translation
+            self.rot_vec.requires_grad = True
+            self.trans_vec.requires_grad = False
+            optimizer = torch.optim.SGD([
+                {'params': self.rot_vec, 'lr': rot_lr, 'momentum': momentum, 'nesterov': True},
+            ])
+        elif optimize_mode == "translation_only":
+            # Only optimize translation, fix rotation
+            self.rot_vec.requires_grad = False
+            self.trans_vec.requires_grad = True
+            optimizer = torch.optim.SGD([
+                {'params': self.trans_vec, 'lr': trans_lr, 'momentum': momentum, 'nesterov': True},
+            ])
+        elif optimize_mode == "both":
+            # Default: optimize both
+            self.rot_vec.requires_grad = True
+            self.trans_vec.requires_grad = True
+            optimizer = torch.optim.SGD([
+                {'params': self.rot_vec, 'lr': rot_lr, 'momentum': momentum, 'nesterov': True},
+                {'params': self.trans_vec, 'lr': trans_lr, 'momentum': momentum, 'nesterov': True}
+            ])
+        else:
+            raise ValueError(f"Unknown optimize_mode: {optimize_mode}. Choose from 'both', 'rotation_only', 'translation_only'.")
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8**(1/100))
 
         prev_loss_val = float('inf')
@@ -712,11 +835,30 @@ class OptimalTransportSolver:
 
         debug_log_path = os.path.join(diagnostics_dir, "gradient_debug.log")
         with open(debug_log_path, 'w') as f:
-            f.write("Iteration, Loss, Rot_Grad_Norm, Trans_Grad_Norm, Rot_x, Rot_y, Rot_z, Trans_x, Trans_y, Trans_z\n")
+            f.write(
+                "Iteration, Loss, Transport_Cost, Cheirality_Loss, T_sum, top1_mean, "
+                "Rot_Grad_Norm, Trans_Grad_Norm, Rot_x, Rot_y, Rot_z, "
+                "Trans_x, Trans_y, Trans_z\n"
+            )
 
         for iteration in pbar:
             optimizer.zero_grad()
-            
+
+            # --- Epsilon annealing (Step G: collapse prevention) ---
+            if epsilon_annealing:
+                if iteration < anneal_steps:
+                    # Linear annealing from epsilon_start to epsilon_end
+                    t = iteration / anneal_steps
+                    current_epsilon = epsilon_start * (1 - t) + epsilon_end * t
+                else:
+                    current_epsilon = epsilon_end
+                # Keep rho proportional to epsilon
+                current_rho = (sinkhorn_rho / sinkhorn_epsilon * current_epsilon
+                              if sinkhorn_epsilon and sinkhorn_rho else 10.0 * current_epsilon)
+            else:
+                current_epsilon = sinkhorn_epsilon
+                current_rho = sinkhorn_rho
+
             # --- SE(3)指数写像（分離したパラメータを結合して渡す） ---
             se3_vec = torch.cat([self.rot_vec, self.trans_vec])
             T_cw = self.lie.se3_to_SE3(se3_vec)  # (3,4) or (4,4)
@@ -730,22 +872,97 @@ class OptimalTransportSolver:
             # 基礎行列と損失の計算
             F = self._build_F_from_wc(R_wc, t_wc)
             cost_matrix = self.compute_cost_matrix(F)
-            
+
             # Differentiable transport context
             context = torch.enable_grad() if differentiable_transport else torch.no_grad()
             with context:
-                transport = self.unbalanced_sinkhorn_algorithm(cost_matrix)
+                transport, _ = self.unbalanced_sinkhorn_algorithm(
+                    cost_matrix,
+                    epsilon=current_epsilon,
+                    rho=current_rho,
+                    gate_mask=self._last_gate_mask
+                )
                 if not differentiable_transport:
                     transport = transport.detach()
-            loss = torch.sum(transport * cost_matrix)
+
+            # Compute score based on selected score_type
+            transport_cost = torch.sum(transport * cost_matrix)
+            T_sum = transport.sum()
+
+            if score_type == "loss":
+                # Original loss (vulnerable to collapse)
+                loss = transport_cost
+            elif score_type == "avg_cost":
+                # Normalized by mass
+                loss = transport_cost / (T_sum + 1e-10)
+            elif score_type == "mass_aware":
+                # avg_cost + lambda * KL
+                avg_cost = transport_cost / (T_sum + 1e-10)
+                a = self.alpha1 / self.alpha1.sum()
+                b = self.alpha2 / self.alpha2.sum()
+                row_sum = transport.sum(dim=1)
+                col_sum = transport.sum(dim=0)
+                # KL divergences (using safe log)
+                eps_kl = 1e-10
+                KL_row = (row_sum * torch.log((row_sum + eps_kl) / (a + eps_kl)) - row_sum + a).sum()
+                KL_col = (col_sum * torch.log((col_sum + eps_kl) / (b + eps_kl)) - col_sum + b).sum()
+                loss = avg_cost + lambda_kl * (KL_row + KL_col)
+            elif score_type == "full_uot":
+                # Full UOT objective (matches Sinkhorn)
+                # CRITICAL: Use the ACTUAL ε/ρ from Sinkhorn's final iteration
+                # The Sinkhorn algorithm internally uses ε-scaling (e.g., [ε, 0.5ε])
+                # so we must use the stored values, not the input parameters
+                a = self.alpha1 / self.alpha1.sum()
+                b = self.alpha2 / self.alpha2.sum()
+                row_sum = transport.sum(dim=1)
+                col_sum = transport.sum(dim=0)
+                eps_kl = 1e-10
+                KL_row = (row_sum * torch.log((row_sum + eps_kl) / (a + eps_kl)) - row_sum + a).sum()
+                KL_col = (col_sum * torch.log((col_sum + eps_kl) / (b + eps_kl)) - col_sum + b).sum()
+                entropy = -(transport * torch.log(transport + eps_kl)).sum()
+                # Use ACTUAL ε/ρ from Sinkhorn (stored after final iteration)
+                eps_actual = self._last_sinkhorn_epsilon
+                rho_actual = self._last_sinkhorn_rho
+                if eps_actual is None or rho_actual is None:
+                    raise RuntimeError(
+                        "full_uot requires unbalanced_sinkhorn_algorithm() to "
+                        "run successfully before computing the score."
+                    )
+                # UOT objective: <T,C> + ρ*(KL_row + KL_col) + ε*sum(T*log(T) - T)
+                entropic = -entropy - T_sum  # = sum(T*log(T) - T)
+                loss = transport_cost + rho_actual * (KL_row + KL_col) + eps_actual * entropic
+            else:
+                raise ValueError(f"Unknown score_type: {score_type}")
+
             if self.lambda_cheirality > 0.0:
-                loss = loss + self.lambda_cheirality * self._cheirality_loss(R_wc, t_wc, transport.detach(), self.cheirality_topk)
-            
+                cheirality_raw = self._cheirality_loss(
+                    R_wc, t_wc, transport.detach(), self.cheirality_topk
+                )
+                loss = loss + self.lambda_cheirality * cheirality_raw
+            elif log_cheirality:
+                with torch.no_grad():
+                    cheirality_raw = self._cheirality_loss(
+                        R_wc, t_wc, transport.detach(), self.cheirality_topk
+                    )
+            else:
+                cheirality_raw = torch.tensor(0.0, device=self.device)
+
+            # Transport diagnostics for collapse detection
+            with torch.no_grad():
+                T_sum = transport.sum().item()
+                row_sum = transport.sum(dim=1)
+                col_sum = transport.sum(dim=0)
+                top1_mean = transport.max(dim=1).values.mean().item()
+
             if iteration % 10 == 0:
                 print(f"\nIteration {iteration} - Before backward:")
                 print(f"  Rot params: {self.rot_vec.data}")
                 print(f"  Trans params: {self.trans_vec.data}")
                 print(f"  Loss: {loss.item():.6f}")
+                print(f"  T.sum(): {T_sum:.4f} (collapse if decreasing!)")
+                print(f"  row_sum: mean={row_sum.mean().item():.4f}, min={row_sum.min().item():.4f}, max={row_sum.max().item():.4f}")
+                print(f"  col_sum: mean={col_sum.mean().item():.4f}, min={col_sum.min().item():.4f}, max={col_sum.max().item():.4f}")
+                print(f"  top1_mean: {top1_mean:.4f}")
                 print(f"  Rot LR: {rot_lr:.6e}, Trans LR: {trans_lr:.6e}")
             
             loss.backward()
@@ -753,25 +970,28 @@ class OptimalTransportSolver:
             # 勾配クリッピング
             # torch.nn.utils.clip_grad_norm_([self.rot_vec, self.trans_vec], max_norm=grad_clip)
             
-            if self.rot_vec.grad is not None and self.trans_vec.grad is not None:
-                rot_grad = self.rot_vec.grad
-                trans_grad = self.trans_vec.grad
-                rot_grad_norm = rot_grad.norm().item()
-                trans_grad_norm = trans_grad.norm().item()
-                
-                with open(debug_log_path, 'a') as f:
-                    rot_vals = rot_grad.detach().cpu().numpy()
-                    trans_vals = trans_grad.detach().cpu().numpy()
-                    f.write(f"{iteration}, {loss.item():.6f}, {rot_grad_norm:.6f}, {trans_grad_norm:.6f}, " + 
-                        f"{rot_vals[0]:.6f}, {rot_vals[1]:.6f}, {rot_vals[2]:.6f}, " +
-                        f"{trans_vals[0]:.6f}, {trans_vals[1]:.6f}, {trans_vals[2]:.6f}\n")
-                
-                if iteration % 10 == 0:
-                    print(f"  Rot gradient norm: {rot_grad_norm:.6f}")
-                    print(f"  Trans gradient norm: {trans_grad_norm:.6f}")
-                    print(f"  Rot/Trans gradient norm ratio: {rot_grad_norm/max(trans_grad_norm, 1e-10):.6f}")
-            else:
-                print("Warning: No gradient computed!")
+            rot_grad = self.rot_vec.grad
+            trans_grad = self.trans_vec.grad
+            rot_grad_norm = rot_grad.norm().item() if rot_grad is not None else 0.0
+            trans_grad_norm = trans_grad.norm().item() if trans_grad is not None else 0.0
+
+            with open(debug_log_path, 'a') as f:
+                rot_vals = rot_grad.detach().cpu().numpy() if rot_grad is not None else np.zeros(3)
+                trans_vals = trans_grad.detach().cpu().numpy() if trans_grad is not None else np.zeros(3)
+                f.write(
+                    f"{iteration}, {loss.item():.6f}, {transport_cost.item():.6f}, "
+                    f"{cheirality_raw.item():.6f}, {T_sum:.6f}, {top1_mean:.6f}, "
+                    f"{rot_grad_norm:.6f}, {trans_grad_norm:.6f}, "
+                    f"{rot_vals[0]:.6f}, {rot_vals[1]:.6f}, {rot_vals[2]:.6f}, "
+                    f"{trans_vals[0]:.6f}, {trans_vals[1]:.6f}, {trans_vals[2]:.6f}\n"
+                )
+
+            if iteration % 10 == 0:
+                print(f"  Rot gradient norm: {rot_grad_norm:.6f}")
+                print(f"  Trans gradient norm: {trans_grad_norm:.6f}")
+                print(f"  Rot/Trans gradient norm ratio: {rot_grad_norm/max(trans_grad_norm, 1e-10):.6f}")
+                if rot_grad is None or trans_grad is None:
+                    print("  Note: One gradient is None due to optimize_mode.")
 
             current_loss = loss.item()
             loss_history.append(current_loss)
@@ -912,7 +1132,12 @@ class OptimalTransportSolver:
         warmstart: bool = True,
         early_stop: bool = True,
         sinkhorn_verbose: bool = False,
-        differentiable_transport: bool = True
+        differentiable_transport: bool = True,
+        # Step III: Score type support (same as SE3 optimizer)
+        score_type: str = "avg_cost",  # "loss", "avg_cost", "mass_aware", "full_uot"
+        lambda_kl: float = 0.1,  # for mass_aware score
+        # Step III: R/t separation for comparison with SE3
+        optimize_mode: str = "both",  # "both", "rotation_only", "translation_only"
     ):
         """
         Camera-2 の姿勢 (R_wc, t̂_wc) を
@@ -948,7 +1173,17 @@ class OptimalTransportSolver:
             early_stop: 品質劣化時の早期停止
             sinkhorn_verbose: Sinkhorn進捗表示
             differentiable_transport: Sinkhornの勾配を計算するかどうか
-            
+            score_type: スコア関数の種類
+                - "loss": 単純な <T,C>
+                - "avg_cost": <T,C> / T.sum() (collapse-robust)
+                - "mass_aware": avg_cost + λ * KL
+                - "full_uot": UOT目的関数全体
+            lambda_kl: mass_aware スコアの KL 重み
+            optimize_mode: 最適化モード (Step III: R/t 分離テスト用)
+                - "both": R と t を同時に最適化
+                - "rotation_only": R のみ最適化（t は固定）
+                - "translation_only": t のみ最適化（R は固定）
+
         Returns:
             loss_history: 損失値の履歴
         """
@@ -1018,7 +1253,7 @@ class OptimalTransportSolver:
         # デバッグログ設定
         debug_log_path = os.path.join(diagnostics_dir, "gradient_debug.log")
         with open(debug_log_path, 'w') as f:
-            f.write("Iteration,Loss,q_Grad_Norm,t_Grad_Norm,q_t_Grad_Ratio,Quaternion_Norm\n")
+            f.write("Iteration,Loss,T_sum,top1_mean,q_Grad_Norm,t_Grad_Norm,q_t_Grad_Ratio,Quaternion_Norm\n")
 
         # -------------------- メインループ -------------------- #
         pbar = tqdm(range(max_iter), desc="Optimizing (S³×S²)", leave=True)
@@ -1043,30 +1278,91 @@ class OptimalTransportSolver:
             # Fundamental matrix → Cost → Transport → Loss
             F = self._build_F_from_wc(R_wc, t_hat)
             C = self.compute_cost_matrix(F)
-            
+
             # Differentiable transport context
             context = torch.enable_grad() if differentiable_transport else torch.no_grad()
             with context:
-                T = self.unbalanced_sinkhorn_algorithm(
+                T, _ = self.unbalanced_sinkhorn_algorithm(
                     cost_matrix=C if differentiable_transport else C.detach(),
                     epsilon=sinkhorn_epsilon,
                     rho=sinkhorn_rho,
                     max_iter=sinkhorn_max_iter,
-                    tol=sinkhorn_tol
+                    tol=sinkhorn_tol,
+                    gate_mask=self._last_gate_mask,
                 )
                 if not differentiable_transport:
                     T = T.detach()
-            loss = (T * C).sum()
+
+            # Step III: Score-type based loss computation (same logic as SE3 optimizer)
+            transport_cost = (T * C).sum()
+            T_sum = T.sum()
+
+            if score_type == "loss":
+                loss = transport_cost
+            elif score_type == "avg_cost":
+                loss = transport_cost / (T_sum + 1e-10)
+            elif score_type == "mass_aware":
+                avg_cost = transport_cost / (T_sum + 1e-10)
+                a = self.ot_mass1 if self.ot_mass1 is not None else torch.ones(T.shape[0], device=T.device) / T.shape[0]
+                b = self.ot_mass2 if self.ot_mass2 is not None else torch.ones(T.shape[1], device=T.device) / T.shape[1]
+                row_marginal = T.sum(dim=1)
+                col_marginal = T.sum(dim=0)
+                KL_row = (row_marginal * (torch.log(row_marginal + 1e-10) - torch.log(a + 1e-10)) - row_marginal + a).sum()
+                KL_col = (col_marginal * (torch.log(col_marginal + 1e-10) - torch.log(b + 1e-10)) - col_marginal + b).sum()
+                loss = avg_cost + lambda_kl * (KL_row + KL_col)
+            elif score_type == "full_uot":
+                # Use ACTUAL ε/ρ from Sinkhorn
+                eps_actual = self._last_sinkhorn_epsilon
+                rho_actual = self._last_sinkhorn_rho
+                if eps_actual is None or rho_actual is None:
+                    raise RuntimeError("full_uot requires Sinkhorn to run first")
+                a = self.ot_mass1 if self.ot_mass1 is not None else torch.ones(T.shape[0], device=T.device) / T.shape[0]
+                b = self.ot_mass2 if self.ot_mass2 is not None else torch.ones(T.shape[1], device=T.device) / T.shape[1]
+                row_marginal = T.sum(dim=1)
+                col_marginal = T.sum(dim=0)
+                KL_row = (row_marginal * (torch.log(row_marginal + 1e-10) - torch.log(a + 1e-10)) - row_marginal + a).sum()
+                KL_col = (col_marginal * (torch.log(col_marginal + 1e-10) - torch.log(b + 1e-10)) - col_marginal + b).sum()
+                entropy = -(T * torch.log(T + 1e-10)).sum()
+                entropic = -entropy - T_sum  # = sum(T*log(T) - T)
+                loss = transport_cost + rho_actual * (KL_row + KL_col) + eps_actual * entropic
+            else:
+                raise ValueError(f"Unknown score_type: {score_type}")
+
             if self.lambda_cheirality > 0.0:
                 loss = loss + self.lambda_cheirality * self._cheirality_loss(R_wc, t_hat, T.detach(), self.cheirality_topk)
 
+            # Transport diagnostics for collapse detection
+            with torch.no_grad():
+                T_sum = T.sum().item()
+                row_sum = T.sum(dim=1)
+                col_sum = T.sum(dim=0)
+                top1_mean = T.max(dim=1).values.mean().item()
+
+            if it % 20 == 0:
+                print(f"  T.sum(): {T_sum:.4f} (collapse if decreasing!)")
+                print(f"  row_sum: mean={row_sum.mean().item():.4f}, min={row_sum.min().item():.4f}, max={row_sum.max().item():.4f}")
+                print(f"  top1_mean: {top1_mean:.4f}")
+
             loss.backward()
+
+            # Step III: optimize_mode - zero out gradients for fixed components
+            if optimize_mode != "both" and self.theta_param.grad is not None:
+                grad = self.theta_param.grad
+                q_grad, t_grad = manifold.unpack_tensor(grad)
+                if optimize_mode == "rotation_only":
+                    # Zero out translation gradient
+                    t_grad.zero_()
+                elif optimize_mode == "translation_only":
+                    # Zero out rotation gradient
+                    q_grad.zero_()
+                # Pack back into theta_param.grad
+                self.theta_param.grad = manifold.pack_point(q_grad, t_grad)
 
             # 勾配クリッピング - NaN検知付き
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
-                    [self.theta_param], 
-                    grad_clip, 
+                    [self.theta_param],
+                    grad_clip,
                     error_if_nonfinite=True
                 )
 
@@ -1096,7 +1392,7 @@ class OptimalTransportSolver:
                 
                 # デバッグログに記録
                 with open(debug_log_path, 'a') as f:
-                    f.write(f"{it},{curr_loss:.8f},{gq:.8f},{gt:.8f},{q_t_ratio:.8f},{q.norm().item():.8f}\n")
+                    f.write(f"{it},{curr_loss:.8f},{T_sum:.6f},{top1_mean:.6f},{gq:.8f},{gt:.8f},{q_t_ratio:.8f},{q.norm().item():.8f}\n")
                 
                 # 定期的な詳細ログ出力
                 if it % 20 == 0:
@@ -1245,3 +1541,4 @@ class OptimalTransportSolver:
         print(f"Final quaternion norm: {q_final_normalized.norm().item():.6f}")
         print(f"Final R_wc det: {torch.linalg.det(self.R_wc).item():.6f}")
         return loss_history
+    
